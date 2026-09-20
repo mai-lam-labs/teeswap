@@ -1,0 +1,70 @@
+ARG PYVER=3.14
+
+FROM alpine:3.22 AS build
+ARG PYVER
+
+RUN apk add --no-cache curl bash
+
+RUN curl -LsSf https://astral.sh/uv/install.sh \
+    | env UV_UNMANAGED_INSTALL=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+
+COPY . /src
+WORKDIR /src
+
+# Install musl Python — uv creates a versioned dir + symlink, rename the real dir.
+RUN uv python install cpython-${PYVER}-linux-x86_64-musl --install-dir /tmp/py --quiet \
+ && mv /tmp/py/cpython-${PYVER}.*-linux-x86_64-musl /bundle
+
+RUN uv pip install --python /bundle/bin/python${PYVER} --break-system-packages . --quiet
+
+# --- strip: libpython .so (statically linked into the binary) ---
+RUN rm -f /bundle/lib/libpython*.so* /bundle/lib/libpython*.a
+
+# --- strip: Tcl/Tk (no GUI) ---
+RUN rm -rf /bundle/lib/libtcl* /bundle/lib/itcl* /bundle/lib/thread* \
+           /bundle/lib/tcl* /bundle/lib/tk*
+
+# --- strip: headers, man pages, pkgconfig ---
+RUN rm -rf /bundle/include /bundle/share /bundle/lib/pkgconfig
+
+# --- strip: bundled pip ---
+RUN rm -rf /bundle/lib/python${PYVER}/site-packages/pip*
+
+# --- strip: unused stdlib modules ---
+RUN rm -rf /bundle/lib/python${PYVER}/idlelib \
+           /bundle/lib/python${PYVER}/tkinter \
+           /bundle/lib/python${PYVER}/turtle.py \
+           /bundle/lib/python${PYVER}/turtledemo \
+           /bundle/lib/python${PYVER}/ensurepip \
+           /bundle/lib/python${PYVER}/pydoc_data \
+           /bundle/lib/python${PYVER}/pydoc.py \
+           /bundle/lib/python${PYVER}/curses \
+           /bundle/lib/python${PYVER}/dbm \
+           /bundle/lib/python${PYVER}/sqlite3 \
+           /bundle/lib/python${PYVER}/xmlrpc \
+           /bundle/lib/python${PYVER}/ctypes \
+           /bundle/lib/python${PYVER}/venv \
+           /bundle/lib/python${PYVER}/lib2to3 \
+           /bundle/lib/python${PYVER}/doctest.py \
+           /bundle/lib/python${PYVER}/unittest
+
+# --- compile stdlib + deps to .pyc, strip .py source (keep teeswap .py for tracebacks) ---
+RUN /bundle/bin/python${PYVER} -O -m compileall -q -b /bundle/lib/python${PYVER}
+RUN find /bundle/lib/python${PYVER} -path "*/site-packages/teeswap*" -prune \
+      -o -name "*.py" -print -exec rm {} +
+RUN find /bundle -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+# --- strip: bin/ clutter (keep only python$PYVER) ---
+RUN find /bundle/bin -type f ! -name "python${PYVER}" -delete 2>/dev/null || true \
+ && find /bundle/bin -type l -delete 2>/dev/null || true
+
+RUN du -sh /bundle
+
+# --- final image ---
+FROM alpine:3.22
+ARG PYVER
+COPY --from=build /bundle /bundle
+RUN ln -s python${PYVER} /bundle/bin/python
+RUN printf '#!/bin/sh\nexec /bundle/bin/python -m teeswap container-init\n' > /init && chmod +x /init
+ENTRYPOINT ["/bundle/bin/python", "-m", "teeswap"]
+CMD ["serve"]

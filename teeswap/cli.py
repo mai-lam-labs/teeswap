@@ -54,6 +54,21 @@ def stdio() -> None:
     asyncio.run(_stdio_loop(dispatcher))
 
 
+@cli.command(name="container-init")
+def container_init() -> None:
+    """Stage2 boot entrypoint — read config from stdin, generate keys, start server."""
+    config_raw = sys.stdin.buffer.read()
+    config: dict[str, Any] = json.loads(config_raw) if config_raw else {}
+
+    teeswap_config: dict[str, Any] = config.get("teeswap", {})
+    host = teeswap_config.get("bind_host", "0.0.0.0")  # noqa: S104
+    port = teeswap_config.get("bind_port", 8402)
+
+    dispatcher = _make_dispatcher()
+    app = create_app(dispatcher)
+    uvicorn.run(app, host=host, port=port)
+
+
 @cli.command()
 def version() -> None:
     """Print version and package info."""
