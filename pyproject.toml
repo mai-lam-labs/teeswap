@@ -1,0 +1,43 @@
+[project]
+name = "teeswap"
+version = "0.1.0"
+description = "Cross-chain swap aggregator in a verified TEE"
+requires-python = ">=3.14"
+dependencies = [
+    "litestar>=2.24.0",
+    "dacite>=1.9.2",
+    "httpx>=0.28.0",
+    "cryptography>=44.0.0",
+    "cbor2>=6.1.0",
+    "uvicorn>=0.52.0",
+    "click>=8.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff==0.16.0",
+    "ty==0.0.61",
+    "pyrefly==1.0.0",
+    "coverage==7.6.1",
+    "pytest==8.3.2",
+    # "py-spy==0.4.2",  # flame graphs / CPU profiling — enable when needed
+]
+
+[project.scripts]
+teeswap = "teeswap.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    ".uv", ".venv", "dist", "docs", "mcp-source",
+    "*.md", "Makefile",
+    "ruff.toml", "ty.toml", "pyrefly.toml", "pyrightconfig.json",
+    "teeswap/tests",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["teeswap"]
+exclude = ["teeswap/tests"]
