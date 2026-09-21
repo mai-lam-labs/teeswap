@@ -1,24 +1,21 @@
 import abc
 import base64
+import json
 import secrets
 import time
 from dataclasses import dataclass, field
-from importlib.metadata import metadata
-from typing import Any, Literal
+from typing import Any, Literal, TextIO
 
 import cryptography.exceptions
 
-from .attestation import VERIFIABLE_TOOLS_NS, Signer, _compute_commitment
-from .common import from_dict
-from .hpke import HpkeKeypair, build_args_aad, build_reply_aad, decrypt_arguments, encrypt_reply
+from .attestation import VERIFIABLE_TOOLS_NS, AttestationError, BlindExecutor, ProofFormat, Signer
+from .common import PKG_NAME, PKG_VERSION, from_dict
+from .hpke import HpkeKeypair
 from .invoice import PaymentRequirement
 from .response import ToolResponse
 from .schema import schema_for_type
 
-_PKG = metadata("teeswap")
-SERVER_NAME = _PKG["Name"]
-SERVER_VERSION = _PKG["Version"]
-MCP_PROTOCOL_VERSION = "2026-07-28"
+MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_VERSIONS = ("2025-11-25", "2026-07-28")
 
 SESSION_TTL_SECONDS = 3600
@@ -63,7 +60,7 @@ class ToolDefinition:
     def rest_path(self) -> str:
         if self.path is not None:
             return self.path
-        return "/" + self.name.removeprefix(f"{SERVER_NAME}_")
+        return "/" + self.name.removeprefix(f"{PKG_NAME}_")
 
     @property
     def http_method(self) -> Literal["GET", "POST"]:
@@ -105,6 +102,11 @@ class Dispatcher:
         self._tools: dict[str, Tool] = {}
         self._signer = signer
         self._hpke_keypair = hpke_keypair
+        self._blind_executor: BlindExecutor | None = (
+            BlindExecutor(signer, hpke_keypair)
+            if signer is not None and hpke_keypair is not None
+            else None
+        )
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.definition.name] = tool
@@ -146,6 +148,10 @@ class Dispatcher:
     @property
     def hpke_keypair(self) -> HpkeKeypair | None:
         return self._hpke_keypair
+
+    @property
+    def blind_executor(self) -> BlindExecutor | None:
+        return self._blind_executor
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
@@ -196,7 +202,7 @@ class SessionManager:
 
 # --- MCP response helpers ---
 
-_SERVER_INFO: dict[str, str] = {"name": SERVER_NAME, "version": SERVER_VERSION}
+_SERVER_INFO: dict[str, str] = {"name": PKG_NAME, "version": PKG_VERSION}
 _CAPABILITIES: dict[str, Any] = {"tools": {"listChanged": False}}
 
 
@@ -247,7 +253,7 @@ async def handle_mcp_request(
             )
         session = sessions.create(protocol_version)
         return McpResult(
-            body=_ok(rpc.id, _init_result(dispatcher)),
+            body=_ok(rpc.id, _init_result(dispatcher, protocol_version)),
             session_id=session.session_id,
         )
 
@@ -290,9 +296,9 @@ async def handle_mcp_request(
             return McpResult(body=_error(rpc.id, -32601, f"unknown method: {method}"))
 
 
-def _init_result(dispatcher: Dispatcher) -> dict[str, Any]:
+def _init_result(dispatcher: Dispatcher, protocol_version: str) -> dict[str, Any]:
     result: dict[str, Any] = {
-        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "protocolVersion": protocol_version,
         "capabilities": _CAPABILITIES,
         "serverInfo": _SERVER_INFO,
     }
@@ -322,7 +328,7 @@ def _discover_result(dispatcher: Dispatcher, has_session: bool) -> dict[str, Any
 
 def _verifiable_capability(dispatcher: Dispatcher) -> dict[str, Any]:
     cap: dict[str, Any] = {
-        "proofFormats": ["tee-nitro-v1"],
+        "proofFormats": [f.value for f in ProofFormat],
     }
     if dispatcher.hpke_keypair is not None:
         pub_b64 = (
@@ -363,13 +369,12 @@ async def _handle_tools_call(
 
 
 async def _handle_blind_call(dispatcher: Dispatcher, rpc: JsonRpcRequest) -> McpResult:
-    if dispatcher.signer is None:
-        return McpResult(body=_error(rpc.id, -32601, "verifiable-tools not enabled"))
-    if dispatcher.hpke_keypair is None:
+    blind = dispatcher.blind_executor
+    if blind is None:
         return McpResult(body=_error(rpc.id, -32601, "blind execution not configured"))
 
     name = rpc.params.get("name", "")
-    client_input_commitment = rpc.params.get("inputCommitment", "")
+    input_commitment = rpc.params.get("inputCommitment", "")
     encryption_scheme = rpc.params.get("encryptionScheme", "")
     encrypted_arguments = rpc.params.get("encryptedArguments", "")
     client_nonce = _extract_client_nonce(rpc)
@@ -378,18 +383,13 @@ async def _handle_blind_call(dispatcher: Dispatcher, rpc: JsonRpcRequest) -> Mcp
     if encryption_scheme != "hpke-v1":
         return McpResult(body=_error(rpc.id, -32602, f"unsupported scheme: {encryption_scheme}"))
 
-    aad = build_args_aad(name, client_input_commitment, encryption_scheme)
     try:
-        decrypted = decrypt_arguments(dispatcher.hpke_keypair, encrypted_arguments, aad)
+        decrypted = blind.decrypt_call(name, encrypted_arguments, input_commitment, encryption_scheme)
+        blind.verify_commitment(decrypted, input_commitment)
     except (ValueError, KeyError, cryptography.exceptions.InvalidTag) as e:
         return McpResult(body=_error(rpc.id, -32602, f"decryption failed: {e}"))
-
-    if len(decrypted.salt) != 32:
-        return McpResult(body=_error(rpc.id, -32602, "salt must be exactly 32 bytes"))
-
-    computed_commitment = _compute_commitment(decrypted.salt, decrypted.arguments)
-    if computed_commitment != client_input_commitment:
-        return McpResult(body=_error(rpc.id, -32602, "inputCommitment mismatch"))
+    except AttestationError as e:
+        return McpResult(body=_error(rpc.id, -32602, str(e)))
 
     try:
         tool_result = await dispatcher.call(name, decrypted.arguments)
@@ -398,21 +398,14 @@ async def _handle_blind_call(dispatcher: Dispatcher, rpc: JsonRpcRequest) -> Mcp
 
     content = tool_result.to_mcp_content()
 
-    verifiable = dispatcher.signer.attest_blind_result(
-        arguments=decrypted.arguments,
+    content, meta = blind.attest_and_encrypt(
+        decrypted=decrypted,
         content=content,
-        salt=decrypted.salt,
+        tool_name=name,
+        client_input_commitment=input_commitment,
         client_nonce=client_nonce,
+        reply_public_key_b64=reply_public_key,
     )
-
-    if reply_public_key is not None:
-        reply_aad = build_reply_aad(name, client_input_commitment, client_nonce)
-        encrypted_content = encrypt_reply(content, reply_public_key, reply_aad)
-        content = [{"type": "text", "text": encrypted_content}]
-        meta = verifiable.to_meta()
-        meta[VERIFIABLE_TOOLS_NS]["encryptedContent"] = True
-    else:
-        meta = verifiable.to_meta()
 
     return McpResult(body=_ok(rpc.id, {"content": content, "_meta": meta}))
 
@@ -421,3 +414,49 @@ def _extract_client_nonce(rpc: JsonRpcRequest) -> str | None:
     meta = rpc.params.get("_meta", {})
     vt = meta.get(VERIFIABLE_TOOLS_NS, {})
     return vt.get("nonce")
+
+
+# --- JSONL transport ---
+
+
+async def jsonl_loop(
+    dispatcher: Dispatcher,
+    sessions: SessionManager,
+    session: Session,
+    input: TextIO,
+    output: TextIO,
+) -> None:
+    def write(obj: dict[str, Any]) -> None:
+        output.write(json.dumps(obj))
+        output.write("\n")
+        output.flush()
+
+    def write_error(req_id: Any, code: int, message: str) -> None:
+        write({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+
+    for raw_line in input:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        try:
+            raw = json.loads(stripped)
+        except json.JSONDecodeError as e:
+            write_error(None, -32700, f"parse error: {e}")
+            continue
+
+        try:
+            rpc = from_dict(JsonRpcRequest, raw)
+        except (TypeError, KeyError, ValueError) as e:
+            write_error(raw.get("id"), -32600, f"invalid request: {e}")
+            continue
+
+        result = await handle_mcp_request(
+            dispatcher=dispatcher,
+            sessions=sessions,
+            method=rpc.method,
+            rpc=rpc,
+            session_id=session.session_id,
+        )
+
+        write(result.body)

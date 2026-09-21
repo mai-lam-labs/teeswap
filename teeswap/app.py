@@ -4,10 +4,8 @@ from litestar import Litestar, MediaType, Request, Response, Router, post
 from litestar.openapi import OpenAPIConfig
 from litestar.status_codes import HTTP_200_OK
 
-from .common import from_dict
+from .common import PKG_NAME, PKG_VERSION, from_dict
 from .mcp import (
-    SERVER_NAME,
-    SERVER_VERSION,
     Dispatcher,
     JsonRpcRequest,
     SessionManager,
@@ -25,7 +23,7 @@ def _make_rest_handler(tool: Tool) -> Any:
         body, media_type = result.to_rest()
         return Response(content=body, status_code=HTTP_200_OK, media_type=media_type)
 
-    short_name = defn.name.removeprefix(f"{SERVER_NAME}_")
+    short_name = defn.name.removeprefix(f"{PKG_NAME}_")
     handler.__name__ = short_name
     handler.__qualname__ = short_name
     handler.__annotations__["data"] = input_type
@@ -72,9 +70,9 @@ def create_app(dispatcher: Dispatcher) -> Litestar:
     ]
 
     api_router = Router(
-        path=f"/{SERVER_NAME}",
+        path=f"/{PKG_NAME}",
         route_handlers=rest_handlers,
-        tags=[SERVER_NAME],
+        tags=[PKG_NAME],
     )
 
     mcp_router = Router(
@@ -86,8 +84,8 @@ def create_app(dispatcher: Dispatcher) -> Litestar:
     return Litestar(
         route_handlers=[api_router, mcp_router],
         openapi_config=OpenAPIConfig(
-            title="TEESwap",
-            version=SERVER_VERSION,
+            title=PKG_NAME,
+            version=PKG_VERSION,
             description="Cross-chain swap aggregator in a verified TEE",
         ),
     )

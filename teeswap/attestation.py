@@ -1,119 +1,35 @@
+"""SEP-2133 — Verifiable MCP Tools (per-result attestation + blind execution).
+
+Proposal: https://github.com/nicholasgasior/model-context-protocol/blob/sep-2133/docs/specification/draft/extensions/verifiable-tools.md
+Reference impl: https://github.com/nicholasgasior/verifiable-mcp-tools
+Namespace: io.github.ripple-node-lab/verifiable-tools (pre-acceptance; will
+           become io.modelcontextprotocol/verifiable-tools if the SEP merges)
+
+Commitment scheme: SHA-256 over JCS-canonicalised arguments/content (see jcs()).
+Proof format: tee-vaportpm-v1 — Ed25519 signature + vaportpm boot attestation.
+Blind execution: HPKE-encrypted arguments (RFC 9180, see hpke.py).
+"""
+
+import base64
 import enum
 import hashlib
 import json
 import os
-import subprocess
 from dataclasses import asdict, dataclass
-from typing import Any, NotRequired, TypedDict
+from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from dacite import DaciteError
 
-from .common import TeeSwapError, from_dict
-from .config import AttestationConfig
-
-
-class CloudProvider(enum.StrEnum):
-    AWS = "aws"
-    GCP = "gcp"
+from .common import TeeSwapError
+from .hpke import HpkeKeypair, hpke_seal
 
 
 class AttestationError(TeeSwapError):
     pass
 
 
-class VaportpmError(AttestationError):
-    pass
-
-
-class VaportpmParseError(AttestationError):
-    pass
-
-
-class CommitmentMismatchError(AttestationError):
-    pass
-
-
 class ProofFormat(enum.StrEnum):
-    TEE_NITRO_V1 = "tee-nitro-v1"
-    SNARKJS_V2 = "snarkjs-v2"
-    NOIR_V1 = "noir-v1"
-    RISC0_V1 = "risc0-v1"
-    EZKL_V1 = "ezkl-v1"
-
-
-# --- Raw JSON shape from vaportpm-attest (TypedDicts) ---
-
-
-class RawEccCoords(TypedDict):
-    x: str
-    y: str
-
-
-class RawTpmAttestation(TypedDict):
-    attest_data: str
-    signature: str
-
-
-class RawNitroAttestation(TypedDict):
-    document: str
-
-
-class RawGcpAttestation(TypedDict):
-    ak_cert_chain: str
-
-
-class RawAttestationContainer(TypedDict):
-    tpm: dict[str, RawTpmAttestation]
-    nitro: NotRequired[RawNitroAttestation]
-    gcp: NotRequired[RawGcpAttestation]
-
-
-class RawVaportpmOutput(TypedDict):
-    nonce: str
-    pcrs: dict[str, dict[str, str]]
-    ak_pubkeys: dict[str, RawEccCoords]
-    attestation: RawAttestationContainer
-
-
-# --- Typed domain objects (frozen dataclasses) ---
-
-
-@dataclass(frozen=True, slots=True)
-class EccPublicKeyCoords:
-    x: str
-    y: str
-
-
-@dataclass(frozen=True, slots=True)
-class TpmAttestationData:
-    attest_data: str
-    signature: str
-
-
-@dataclass(frozen=True, slots=True)
-class NitroAttestationData:
-    document: str
-
-
-@dataclass(frozen=True, slots=True)
-class GcpAttestationData:
-    ak_cert_chain: str
-
-
-@dataclass(frozen=True, slots=True)
-class AttestationContainer:
-    tpm: dict[str, TpmAttestationData]
-    nitro: NitroAttestationData | None = None
-    gcp: GcpAttestationData | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class VaportpmOutput:
-    nonce: str
-    pcrs: dict[str, dict[str, str]]
-    ak_pubkeys: dict[str, EccPublicKeyCoords]
-    attestation: AttestationContainer
+    TEE_VAPORTPM_V1 = "tee-vaportpm-v1"
 
 
 # --- SEP-2133 constants ---
@@ -160,14 +76,14 @@ class Signer:
             self._key = Ed25519PrivateKey.generate()
 
         self._public_bytes = self._key.public_key().public_bytes_raw()
-        self._boot_attestation: VaportpmOutput | None = None
+        self._boot_attestation: dict[str, Any] | None = None
 
     @property
     def public_key_hex(self) -> str:
         return "0x" + self._public_bytes.hex()
 
-    def set_boot_attestation(self, attestation: VaportpmOutput) -> None:
-        self._boot_attestation = attestation
+    def set_boot_attestation(self, attestation: Any) -> None:
+        self._boot_attestation = asdict(attestation)
 
     def attest_result(
         self,
@@ -176,8 +92,8 @@ class Signer:
         client_nonce: str | None = None,
         salt: bytes = b"",
     ) -> VerifiableResult:
-        input_commitment = _compute_commitment(salt, arguments)
-        output_commitment = _compute_commitment(b"", content)
+        input_commitment = compute_commitment(salt, arguments)
+        output_commitment = compute_commitment(b"", content)
 
         binding_fields: dict[str, str] = {
             "inputCommitment": input_commitment,
@@ -186,19 +102,15 @@ class Signer:
         if client_nonce is not None:
             binding_fields["nonce"] = client_nonce
 
-        signature = self._key.sign(_jcs(binding_fields))
-
-        boot_dict: dict[str, Any] | None = None
-        if self._boot_attestation is not None:
-            boot_dict = asdict(self._boot_attestation)
+        signature = self._key.sign(jcs(binding_fields))
 
         return VerifiableResult(
             input_commitment=input_commitment,
             output_commitment=output_commitment,
             nonce=client_nonce,
             proof="0x" + signature.hex(),
-            proof_format=ProofFormat.TEE_NITRO_V1,
-            tee_attestation=boot_dict,
+            proof_format=ProofFormat.TEE_VAPORTPM_V1,
+            tee_attestation=self._boot_attestation,
         )
 
     def attest_blind_result(
@@ -217,6 +129,17 @@ class Signer:
             salt=salt,
         )
 
+    @property
+    def private_key_bytes(self) -> bytes:
+        return self._key.private_bytes_raw()
+
+    @property
+    def public_key_bytes(self) -> bytes:
+        return self._public_bytes
+
+    def sign_raw(self, data: bytes) -> bytes:
+        return self._key.sign(data)
+
     @classmethod
     def from_env(cls) -> Signer:
         key_hex = os.environ.get("TEESWAP_SIGNING_KEY")
@@ -231,58 +154,101 @@ class Signer:
 # --- Commitment computation ---
 
 
-def _compute_commitment(prefix: bytes, obj: dict[str, Any] | list[dict[str, Any]]) -> str:
-    canonical = _jcs(obj)
+def compute_commitment(prefix: bytes, obj: dict[str, Any] | list[dict[str, Any]]) -> str:
+    canonical = jcs(obj)
     return "0x" + hashlib.sha256(prefix + canonical).hexdigest()
 
 
-def _jcs(obj: dict[str, Any] | list[Any]) -> bytes:
-    # TODO: replace with `jcs` or `canonicaljson` package (RFC 8785)
+def jcs(obj: dict[str, Any] | list[Any]) -> bytes:
+    """RFC 8785 JSON Canonicalization Scheme — simplified.
+
+    Full 8785 specifies UTF-16 key sort order and ES2015 number serialization.
+    We require all numeric values to be string-encoded (amounts, hashes, keys),
+    so sorted-key compact JSON is sufficient.  Both signer and verifier share
+    this function; interop with a full 8785 implementation is only guaranteed
+    when the input contains no bare numeric JSON values.
+    """
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
 
 
-# --- vaportpm subprocess interface ---
+# --- Blind execution (HPKE + protocol layer) ---
 
 
-def generate_attestation(
-    config: AttestationConfig,
-    nonce: bytes,
-) -> VaportpmOutput:
-    cmd = [config.vaportpm_attest_bin, nonce.hex()]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            check=True,
-            text=True,
-            timeout=10,
+@dataclass(frozen=True, slots=True)
+class DecryptedBlindCall:
+    salt: bytes
+    arguments: dict[str, Any]
+
+
+def build_args_aad(tool_name: str, input_commitment: str, encryption_scheme: str) -> bytes:
+    return jcs({
+        "tool": tool_name,
+        "inputCommitment": input_commitment,
+        "encryptionScheme": encryption_scheme,
+    })
+
+
+def build_reply_aad(tool_name: str, input_commitment: str, nonce: str | None) -> bytes:
+    obj: dict[str, str] = {"tool": tool_name, "inputCommitment": input_commitment}
+    if nonce is not None:
+        obj["nonce"] = nonce
+    return jcs(obj)
+
+
+class BlindExecutor:
+    def __init__(self, signer: Signer, keypair: HpkeKeypair) -> None:
+        self.signer = signer
+        self.keypair = keypair
+
+    def decrypt_call(
+        self,
+        tool_name: str,
+        encrypted_arguments_b64: str,
+        input_commitment: str,
+        encryption_scheme: str,
+    ) -> DecryptedBlindCall:
+        aad = build_args_aad(tool_name, input_commitment, encryption_scheme)
+        raw = base64.urlsafe_b64decode(encrypted_arguments_b64 + "==")
+        plaintext = self.keypair.open(HPKE_INFO_ARGS, aad, raw)
+        payload = json.loads(plaintext)
+        salt = bytes.fromhex(payload["salt"].removeprefix("0x"))
+        return DecryptedBlindCall(salt=salt, arguments=payload["arguments"])
+
+    def verify_commitment(
+        self,
+        decrypted: DecryptedBlindCall,
+        client_input_commitment: str,
+    ) -> None:
+        if len(decrypted.salt) != 32:
+            raise AttestationError("salt must be exactly 32 bytes")
+        computed = compute_commitment(decrypted.salt, decrypted.arguments)
+        if computed != client_input_commitment:
+            raise AttestationError("inputCommitment mismatch")
+
+    def attest_and_encrypt(
+        self,
+        decrypted: DecryptedBlindCall,
+        content: list[dict[str, Any]],
+        tool_name: str,
+        client_input_commitment: str,
+        client_nonce: str | None = None,
+        reply_public_key_b64: str | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        verifiable = self.signer.attest_blind_result(
+            arguments=decrypted.arguments,
+            content=content,
+            salt=decrypted.salt,
+            client_nonce=client_nonce,
         )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        raise VaportpmError(f"vaportpm-attest failed: {e}") from e
-    return _parse_vaportpm_output(result.stdout)
+        meta = verifiable.to_meta()
 
+        if reply_public_key_b64 is not None:
+            reply_aad = build_reply_aad(tool_name, client_input_commitment, client_nonce)
+            plaintext = jcs(content)
+            reply_public_bytes = base64.urlsafe_b64decode(reply_public_key_b64 + "==")
+            sealed = hpke_seal(reply_public_bytes, HPKE_INFO_REPLY, reply_aad, plaintext)
+            encrypted_content = base64.urlsafe_b64encode(sealed).decode().rstrip("=")
+            content = [{"type": "text", "text": encrypted_content}]
+            meta[VERIFIABLE_TOOLS_NS]["encryptedContent"] = True
 
-def extend_pcr(config: AttestationConfig, pcr_index: int, data: bytes) -> None:
-    cmd = [
-        config.vaportpm_pcr_extend_bin,
-        "pcr-extend",
-        "--index",
-        str(pcr_index),
-        "--data",
-        data.hex(),
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, check=True, timeout=10)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        raise VaportpmError(f"PCR extend failed: {e}") from e
-
-
-# --- Parser ---
-
-
-def _parse_vaportpm_output(raw_json: str) -> VaportpmOutput:
-    try:
-        data = json.loads(raw_json)
-        return from_dict(VaportpmOutput, data)
-    except (json.JSONDecodeError, DaciteError, KeyError, TypeError) as e:
-        raise VaportpmParseError(f"failed to parse vaportpm output: {e}") from e
+        return content, meta

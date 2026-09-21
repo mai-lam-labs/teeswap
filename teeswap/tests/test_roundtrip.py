@@ -16,10 +16,12 @@ from teeswap.attestation import (
     HPKE_INFO_REPLY,
     VERIFIABLE_TOOLS_NS,
     Signer,
-    _compute_commitment,
-    _jcs,
+    build_args_aad,
+    build_reply_aad,
+    compute_commitment,
+    jcs,
 )
-from teeswap.hpke import build_args_aad, build_reply_aad, generate_keypair, hpke_open, hpke_seal
+from teeswap.hpke import HpkeKeypair, hpke_seal
 from teeswap.mcp import (
     Dispatcher,
     JsonRpcRequest,
@@ -56,7 +58,7 @@ class EchoTool(Tool):
 
 def _make_stack() -> tuple[Dispatcher, Signer, Verifier, SessionManager]:
     signer = Signer()
-    keypair = generate_keypair()
+    keypair = HpkeKeypair.random()
     dispatcher = Dispatcher(signer=signer, hpke_keypair=keypair)
     dispatcher.register(EchoTool())
     verifier = Verifier(
@@ -94,7 +96,7 @@ def test_plain_tools_call_round_trip() -> None:
         expected_nonce=nonce,
     )
     assert isinstance(outcome, Verified)
-    assert outcome.proof_format == "tee-nitro-v1"
+    assert outcome.proof_format == "tee-vaportpm-v1"
 
 
 def test_tampered_content_rejected() -> None:
@@ -176,9 +178,9 @@ def _encrypt_for_blind_call(
     """
     assert dispatcher.hpke_keypair is not None
     salt = os.urandom(32)
-    input_commitment = _compute_commitment(salt, arguments)
+    input_commitment = compute_commitment(salt, arguments)
 
-    payload = _jcs({"salt": "0x" + salt.hex(), "arguments": arguments})
+    payload = jcs({"salt": "0x" + salt.hex(), "arguments": arguments})
 
     aad = build_args_aad(tool_name, input_commitment, "hpke-v1")
     sealed = hpke_seal(dispatcher.hpke_keypair.public_key_bytes, HPKE_INFO_ARGS, aad, payload)
@@ -233,7 +235,7 @@ def test_blind_call_with_encrypted_reply() -> None:
 
     input_commitment, encrypted_args, salt = _encrypt_for_blind_call(dispatcher, "echo", arguments)
 
-    reply_keypair = generate_keypair()
+    reply_keypair = HpkeKeypair.random()
     reply_pub_b64 = base64.urlsafe_b64encode(reply_keypair.public_key_bytes).decode().rstrip("=")
 
     rpc = JsonRpcRequest(
@@ -261,9 +263,7 @@ def test_blind_call_with_encrypted_reply() -> None:
     encrypted_bytes = base64.urlsafe_b64decode(encrypted_content_b64 + "==")
 
     reply_aad = build_reply_aad("echo", input_commitment, nonce)
-    plaintext = hpke_open(
-        reply_keypair.private_key_bytes,
-        reply_keypair.public_key_bytes,
+    plaintext = reply_keypair.open(
         HPKE_INFO_REPLY,
         reply_aad,
         encrypted_bytes,

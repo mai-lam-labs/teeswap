@@ -1,0 +1,13 @@
+.uv/
+.venv/
+.git/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.egg-info/
+.coverage
+dist/*/boot/
+dist/*/boot.disk
+dist/*/linux.efi
+dist/*/stage2
+dist/*/bootstrap

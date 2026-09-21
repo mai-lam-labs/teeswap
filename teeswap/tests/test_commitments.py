@@ -12,36 +12,36 @@ not from our implementation or the reference implementation.
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from teeswap.attestation import Signer, _compute_commitment, _jcs
+from teeswap.attestation import Signer, compute_commitment, jcs
 
 
-def test_jcs_sorts_keys() -> None:
-    assert _jcs({"b": 2, "a": 1}) == b'{"a":1,"b":2}'
+def testjcs_sorts_keys() -> None:
+    assert jcs({"b": 2, "a": 1}) == b'{"a":1,"b":2}'
 
 
-def test_jcs_array_sorts_inner_keys() -> None:
-    assert _jcs([{"type": "text", "text": "3"}]) == b'[{"text":"3","type":"text"}]'
+def testjcs_array_sorts_inner_keys() -> None:
+    assert jcs([{"type": "text", "text": "3"}]) == b'[{"text":"3","type":"text"}]'
 
 
-def test_jcs_nested_object() -> None:
-    result = _jcs({"z": {"b": 1, "a": 2}, "a": 0})
+def testjcs_nested_object() -> None:
+    result = jcs({"z": {"b": 1, "a": 2}, "a": 0})
     assert result == b'{"a":0,"z":{"a":2,"b":1}}'
 
 
 def test_input_commitment_no_salt() -> None:
-    commitment = _compute_commitment(b"", {"a": 1, "b": 2})
+    commitment = compute_commitment(b"", {"a": 1, "b": 2})
     assert commitment == "0x43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"
 
 
 def test_output_commitment() -> None:
     content = [{"type": "text", "text": "3"}]
-    commitment = _compute_commitment(b"", content)
+    commitment = compute_commitment(b"", content)
     assert commitment == "0xdf3c1a607fa724ac6ecfcad943cd9f66624ebabed781a444564d3ed953c24b4e"
 
 
 def test_input_commitment_with_salt() -> None:
     salt = bytes(range(32))
-    commitment = _compute_commitment(salt, {"income": 100, "debt": 20})
+    commitment = compute_commitment(salt, {"income": 100, "debt": 20})
     assert commitment == "0x884c76820ff75d4829ee314f2ca19ada0b6ea1c6c4853a64b1301616c97e6ef9"
 
 
@@ -108,7 +108,7 @@ def test_proof_is_verifiable() -> None:
     pub = Ed25519PublicKey.from_public_bytes(
         bytes.fromhex(signer.public_key_hex.removeprefix("0x"))
     )
-    binding = _jcs(
+    binding = jcs(
         {
             "inputCommitment": result.input_commitment,
             "outputCommitment": result.output_commitment,

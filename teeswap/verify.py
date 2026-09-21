@@ -9,8 +9,8 @@ from .attestation import (
     VERIFIABLE_TOOLS_NS,
     ProofFormat,
     VerifiableResult,
-    _compute_commitment,
-    _jcs,
+    compute_commitment,
+    jcs,
 )
 
 
@@ -42,7 +42,7 @@ class Verifier:
     def __init__(
         self,
         public_key_bytes: bytes,
-        proof_formats: tuple[ProofFormat, ...] = (ProofFormat.TEE_NITRO_V1,),
+        proof_formats: tuple[ProofFormat, ...] = (ProofFormat.TEE_VAPORTPM_V1,),
     ) -> None:
         self._public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
         self._proof_formats = frozenset(proof_formats)
@@ -64,11 +64,11 @@ class Verifier:
         if expected_nonce is not None and result.nonce != expected_nonce:
             return VerificationFailed(VerifyFailure.NONCE_MISMATCH)
 
-        computed_input = _compute_commitment(salt, arguments)
+        computed_input = compute_commitment(salt, arguments)
         if computed_input != result.input_commitment:
             return VerificationFailed(VerifyFailure.INPUT_COMMITMENT_MISMATCH)
 
-        computed_output = _compute_commitment(b"", content)
+        computed_output = compute_commitment(b"", content)
         if computed_output != result.output_commitment:
             return VerificationFailed(VerifyFailure.OUTPUT_COMMITMENT_MISMATCH)
 
@@ -82,7 +82,7 @@ class Verifier:
         try:
             self._public_key.verify(
                 bytes.fromhex(result.proof.removeprefix("0x")),
-                _jcs(binding_fields),
+                jcs(binding_fields),
             )
         except InvalidSignature:
             return VerificationFailed(VerifyFailure.INVALID_SIGNATURE)

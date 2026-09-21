@@ -31,10 +31,13 @@ export UV_PYTHON_INSTALL_DIR   := $(TOOLS)/python
 # TODO: download from lockboot release URLs.
 BOOTSTRAP_SHA256_x86_64  := 6694c4bacfb8d81446364e3aa446e33cc6ad431ee48f760ba23169e001d03937
 BOOTSTRAP_SHA256_aarch64 := 42ac5dcf2d11614c973bbc8acb14aa3e1976c8bc02ec65a4d4b67bc381629691
+VAPORTPM_SHA256_x86_64   := 8fa11b42cf12abf942eb14bee5be7613d97dc75642a62095fd03d90c8448d961
 BOOT_DISK_SHA256_x86_64  := a1e4a4f791f356100fc33e218007dd02ad67168ae689ef4b6369548bdb3fe671
 UKI_SHA256_x86_64        := 283c5b1726ebd10cc95c4cbc0d3c751260e642a505baa03ae197672e7ae6d9f2
+EFI_VARS_SHA256_x86_64   := d55f52b13eba249a2d80ef85f63f1234be956c3fa609185f42188acbdf47ac1e
 
 SERVE_HOST ?= 10.0.2.1:8000
+FORWARD_PORTS ?= 8402
 
 # KVM passthrough (same pattern as lockboot's build.mk).
 KVM_GID   := $(shell stat -c %g /dev/kvm 2>/dev/null || echo "")
@@ -85,11 +88,14 @@ build:
 
 # ---- bundle-<arch>: Docker image with stripped musl Python + teeswap ----
 bundle-%:
+	@test -f dist/$*/vaportpm-attest || { echo "error: dist/$*/vaportpm-attest not found"; exit 1; }
+	@[ "$$(sha256sum dist/$*/vaportpm-attest | cut -d' ' -f1)" = "$(VAPORTPM_SHA256_$*)" ] || \
+	  { echo "error: dist/$*/vaportpm-attest hash mismatch (expected $(VAPORTPM_SHA256_$*))"; exit 1; }
 	docker build -f Dockerfile.bundle --build-arg PYVER=$(PYVER) -t teeswap:bundle-$* .
 	@echo ">> image built: teeswap:bundle-$*"
 
 # ---- payload-<arch>: lockboot stage2 binary ----
-payload-%:
+payload-%: bundle-%
 	@test -f dist/$*/bootstrap || { echo "error: dist/$*/bootstrap not found — copy the lockboot stage2 loader into dist/$*/"; exit 1; }
 	@[ "$$(sha256sum dist/$*/bootstrap | cut -d' ' -f1)" = "$(BOOTSTRAP_SHA256_$*)" ] || \
 	  { echo "error: dist/$*/bootstrap hash mismatch (expected $(BOOTSTRAP_SHA256_$*))"; exit 1; }
@@ -102,15 +108,17 @@ payload-%:
 	@echo ">> stage2 ready at dist/$*/stage2"
 
 # ---- boot-<arch>: full lockboot chain under QEMU ----
-# Requires dist/<arch>/{stage2, boot.disk, linux.efi} — copy lockboot artifacts manually.
-boot-%:
-	@test -f dist/$*/stage2    || { echo "error: dist/$*/stage2 not found — run 'make payload-$*'"; exit 1; }
-	@test -f dist/$*/boot.disk || { echo "error: dist/$*/boot.disk not found — copy from lockboot stage0 build"; exit 1; }
-	@test -f dist/$*/linux.efi || { echo "error: dist/$*/linux.efi not found — copy from lockboot stage1 build"; exit 1; }
+boot-%: 
+	@test -f dist/$*/stage2      || { echo "error: dist/$*/stage2 not found — run 'make payload-$*'"; exit 1; }
+	@test -f dist/$*/boot.disk   || { echo "error: dist/$*/boot.disk not found — copy from lockboot stage0 build"; exit 1; }
+	@test -f dist/$*/linux.efi   || { echo "error: dist/$*/linux.efi not found — copy from lockboot stage1 build"; exit 1; }
+	@test -f dist/$*/efi-vars.ovmf || { echo "error: dist/$*/efi-vars.ovmf not found — copy from lockboot stage0 build"; exit 1; }
 	@[ "$$(sha256sum dist/$*/boot.disk | cut -d' ' -f1)" = "$(BOOT_DISK_SHA256_$*)" ] || \
 	  { echo "error: dist/$*/boot.disk hash mismatch"; exit 1; }
 	@[ "$$(sha256sum dist/$*/linux.efi | cut -d' ' -f1)" = "$(UKI_SHA256_$*)" ] || \
 	  { echo "error: dist/$*/linux.efi hash mismatch"; exit 1; }
+	@[ "$$(sha256sum dist/$*/efi-vars.ovmf | cut -d' ' -f1)" = "$(EFI_VARS_SHA256_$*)" ] || \
+	  { echo "error: dist/$*/efi-vars.ovmf hash mismatch"; exit 1; }
 	@D="dist/$*/boot"; rm -rf "$$D"; mkdir -p "$$D"; H="http://$(SERVE_HOST)"; \
 	cp dist/$*/linux.efi "$$D/linux.efi"; \
 	cp dist/$*/stage2 "$$D/stage2"; \
@@ -127,11 +135,13 @@ boot-%:
 	  $(DOCKER_OPT_KVM) \
 	  -e YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1 \
 	  --cap-add=NET_ADMIN --device=/dev/net/tun \
+	  $(foreach p,$(FORWARD_PORTS),-p $(p):$(p)) \
 	  -v "$(CURDIR)/dist/$*/boot:/boot" \
 	  lockboot:harness --kind stage0 --arch $* \
 	    --boot-disk /boot/boot.disk \
 	    --serve-dir /boot \
-	    --user-data /boot/user-data.json
+	    --user-data /boot/user-data.json \
+	    $(foreach p,$(FORWARD_PORTS),--forward $(p))
 
 clean:
 	rm -rf "$(VENV)" "$(TOOLS)/cache" .ruff_cache

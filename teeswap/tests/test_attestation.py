@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from teeswap.attestation import AttestationError, VaportpmParseError, _parse_vaportpm_output
+from teeswap.attestation import AttestationError
+from teeswap.vaportpm import VaportpmParseError, _parse_vaportpm_output
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

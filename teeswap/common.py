@@ -1,6 +1,11 @@
+from importlib.metadata import metadata
 from typing import Any
 
 import dacite
+
+_PKG = metadata(__package__ or __name__)
+PKG_NAME: str = _PKG["Name"]
+PKG_VERSION: str = _PKG["Version"]
 
 
 class TeeSwapError(Exception):

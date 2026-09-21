@@ -1,23 +1,17 @@
-import base64
-import hashlib
+"""RFC 9180 — Hybrid Public Key Encryption (HPKE).
+
+Suite: DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM (base mode).
+
+Spec:   https://www.rfc-editor.org/rfc/rfc9180
+Errata: https://www.rfc-editor.org/errata/rfc9180
+Vector: RFC 9180 Appendix A.1.1 (test_hpke.py verifies against it)
+"""
+
 import hmac
-import json
-import os
 from dataclasses import dataclass
-from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-from .attestation import (
-    HPKE_INFO_ARGS,
-    HPKE_INFO_REPLY,
-    VaportpmOutput,
-    _jcs,
-    extend_pcr,
-    generate_attestation,
-)
-from .config import AttestationConfig
 
 ENC_SIZE = 32
 KEY_SIZE = 16
@@ -88,39 +82,42 @@ def _key_schedule(shared_secret: bytes, info: bytes) -> tuple[bytes, bytes]:
     return key, base_nonce
 
 
+def _ecdh(private_bytes: bytes, peer_public_bytes: bytes) -> bytes:
+    private_key = X25519PrivateKey.from_private_bytes(private_bytes)
+    peer_public = X25519PublicKey.from_public_bytes(peer_public_bytes)
+    return private_key.exchange(peer_public)
+
+
 @dataclass(slots=True)
 class HpkeKeypair:
     private_key_bytes: bytes
     public_key_bytes: bytes
 
+    @classmethod
+    def random(cls) -> HpkeKeypair:
+        return cls._from_key(X25519PrivateKey.generate())
 
-@dataclass(frozen=True, slots=True)
-class DecryptedBlindCall:
-    salt: bytes
-    arguments: dict[str, Any]
+    @classmethod
+    def from_seed(cls, seed: bytes) -> HpkeKeypair:
+        return cls._from_key(X25519PrivateKey.from_private_bytes(seed))
 
+    @classmethod
+    def _from_key(cls, key: X25519PrivateKey) -> HpkeKeypair:
+        return cls(
+            private_key_bytes=key.private_bytes_raw(),
+            public_key_bytes=key.public_key().public_bytes_raw(),
+        )
 
-def generate_keypair() -> HpkeKeypair:
-    private_key = X25519PrivateKey.generate()
-    private_bytes = private_key.private_bytes_raw()
-    public_bytes = private_key.public_key().public_bytes_raw()
-    return HpkeKeypair(private_key_bytes=private_bytes, public_key_bytes=public_bytes)
+    def open(self, info: bytes, aad: bytes, enc_and_ciphertext: bytes) -> bytes:
+        enc = enc_and_ciphertext[:ENC_SIZE]
+        ciphertext = enc_and_ciphertext[ENC_SIZE:]
 
+        dh = _ecdh(self.private_key_bytes, enc)
+        shared_secret = _extract_and_expand(dh, enc + self.public_key_bytes)
+        key, base_nonce = _key_schedule(shared_secret, info)
 
-def bind_key_to_pcr(
-    keypair: HpkeKeypair,
-    config: AttestationConfig,
-) -> VaportpmOutput:
-    key_hash = hashlib.sha256(keypair.public_key_bytes).digest()
-    extend_pcr(config, config.pcr_key_index, key_hash)
-    nonce = os.urandom(32)
-    return generate_attestation(config, nonce=nonce)
-
-
-def _ecdh(private_bytes: bytes, peer_public_bytes: bytes) -> bytes:
-    private_key = X25519PrivateKey.from_private_bytes(private_bytes)
-    peer_public = X25519PublicKey.from_public_bytes(peer_public_bytes)
-    return private_key.exchange(peer_public)
+        aesgcm = AESGCM(key)
+        return aesgcm.decrypt(base_nonce, ciphertext, aad)
 
 
 def hpke_seal(
@@ -145,84 +142,3 @@ def hpke_seal(
     aesgcm = AESGCM(key)
     ciphertext = aesgcm.encrypt(base_nonce, plaintext, aad)
     return enc + ciphertext
-
-
-def hpke_open(
-    recipient_private_bytes: bytes,
-    recipient_public_bytes: bytes,
-    info: bytes,
-    aad: bytes,
-    enc_and_ciphertext: bytes,
-) -> bytes:
-    enc = enc_and_ciphertext[:ENC_SIZE]
-    ciphertext = enc_and_ciphertext[ENC_SIZE:]
-
-    dh = _ecdh(recipient_private_bytes, enc)
-    shared_secret = _extract_and_expand(dh, enc + recipient_public_bytes)
-    key, base_nonce = _key_schedule(shared_secret, info)
-
-    aesgcm = AESGCM(key)
-    return aesgcm.decrypt(base_nonce, ciphertext, aad)
-
-
-def decrypt_arguments(
-    keypair: HpkeKeypair,
-    encrypted_arguments_b64: str,
-    aad: bytes,
-) -> DecryptedBlindCall:
-    raw = base64.urlsafe_b64decode(encrypted_arguments_b64 + "==")
-
-    plaintext = hpke_open(
-        keypair.private_key_bytes,
-        keypair.public_key_bytes,
-        HPKE_INFO_ARGS,
-        aad,
-        raw,
-    )
-
-    payload = json.loads(plaintext)
-    salt_hex: str = payload["salt"]
-    salt = bytes.fromhex(salt_hex.removeprefix("0x"))
-    arguments: dict[str, Any] = payload["arguments"]
-
-    return DecryptedBlindCall(salt=salt, arguments=arguments)
-
-
-def encrypt_reply(
-    content: list[dict[str, Any]],
-    reply_public_key_b64: str,
-    aad: bytes,
-) -> str:
-    plaintext = _jcs(content)
-    reply_public_bytes = base64.urlsafe_b64decode(reply_public_key_b64 + "==")
-
-    sealed = hpke_seal(reply_public_bytes, HPKE_INFO_REPLY, aad, plaintext)
-    return base64.urlsafe_b64encode(sealed).decode().rstrip("=")
-
-
-def build_args_aad(
-    tool_name: str,
-    input_commitment: str,
-    encryption_scheme: str,
-) -> bytes:
-    return _jcs(
-        {
-            "tool": tool_name,
-            "inputCommitment": input_commitment,
-            "encryptionScheme": encryption_scheme,
-        }
-    )
-
-
-def build_reply_aad(
-    tool_name: str,
-    input_commitment: str,
-    nonce: str | None,
-) -> bytes:
-    obj: dict[str, str] = {
-        "tool": tool_name,
-        "inputCommitment": input_commitment,
-    }
-    if nonce is not None:
-        obj["nonce"] = nonce
-    return _jcs(obj)

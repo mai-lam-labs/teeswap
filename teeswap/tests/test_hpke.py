@@ -14,11 +14,10 @@ import pytest
 from cryptography.exceptions import InvalidTag
 
 from teeswap.hpke import (
+    HpkeKeypair,
     _ecdh,
     _extract_and_expand,
     _key_schedule,
-    generate_keypair,
-    hpke_open,
     hpke_seal,
 )
 
@@ -70,24 +69,25 @@ def test_seal_matches_rfc_vector() -> None:
 
 
 def test_open_decrypts_rfc_vector() -> None:
+    recipient = HpkeKeypair(private_key_bytes=SK_R, public_key_bytes=PK_R)
     enc_and_ciphertext = PK_E + EXPECTED_CIPHERTEXT
-    plaintext = hpke_open(SK_R, PK_R, INFO, AAD, enc_and_ciphertext)
+    plaintext = recipient.open(INFO, AAD, enc_and_ciphertext)
     assert plaintext == PLAINTEXT
 
 
 def test_round_trip_with_random_keys() -> None:
-    kp = generate_keypair()
+    kp = HpkeKeypair.random()
     info = b"test-info"
     aad = b"test-aad"
     message = b"hello from teeswap"
 
     sealed = hpke_seal(kp.public_key_bytes, info, aad, message)
-    decrypted = hpke_open(kp.private_key_bytes, kp.public_key_bytes, info, aad, sealed)
+    decrypted = kp.open(info, aad, sealed)
     assert decrypted == message
 
 
 def test_wrong_aad_fails() -> None:
-    kp = generate_keypair()
+    kp = HpkeKeypair.random()
     sealed = hpke_seal(kp.public_key_bytes, b"info", b"correct-aad", b"secret")
     with pytest.raises(InvalidTag):
-        hpke_open(kp.private_key_bytes, kp.public_key_bytes, b"info", b"wrong-aad", sealed)
+        kp.open(b"info", b"wrong-aad", sealed)

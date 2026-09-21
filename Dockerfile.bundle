@@ -1,6 +1,6 @@
 ARG PYVER=3.14
 
-FROM alpine:3.22 AS build
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS build
 ARG PYVER
 
 RUN apk add --no-cache curl bash
@@ -8,20 +8,24 @@ RUN apk add --no-cache curl bash
 RUN curl -LsSf https://astral.sh/uv/install.sh \
     | env UV_UNMANAGED_INSTALL=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
 
-COPY . /src
-WORKDIR /src
-
 # Install musl Python — uv creates a versioned dir + symlink, rename the real dir.
 RUN uv python install cpython-${PYVER}-linux-x86_64-musl --install-dir /tmp/py --quiet \
  && mv /tmp/py/cpython-${PYVER}.*-linux-x86_64-musl /bundle
 
-RUN uv pip install --python /bundle/bin/python${PYVER} --break-system-packages . --quiet
+# Dependencies first — only re-fetched when pyproject.toml or uv.lock changes.
+COPY pyproject.toml uv.lock /src/
+WORKDIR /src
+RUN uv pip install --python /bundle/bin/python${PYVER} --break-system-packages . --locked --quiet
+
+# Now copy source and reinstall (only the local package changes, deps are cached).
+COPY . /src
+RUN uv pip install --python /bundle/bin/python${PYVER} --break-system-packages . --locked --quiet
 
 # --- strip: libpython .so (statically linked into the binary) ---
 RUN rm -f /bundle/lib/libpython*.so* /bundle/lib/libpython*.a
 
 # --- strip: Tcl/Tk (no GUI) ---
-RUN rm -rf /bundle/lib/libtcl* /bundle/lib/itcl* /bundle/lib/thread* \
+RUN rm -rf /bundle/lib/libtcl* /bundle/lib/itcl* /bundle/lib/thread*  \
            /bundle/lib/tcl* /bundle/lib/tk*
 
 # --- strip: headers, man pages, pkgconfig ---
@@ -61,9 +65,12 @@ RUN find /bundle/bin -type f ! -name "python${PYVER}" -delete 2>/dev/null || tru
 RUN du -sh /bundle
 
 # --- final image ---
-FROM alpine:3.22
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 ARG PYVER
+ARG VAPORTPM_BIN=dist/x86_64/vaportpm-attest
 COPY --from=build /bundle /bundle
+COPY ${VAPORTPM_BIN} /usr/bin/vaportpm-attest
+RUN chmod +x /usr/bin/vaportpm-attest
 RUN ln -s python${PYVER} /bundle/bin/python
 RUN printf '#!/bin/sh\nexec /bundle/bin/python -m teeswap container-init\n' > /init && chmod +x /init
 ENTRYPOINT ["/bundle/bin/python", "-m", "teeswap"]
