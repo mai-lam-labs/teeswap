@@ -198,5 +198,3 @@ def _drop_privileges(user: str) -> None:
     os.setuid(pw.pw_uid)
     os.environ["HOME"] = pw.pw_dir
     click.echo(f"dropped privileges to {user} (uid={pw.pw_uid})", err=True)
-
-

@@ -181,11 +181,13 @@ class DecryptedBlindCall:
 
 
 def build_args_aad(tool_name: str, input_commitment: str, encryption_scheme: str) -> bytes:
-    return jcs({
-        "tool": tool_name,
-        "inputCommitment": input_commitment,
-        "encryptionScheme": encryption_scheme,
-    })
+    return jcs(
+        {
+            "tool": tool_name,
+            "inputCommitment": input_commitment,
+            "encryptionScheme": encryption_scheme,
+        }
+    )
 
 
 def build_reply_aad(tool_name: str, input_commitment: str, nonce: str | None) -> bytes:

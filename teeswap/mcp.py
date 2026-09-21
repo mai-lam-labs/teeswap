@@ -385,7 +385,10 @@ async def _handle_blind_call(dispatcher: Dispatcher, rpc: JsonRpcRequest) -> Mcp
 
     try:
         decrypted = blind.decrypt_call(
-            name, encrypted_arguments, input_commitment, encryption_scheme,
+            name,
+            encrypted_arguments,
+            input_commitment,
+            encryption_scheme,
         )
         blind.verify_commitment(decrypted, input_commitment)
     except (ValueError, KeyError, cryptography.exceptions.InvalidTag) as e:
