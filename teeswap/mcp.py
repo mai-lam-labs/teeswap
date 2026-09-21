@@ -384,7 +384,9 @@ async def _handle_blind_call(dispatcher: Dispatcher, rpc: JsonRpcRequest) -> Mcp
         return McpResult(body=_error(rpc.id, -32602, f"unsupported scheme: {encryption_scheme}"))
 
     try:
-        decrypted = blind.decrypt_call(name, encrypted_arguments, input_commitment, encryption_scheme)
+        decrypted = blind.decrypt_call(
+            name, encrypted_arguments, input_commitment, encryption_scheme,
+        )
         blind.verify_commitment(decrypted, input_commitment)
     except (ValueError, KeyError, cryptography.exceptions.InvalidTag) as e:
         return McpResult(body=_error(rpc.id, -32602, f"decryption failed: {e}"))
@@ -423,18 +425,18 @@ async def jsonl_loop(
     dispatcher: Dispatcher,
     sessions: SessionManager,
     session: Session,
-    input: TextIO,
-    output: TextIO,
+    reader: TextIO,
+    writer: TextIO,
 ) -> None:
     def write(obj: dict[str, Any]) -> None:
-        output.write(json.dumps(obj))
-        output.write("\n")
-        output.flush()
+        writer.write(json.dumps(obj))
+        writer.write("\n")
+        writer.flush()
 
     def write_error(req_id: Any, code: int, message: str) -> None:
         write({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
 
-    for raw_line in input:
+    for raw_line in reader:
         stripped = raw_line.strip()
         if not stripped:
             continue

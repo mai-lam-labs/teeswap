@@ -81,7 +81,7 @@ ignore = [
 # Tests use assert and exercise internals on purpose.
 "teeswap/tests/**" = ["S101", "S106", "SLF", "ARG"]
 # Subprocess calls to known binaries (cast, vaportpm) are the architecture, not a vulnerability.
-"teeswap/attestation.py" = ["S603"]
+"teeswap/vaportpm.py" = ["S603"]
 "teeswap/chain.py" = ["S603"]
 # container-init re-execs itself after dropping privileges — os.execvp is intentional.
 "teeswap/cli.py" = ["S606"]
