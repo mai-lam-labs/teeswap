@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 from .blockchain.chains import Chain, ChainFamily
 from .blockchain.rpc import RpcConfig
+from .types import HasFromDict
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +149,7 @@ _DEFAULT_RPCS: tuple[RpcConfig, ...] = (
 
 
 @dataclass(frozen=True, slots=True)
-class ContainerInitConfig:
+class TeeSwapConfig(HasFromDict):
     facilitators: tuple[FacilitatorConfig, ...] = _DEFAULT_FACILITATORS
     chains: tuple[Chain, ...] = _DEFAULT_CHAINS
     rpcs: tuple[RpcConfig, ...] = _DEFAULT_RPCS

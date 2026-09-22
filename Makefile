@@ -42,6 +42,8 @@ FOUNDRY_TARBALL  := foundry_$(FOUNDRY_VERSION)_linux_amd64.tar.gz
 FOUNDRY_SHA256   := 7ca48e6ca3cac1bce1403ca67e5bc1dc3bc1fd818199c9957c7165079c228568
 FOUNDRY_URL      := https://github.com/foundry-rs/foundry/releases/download/$(FOUNDRY_VERSION)/$(FOUNDRY_TARBALL)
 ANVIL            := dist/tools/anvil
+ANVIL_PORT       ?= 8545
+ANVIL_PID        := dist/tools/anvil.pid
 
 SERVE_HOST ?= 10.0.2.1:8000
 FORWARD_PORTS ?= 8402
@@ -51,7 +53,7 @@ KVM_GID   := $(shell stat -c %g /dev/kvm 2>/dev/null || echo "")
 KVM_MOUNT := $(shell test -e /dev/kvm && echo "-v /dev/kvm:/dev/kvm")
 DOCKER_OPT_KVM := $(if $(KVM_GID),--group-add $(KVM_GID)) $(KVM_MOUNT)
 
-.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check build fetch-anvil clean distclean
+.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check build anvil-fetch anvil-run anvil-start anvil-stop clean distclean
 
 help:
 	@echo "targets: install | check | bundle-<arch> | payload-<arch> | boot-<arch> | clean | distclean"
@@ -93,8 +95,8 @@ check: lint format-check typecheck test
 build:
 	"$(UV)" build --python "$(PY)" --out-dir dist
 
-# ---- fetch-anvil: project-local Foundry anvil for EVM integration tests ----
-fetch-anvil:
+# ---- anvil: local EVM node for integration tests ----
+anvil-fetch:
 	@if test -x "$(ANVIL)"; then echo ">> anvil already at $(ANVIL)"; else \
 	  mkdir -p dist/tools && \
 	  curl -LsSf "$(FOUNDRY_URL)" -o dist/tools/$(FOUNDRY_TARBALL) && \
@@ -103,6 +105,32 @@ fetch-anvil:
 	  tar -xzf dist/tools/$(FOUNDRY_TARBALL) -C dist/tools anvil && \
 	  rm dist/tools/$(FOUNDRY_TARBALL) && \
 	  echo ">> anvil $(FOUNDRY_VERSION) ready at $(ANVIL)"; \
+	fi
+
+anvil-run: anvil-fetch
+	$(ANVIL) --port $(ANVIL_PORT) --accounts 10 --balance 1000
+
+anvil-start: anvil-fetch
+	@if test -f "$(ANVIL_PID)" && kill -0 $$(cat "$(ANVIL_PID)") 2>/dev/null; then \
+	  echo ">> anvil already running (pid $$(cat "$(ANVIL_PID)"))"; \
+	else \
+	  nohup $(ANVIL) --port $(ANVIL_PORT) --accounts 10 --balance 1000 --silent \
+	    > dist/tools/anvil.log 2>&1 & echo $$! > "$(ANVIL_PID)"; \
+	  sleep 1; \
+	  if kill -0 $$(cat "$(ANVIL_PID)") 2>/dev/null; then \
+	    echo ">> anvil started on :$(ANVIL_PORT) (pid $$(cat "$(ANVIL_PID)"))"; \
+	  else \
+	    echo "error: anvil failed to start"; rm -f "$(ANVIL_PID)"; exit 1; \
+	  fi; \
+	fi
+
+anvil-stop:
+	@if test -f "$(ANVIL_PID)" && kill -0 $$(cat "$(ANVIL_PID)") 2>/dev/null; then \
+	  kill $$(cat "$(ANVIL_PID)") && echo ">> anvil stopped"; \
+	  rm -f "$(ANVIL_PID)"; \
+	else \
+	  echo ">> anvil not running"; \
+	  rm -f "$(ANVIL_PID)"; \
 	fi
 
 # ---- bundle-<arch>: Docker image with stripped musl Python + teeswap ----

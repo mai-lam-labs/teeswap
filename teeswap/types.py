@@ -1,10 +1,16 @@
 import enum
 from dataclasses import dataclass, field
-from typing import Annotated, Any, ClassVar
+from datetime import datetime
+from typing import Annotated, Any, ClassVar, Self, override
 
+import dacite
+from eth_typing import Hash32
 from litestar.params import Parameter
 
-# --- Validated newtypes ---
+from .blockchain.chains import Chain
+from .response import DataclassResponse
+
+# --- Base mixins ---
 
 
 class Validated:
@@ -13,6 +19,19 @@ class Validated:
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         Validated.registry.append(cls)
+
+
+class HasFromDict:
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return dacite.from_dict(
+            data_class=cls,
+            data=data,  # pyrefly: ignore[bad-argument-type]
+            config=dacite.Config(strict=True, cast=Validated.registry),
+        )
+
+
+# --- Validated newtypes ---
 
 
 class HexStr(str, Validated):
@@ -33,41 +52,83 @@ class HexEd25519PublicKey(HexStr):
     LENGTH = 32
 
 
+# --- Duration types ---
+
+
+class Millis(int):
+    def to_seconds(self) -> Seconds:
+        return Seconds(self / 1000)
+
+
+class Seconds(float):
+    def to_millis(self) -> Millis:
+        return Millis(int(self * 1000))
+
+
+# --- URL with secrets ---
+
+
+@dataclass(frozen=True, slots=True)
+class SecureUrl:
+    url: str
+    id: str | None = None
+    secret_headers: dict[str, str] = field(default_factory=dict)
+    url_secrets: dict[str, str] = field(default_factory=dict)
+
+    @override
+    def __str__(self) -> str:
+        return self.id or self.url
+
+
 # --- Domain types ---
 
 
-class ChainFamily(enum.StrEnum):
-    EVM = "evm"
-    SOLANA = "solana"
-
-
 @dataclass(frozen=True, slots=True)
-class ChainId:
-    name: str
-    chain_id: int
-    family: ChainFamily
-    rpc_url: str
-
-
-@dataclass(frozen=True, slots=True)
-class TokenInfo:
+class Token:
     symbol: str
-    address: str
-    chain: str
+    chain: Chain
+    contract: str | None
     decimals: int
 
 
-class RiskPreference(enum.StrEnum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
+@dataclass(frozen=True, slots=True)
+class TokenAmount:
+    token: Token
+    amount: int
 
 
-class RouteOrder(enum.StrEnum):
-    RECOMMENDED = "RECOMMENDED"
-    FASTEST = "FASTEST"
-    CHEAPEST = "CHEAPEST"
-    SAFEST = "SAFEST"
+class AmountQualifier(enum.StrEnum):
+    EXACT = "exact"
+    AT_LEAST = "at_least"
+    BEST_RATE = "best_rate"
+
+
+@dataclass(frozen=True, slots=True)
+class TokenRequirement:
+    token: Token
+    amount: int
+    qualifier: AmountQualifier
+    tolerance_percent: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Transaction:
+    chain: Chain
+    hash: Hash32
+    timestamp: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class HttpExchange:
+    timestamp: datetime
+    method: str
+    url: str
+    request_headers: dict[str, str]
+    request_body: bytes | None
+    status_code: int
+    response_headers: dict[str, str]
+    response_body: bytes
+    latency: Millis
 
 
 class ProtocolClass(enum.StrEnum):
@@ -77,141 +138,70 @@ class ProtocolClass(enum.StrEnum):
     D = "D"
 
 
-@dataclass(frozen=True, slots=True)
-class RiskProfile:
-    score: float
-    max_admin_risk: str
-    worst_leg_incidents_12mo: int
-    has_judgment_oracle_dependency: bool
+# --- Quote / Invoice request types ---
 
 
 @dataclass(frozen=True, slots=True)
-class Leg:
-    protocol: str
-    action: str
-    chain: str
-    protocol_class: ProtocolClass
-    estimated_time_seconds: int
+class Output:
+    token: Annotated[Token, Parameter(description="Token to deliver")]
+    amount: Annotated[int, Parameter(description="Amount in smallest units")]
+    recipient: Annotated[str, Parameter(description="Destination address")]
 
 
 @dataclass(frozen=True, slots=True)
-class Route:
-    legs: tuple[Leg, ...]
-    estimated_total_time_seconds: int
-    risk_profile: RiskProfile
-
-
-class InputMethod(enum.StrEnum):
-    X402_PASSTHROUGH = "x402-passthrough"
-    X402_TO_TEE = "x402-to-tee"
-    DIRECT_DEPOSIT = "direct-deposit"
+class QuoteRequest(HasFromDict):
+    input: Annotated[TokenAmount, Parameter(description="What the user is depositing")]
+    outputs: Annotated[tuple[Output, ...], Parameter(description="Where to send the results")]
+    tolerance_percent: Annotated[
+        float, Parameter(description="Acceptable slippage as a percentage", ge=0, le=10)
+    ] = 0.5
 
 
 @dataclass(frozen=True, slots=True)
-class QuoteRequest:
-    input_token: Annotated[str, Parameter(description="Token symbol ('USDC') or contract address")]
-    input_chain: Annotated[
-        str, Parameter(description="Source chain ('base', 'ethereum', 'arbitrum')")
-    ]
-    input_amount: Annotated[
-        str, Parameter(description="Human-readable decimal amount, not raw wei")
-    ]
-    output_token: Annotated[str, Parameter(description="Destination token symbol or address")]
-    output_chain: Annotated[str, Parameter(description="Destination chain name")]
-    recipient: Annotated[
-        str, Parameter(description="Destination address (format must match chain)")
-    ]
-    risk_preference: RiskPreference = RiskPreference.MEDIUM
-    order: RouteOrder = RouteOrder.RECOMMENDED
-    slippage_bps: Annotated[
-        int, Parameter(description="Slippage tolerance in basis points", ge=1, le=500)
-    ] = 50
-    exclude_protocols: tuple[str, ...] = ()
-    max_price_cap: Annotated[
-        str | None, Parameter(description="Refuse if total cost exceeds this")
-    ] = None
+class GasEstimate:
+    token: Token
+    amount: Annotated[int, Parameter(description="Estimated gas cost in smallest units")]
 
 
 @dataclass(frozen=True, slots=True)
-class QuoteResponse:
+class OutputEstimate:
+    recipient: str
+    token: Token
+    amount: Annotated[int, Parameter(description="Estimated amount after gas and fees")]
+
+
+@dataclass(frozen=True)
+class QuoteResponse(DataclassResponse):
+    quote_id: Annotated[str, Parameter(description="Use this ID with teeswap_accept")]
+    input: TokenAmount
+    outputs: tuple[OutputEstimate, ...]
+    gas: GasEstimate
+    fee: TokenAmount
+    expires_at: Annotated[datetime, Parameter(description="Quote expires at this time (UTC)")]
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptRequest(HasFromDict):
+    quote_id: Annotated[str, Parameter(description="Quote ID from teeswap_quote")]
+
+
+@dataclass(frozen=True, slots=True)
+class DepositInstruction:
+    address: Annotated[str, Parameter(description="Send funds to this address")]
+    amount: Annotated[TokenAmount, Parameter(description="Exact amount to deposit")]
+    chain: Annotated[Chain, Parameter(description="Chain to deposit on")]
+
+
+@dataclass(frozen=True)
+class AcceptResponse(DataclassResponse):
     quote_id: str
-    output_amount: Annotated[
-        str, Parameter(description="Estimated output in human-readable decimal")
+    deposits: Annotated[
+        tuple[DepositInstruction, ...], Parameter(description="What to deposit and where")
     ]
-    min_output_amount: Annotated[str, Parameter(description="Minimum output after slippage")]
-    route: Route
-    input_method: InputMethod
-    deposit_address: Annotated[
-        str | None, Parameter(description="Only set for direct-deposit method")
-    ]
-    deadline: Annotated[int, Parameter(description="Quote expiry as unix timestamp")]
-    execution_payment: dict[str, str] = field(default_factory=dict)
+    expires_at: Annotated[datetime, Parameter(description="Deposits must arrive before this time")]
+    instructions: Annotated[str, Parameter(description="Human-readable deposit instructions")]
 
 
 @dataclass(frozen=True, slots=True)
-class ExecuteRequest:
-    quote_id: Annotated[str, Parameter(description="Quote ID from teeswap_quote response")]
-
-
-@dataclass(frozen=True, slots=True)
-class LegStatus:
-    step: int
-    protocol: str
-    chain: str
-    tx_hash: str | None
-    status: str
-    timestamp: int | None
-
-
-@dataclass(frozen=True, slots=True)
-class StatusResponse:
-    order_id: str
-    status: str
-    legs: tuple[LegStatus, ...]
-    output_amount: Annotated[
-        str | None, Parameter(description="Actual output amount once delivered")
-    ]
-
-
-@dataclass(frozen=True, slots=True)
-class StatusRequest:
-    order_id: Annotated[str, Parameter(description="Order ID from teeswap_execute response")]
-
-
-@dataclass(frozen=True, slots=True)
-class RoutesFilter:
-    input_chain: Annotated[str | None, Parameter(description="Filter by source chain")] = None
-    output_chain: Annotated[str | None, Parameter(description="Filter by destination chain")] = None
-    input_token: Annotated[str | None, Parameter(description="Filter by source token")] = None
-    output_token: Annotated[str | None, Parameter(description="Filter by destination token")] = None
-
-
-@dataclass(frozen=True, slots=True)
-class RefundRequest:
-    order_id: Annotated[str, Parameter(description="Order ID of the failed/timed-out swap")]
-
-
-@dataclass(frozen=True, slots=True)
-class RefundResponse:
-    order_id: str
-    status: str
-    tx_hash: str | None
-    refund_amount: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class InvoiceListRequest:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class InvoiceDetailRequest:
-    invoice_id: Annotated[str, Parameter(description="Invoice ID")]
-
-
-@dataclass(frozen=True, slots=True)
-class InvoicePayRequest:
-    invoice_id: Annotated[str, Parameter(description="Invoice ID to pay")]
-    authorization: Annotated[str, Parameter(description="Signed x402 payment authorization")]
-    chain_id: Annotated[int, Parameter(description="Chain ID for the payment")]
-    payer: Annotated[str, Parameter(description="Payer address")]
+class StatusRequest(HasFromDict):
+    quote_id: Annotated[str, Parameter(description="Quote/invoice ID")]

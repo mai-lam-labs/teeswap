@@ -2,9 +2,30 @@
 
 import time
 
-from ..blockchain import RpcMonitor
-from ..blockchain.rpc import RpcStatus
+from ..blockchain.rpc import RpcMonitor, RpcStatus
 from ..facilitator import FacilitatorMonitor
+from ..invoice import InvoiceRegistry
+from .html import (
+    a,
+    button,
+    div,
+    document,
+    form,
+    h1,
+    input_,
+    label,
+    meta,
+    nav,
+    p,
+    span,
+    style,
+    table,
+    tbody,
+    td,
+    th,
+    thead,
+    tr,
+)
 
 _LOGIN_CSS = """
 body { font-family: system-ui, sans-serif; background: #0c0a09; color: #e7e5e4;
@@ -62,172 +83,271 @@ td { padding: 10px 8px 10px 0; border-bottom: 1px solid #1c1917;
 .lat { font-variant-numeric: tabular-nums; }
 """
 
+_NAV_ITEMS = [
+    ("Invoices", "/operator/invoices"),
+    ("Processes", "/operator/processes"),
+    ("Facilitators", "/operator/facilitators"),
+    ("RPCs", "/operator/rpcs"),
+]
 
-def _head(title: str, css: str) -> str:
-    return (
-        "<!doctype html><html><head>"
-        '<meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        f"<title>{title}</title>"
-        f"<style>{css}</style>"
-        "</head><body>"
-    )
+
+def _badge(label_text: str, css: str) -> None:
+    span(label_text, cls=css)
+
+
+def _stat(value: str, label_text: str) -> None:
+    with div(cls="stat"):
+        div(value, cls="sv")
+        div(label_text, cls="sl")
+
+
+def _nav_bar(active: str) -> None:
+    with nav():
+        for label_text, href in _NAV_ITEMS:
+            cls = "active" if label_text == active else False
+            a(label_text, href=href, cls=cls)
+
+
+def _dash_page(title: str) -> document:
+    doc = document(title)
+    with doc.head:
+        meta(charset="utf-8")
+        meta(name="viewport", content="width=device-width,initial-scale=1")
+        style(_DASH_CSS)
+    return doc
+
+
+def _dash_header(active_nav: str) -> None:
+    a("Log out", href="/operator/logout", cls="lo")
+    h1("Operator Dashboard")
+    p("TEESwap deployment health", cls="sub")
+    _nav_bar(active_nav)
+
+
+def _header_cols(*cols: str) -> None:
+    with thead(), tr():
+        for col in cols:
+            th(col)
+
+
+def _empty_row(message: str, colspan: int) -> None:
+    with tr():
+        td(message, colspan=str(colspan), style="color:#a8a29e")
+
+
+# --- Login ---
 
 
 def render_login(error: str = "") -> str:
-    err = f'<p class="error">{error}</p>' if error else ""
-    return (
-        _head("Operator Login", _LOGIN_CSS)
-        + '<form method="POST" action="/operator/login">'
-        + f"<h1>Operator Login</h1>{err}"
-        + '<label for="password">Password</label>'
-        + '<input type="password" name="password" id="password" autofocus>'
-        + '<button type="submit">Log in</button>'
-        + "</form></body></html>"
-    )
+    doc = document("Operator Login")
+    with doc.head:
+        meta(charset="utf-8")
+        meta(name="viewport", content="width=device-width,initial-scale=1")
+        style(_LOGIN_CSS)
+    with doc.body, form(method="POST", action="/operator/login"):
+        h1("Operator Login")
+        if error:
+            p(error, cls="error")
+        label("Password", for_="password")
+        input_(type="password", name="password", id="password", autofocus=True)
+        button("Log in", type="submit")
+    return str(doc)
 
 
-def _nav(active: str) -> str:
-    items = [("Facilitators", "/operator"), ("RPCs", "/operator/rpcs")]
-    links = ""
-    for label, href in items:
-        cls = ' class="active"' if label == active else ""
-        links += f'<a href="{href}"{cls}>{label}</a>'
-    return f"<nav>{links}</nav>"
+# --- Facilitators ---
 
 
 def render_facilitators(monitor: FacilitatorMonitor) -> str:
     snapshot = monitor.snapshot
-    rows = ""
-    for url, status in sorted(snapshot.facilitators.items()):
-        health = (
-            '<span class="up">UP</span>' if status.healthy else '<span class="down">DOWN</span>'
-        )
-        networks = ", ".join(sorted({k.network for k in status.kinds})) if status.kinds else "—"
-        schemes = ", ".join(sorted({k.scheme for k in status.kinds})) if status.kinds else "—"
-        extensions = ", ".join(status.extensions) if status.extensions else "—"
-        age = f"{time.time() - status.last_polled:.0f}s ago"
-        rows += (
-            f"<tr><td>{health}</td>"
-            f'<td class="mono">{url}</td>'
-            f"<td>{schemes}</td>"
-            f'<td class="nets">{networks}</td>'
-            f"<td>{extensions}</td>"
-            f'<td class="age">{age}</td></tr>'
-        )
-
-    kind_count = len(snapshot.available_kinds)
-    net_count = len(snapshot.available_networks)
     fac_count = len(snapshot.facilitators)
-    healthy = sum(1 for f in snapshot.facilitators.values() if f.healthy)
+    healthy_count = sum(1 for f in snapshot.facilitators.values() if f.healthy)
 
-    empty = '<tr><td colspan="6" style="color:#a8a29e">No facilitators configured</td></tr>'
+    doc = _dash_page("Operator Dashboard — Facilitators")
+    with doc.body, div(cls="c"):
+        _dash_header("Facilitators")
+        with div(cls="stats"):
+            _stat(f"{healthy_count}/{fac_count}", "Facilitators healthy")
+            _stat(str(len(snapshot.available_kinds)), "Payment kinds")
+            _stat(str(len(snapshot.available_networks)), "Networks")
 
-    return (
-        _head("Operator Dashboard", _DASH_CSS)
-        + '<div class="c">'
-        + '<a href="/operator/logout" class="lo">Log out</a>'
-        + "<h1>Operator Dashboard</h1>"
-        + '<p class="sub">TEESwap deployment health</p>'
-        + _nav("Facilitators")
-        + '<div class="stats">'
-        + f'<div class="stat"><div class="sv">{healthy}/{fac_count}</div>'
-        + '<div class="sl">Facilitators healthy</div></div>'
-        + f'<div class="stat"><div class="sv">{kind_count}</div>'
-        + '<div class="sl">Payment kinds</div></div>'
-        + f'<div class="stat"><div class="sv">{net_count}</div>'
-        + '<div class="sl">Networks</div></div>'
-        + "</div>"
-        + '<div class="ox"><table>'
-        + "<thead><tr>"
-        + "<th>Status</th><th>Facilitator</th><th>Schemes</th>"
-        + "<th>Networks</th><th>Extensions</th><th>Polled</th>"
-        + "</tr></thead>"
-        + f"<tbody>{rows or empty}</tbody>"
-        + "</table></div>"
-        + "</div></body></html>"
-    )
+        with div(cls="ox"), table():
+            _header_cols("Status", "Facilitator", "Schemes", "Networks", "Extensions", "Polled")
+            with tbody():
+                if not snapshot.facilitators:
+                    _empty_row("No facilitators configured", 6)
+                else:
+                    for url, status in sorted(snapshot.facilitators.items()):
+                        with tr():
+                            with td():
+                                _badge(
+                                    "UP" if status.healthy else "DOWN",
+                                    "up" if status.healthy else "down",
+                                )
+                            td(url, cls="mono")
+                            td(", ".join(sorted({k.scheme for k in status.kinds})) or "—")
+                            td(
+                                ", ".join(sorted({k.network for k in status.kinds})) or "—",
+                                cls="nets",
+                            )
+                            td(", ".join(status.extensions) or "—")
+                            td(f"{time.time() - status.last_polled:.0f}s ago", cls="age")
+    return str(doc)
 
 
-def _render_rpc_row(chain_name: str, url: str, status: RpcStatus | None) -> str:
-    if status is None:
-        return (
-            f'<tr><td><span class="warn">PENDING</span></td>'
-            f"<td>{chain_name}</td>"
-            f'<td class="mono">{url}</td>'
-            f"<td>—</td><td>—</td><td>—</td><td>—</td><td></td></tr>"
-        )
+# --- Invoices ---
 
-    health = '<span class="up">UP</span>' if status.healthy else '<span class="down">DOWN</span>'
 
-    if status.chain_id_match is None:
-        id_match = "—"
-    elif status.chain_id_match:
-        id_match = '<span class="up">OK</span>'
-    else:
-        id_match = '<span class="down">MISMATCH</span>'
+def render_invoices(registry: InvoiceRegistry) -> str:
+    invoices = registry.all()
+    total = len(invoices)
+    active_count = sum(1 for i in invoices if i.is_active)
 
-    block = str(status.block_height) if status.block_height is not None else "—"
-    latency = (
-        f'<span class="lat">{status.latency_ms:.0f}ms</span>'
-        if status.latency_ms is not None
-        else "—"
-    )
-    age = f"{time.time() - status.last_polled:.0f}s ago"
-    err = status.error or ""
+    doc = _dash_page("Operator Dashboard — Invoices")
+    with doc.body, div(cls="c"):
+        _dash_header("Invoices")
+        with div(cls="stats"):
+            _stat(str(total), "Total invoices")
+            _stat(str(active_count), "Active")
 
-    return (
-        f"<tr><td>{health}</td>"
-        f"<td>{chain_name}</td>"
-        f'<td class="mono">{url}</td>'
-        f"<td>{id_match}</td>"
-        f"<td>{block}</td>"
-        f"<td>{latency}</td>"
-        f'<td class="age">{age}</td>'
-        f'<td class="mono" style="color:#a8a29e">{err}</td></tr>'
-    )
+        with div(cls="ox"), table():
+            _header_cols(
+                "Status", "ID", "Chain", "Have", "Want", "Deposit", "Actions", "Current", "Created"
+            )
+            with tbody():
+                if not invoices:
+                    _empty_row("No invoices", 9)
+                else:
+                    for inv in sorted(invoices, key=lambda i: i.created_at, reverse=True):
+                        css = (
+                            "up"
+                            if inv.is_active
+                            else ("down" if inv.status.value == "failed" else "warn")
+                        )
+                        current = inv.current_action
+                        with tr():
+                            with td():
+                                _badge(inv.status.value.upper(), css)
+                            td(str(inv.id), cls="mono")
+                            td(inv.source_chain.name)
+                            inp = inv.request.input
+                            td(f"{inp.amount} {inp.token.symbol}")
+                            td(f"{len(inv.request.outputs)} output(s)")
+                            td((inv.deposit_address or "—")[:10] + "…", cls="mono")
+                            td(str(len(inv.actions)))
+                            td(current.description if current else "—")
+                            td(inv.created_at.strftime("%Y-%m-%d %H:%M"), cls="age")
+    return str(doc)
+
+
+# --- Processes ---
+
+
+def render_processes(registry: InvoiceRegistry) -> str:
+    active = registry.active()
+
+    doc = _dash_page("Operator Dashboard — Processes")
+    with doc.body, div(cls="c"):
+        _dash_header("Processes")
+        with div(cls="stats"):
+            _stat(str(len(active)), "Active processes")
+
+        with div(cls="ox"), table():
+            _header_cols("Invoice", "Action", "Step", "Status", "Chain", "Started")
+            with tbody():
+                if not active:
+                    _empty_row("No active processes", 6)
+                else:
+                    for inv in active:
+                        action = inv.current_action
+                        step = action.current_step if action else None
+                        with tr():
+                            td(str(inv.id), cls="mono")
+                            td(action.description if action else "—")
+                            td(step.operation if step else "—")
+                            with td():
+                                _badge(step.status.value if step else "—", "warn")
+                            td(step.chain.name if step and step.chain else "—")
+                            td(
+                                step.started_at.strftime("%H:%M:%S")
+                                if step and step.started_at
+                                else "—",
+                                cls="age",
+                            )
+    return str(doc)
+
+
+# --- RPCs ---
+
+
+def _rpc_row(chain_name: str, url: str, status: RpcStatus | None) -> None:
+    with tr():
+        if status is None:
+            with td():
+                _badge("PENDING", "warn")
+            td(chain_name)
+            td(url, cls="mono")
+            for _ in range(5):
+                td("—")
+            return
+
+        with td():
+            _badge("UP" if status.healthy else "DOWN", "up" if status.healthy else "down")
+        td(chain_name)
+        td(url, cls="mono")
+
+        if status.chain_id_match is None:
+            td("—")
+        elif status.chain_id_match:
+            with td():
+                _badge("OK", "up")
+        else:
+            with td():
+                _badge("MISMATCH", "down")
+
+        td(str(status.block_height) if status.block_height is not None else "—")
+        if status.latency_ms is not None:
+            with td():
+                span(f"{status.latency_ms:.0f}ms", cls="lat")
+        else:
+            td("—")
+        td(f"{time.time() - status.last_polled:.0f}s ago", cls="age")
+        td(status.error or "", cls="mono", style="color:#a8a29e")
 
 
 def render_rpcs(monitor: RpcMonitor) -> str:
     snapshot = monitor.snapshot
-    rows = ""
     total = 0
     healthy = 0
     healthy_chains: set[str] = set()
 
     for rpc_config in monitor.configs:
         chain = monitor.registry.lookup(rpc_config.chain)
-        chain_name = chain.name if chain else rpc_config.chain
         for url in rpc_config.urls:
             total += 1
-            status = snapshot.endpoints.get(url)
+            status = snapshot.endpoints.get(str(url))
             if status is not None and status.healthy:
                 healthy += 1
                 if chain is not None:
                     healthy_chains.add(chain.caip2)
-            rows += _render_rpc_row(chain_name, url, status)
 
-    empty = '<tr><td colspan="8" style="color:#a8a29e">No RPCs configured</td></tr>'
+    doc = _dash_page("Operator Dashboard — RPCs")
+    with doc.body, div(cls="c"):
+        _dash_header("RPCs")
+        with div(cls="stats"):
+            _stat(f"{healthy}/{total}", "RPCs healthy")
+            _stat(str(len(healthy_chains)), "Chains reachable")
 
-    return (
-        _head("Operator Dashboard — RPCs", _DASH_CSS)
-        + '<div class="c">'
-        + '<a href="/operator/logout" class="lo">Log out</a>'
-        + "<h1>Operator Dashboard</h1>"
-        + '<p class="sub">TEESwap deployment health</p>'
-        + _nav("RPCs")
-        + '<div class="stats">'
-        + f'<div class="stat"><div class="sv">{healthy}/{total}</div>'
-        + '<div class="sl">RPCs healthy</div></div>'
-        + f'<div class="stat"><div class="sv">{len(healthy_chains)}</div>'
-        + '<div class="sl">Chains reachable</div></div>'
-        + "</div>"
-        + '<div class="ox"><table>'
-        + "<thead><tr>"
-        + "<th>Status</th><th>Chain</th><th>URL</th><th>Chain ID</th>"
-        + "<th>Block</th><th>Latency</th><th>Polled</th><th>Error</th>"
-        + "</tr></thead>"
-        + f"<tbody>{rows or empty}</tbody>"
-        + "</table></div>"
-        + "</div></body></html>"
-    )
+        with div(cls="ox"), table():
+            _header_cols(
+                "Status", "Chain", "URL", "Chain ID", "Block", "Latency", "Polled", "Error"
+            )
+            with tbody():
+                if total == 0:
+                    _empty_row("No RPCs configured", 8)
+                else:
+                    for rpc_config in monitor.configs:
+                        chain = monitor.registry.lookup(rpc_config.chain)
+                        chain_name = chain.name if chain else rpc_config.chain
+                        for url in rpc_config.urls:
+                            _rpc_row(chain_name, str(url), snapshot.endpoints.get(str(url)))
+    return str(doc)

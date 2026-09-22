@@ -1,9 +1,9 @@
-from typing import Any, override
+from typing import override
 
 from teeswap.mcp import Dispatcher, Tool, ToolDefinition
-from teeswap.response import JsonResponse, ToolResponse
+from teeswap.response import JsonResponse
 from teeswap.schema import schema_for_type
-from teeswap.types import QuoteRequest, RoutesFilter
+from teeswap.types import AcceptRequest, QuoteRequest, StatusRequest
 
 
 class DummyQuoteTool(Tool):
@@ -12,13 +12,13 @@ class DummyQuoteTool(Tool):
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="teeswap_quote",
-            description="Get a swap quote.",
+            description="Get a quote.",
             input_type=QuoteRequest,
             annotations={"readOnly": True, "openWorld": True},
         )
 
     @override
-    async def execute(self, args: Any) -> ToolResponse:
+    async def execute(self, args: QuoteRequest) -> JsonResponse:
         return JsonResponse({"status": "ok"})
 
 
@@ -26,33 +26,29 @@ def test_quote_request_schema_has_properties() -> None:
     schema = schema_for_type(QuoteRequest)
     assert schema["type"] == "object"
     props = schema["properties"]
-    assert "input_token" in props
-    assert "input_chain" in props
-    assert "input_amount" in props
-    assert "recipient" in props
+    assert "input" in props
+    assert "outputs" in props
 
 
-def test_quote_request_descriptions_propagate() -> None:
-    schema = schema_for_type(QuoteRequest)
+def test_accept_request_schema() -> None:
+    schema = schema_for_type(AcceptRequest)
+    assert schema["type"] == "object"
     props = schema["properties"]
-    assert "description" in props["input_token"]
-    assert "USDC" in props["input_token"]["description"]
+    assert "quote_id" in props
 
 
-def test_enum_field_produces_enum_values() -> None:
-    schema = schema_for_type(QuoteRequest)
+def test_status_request_schema() -> None:
+    schema = schema_for_type(StatusRequest)
+    assert schema["type"] == "object"
     props = schema["properties"]
-    risk = props["risk_preference"]
-    assert "enum" in risk
-    assert "low" in risk["enum"]
-    assert "high" in risk["enum"]
+    assert "quote_id" in props
 
 
 def test_tool_definition_derives_schema_from_type() -> None:
     tool = DummyQuoteTool()
     schema = tool.definition.input_schema
     assert schema["type"] == "object"
-    assert "input_token" in schema["properties"]
+    assert "input" in schema["properties"]
 
 
 def test_dispatcher_tools_list() -> None:
@@ -62,9 +58,3 @@ def test_dispatcher_tools_list() -> None:
     assert len(listing) == 1
     assert listing[0]["name"] == "teeswap_quote"
     assert "properties" in listing[0]["inputSchema"]
-
-
-def test_routes_filter_all_optional() -> None:
-    schema = schema_for_type(RoutesFilter)
-    required = schema.get("required", [])
-    assert len(required) == 0

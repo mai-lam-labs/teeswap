@@ -2,7 +2,7 @@
 
 Each chain has a CAIP-2 identifier, human-friendly names, and metadata about
 its native token. The operator configures which chains are active via
-ContainerInitConfig; defaults are provided.
+TeeSwapConfig; defaults are provided.
 """
 
 import enum

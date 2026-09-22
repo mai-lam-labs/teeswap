@@ -8,13 +8,14 @@ import hmac
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
 from eth_abi.abi import encode
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from eth_typing import BlockNumber, ChainId, ChecksumAddress, Hash32, HexStr
 
 from ..common import TeeSwapError
+from ..http import BaseHttpClient
+from ..types import SecureUrl
 from .rpc import jsonrpc
 
 
@@ -101,7 +102,7 @@ class EthSigner:
 
 
 class EvmRpcClient:
-    def __init__(self, client: httpx.AsyncClient, url: str) -> None:
+    def __init__(self, client: BaseHttpClient, url: SecureUrl | str) -> None:
         self._client = client
         self._url = url
 

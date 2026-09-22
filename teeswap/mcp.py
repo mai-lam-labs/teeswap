@@ -17,14 +17,24 @@ from .crypto.attestation import (
     Signer,
 )
 from .crypto.hpke import HpkeKeypair
-from .invoice import PaymentRequirement
 from .response import ToolResponse
 from .schema import schema_for_type
+from .types import HasFromDict
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_VERSIONS = ("2025-11-25", "2026-07-28")
 
 SESSION_TTL_SECONDS = 3600
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentRequirement:
+    scheme: str
+    network: str
+    amount: str
+    currency: str
+    pay_to: str
+    description: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +63,7 @@ class JsonRpcError:
 class ToolDefinition:
     name: str
     description: str
-    input_type: type
+    input_type: type[HasFromDict]
     annotations: dict[str, bool]
     path: str | None = None
     tags: tuple[str, ...] = ()

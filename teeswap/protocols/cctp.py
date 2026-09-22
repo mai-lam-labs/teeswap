@@ -1,7 +1,27 @@
-from typing import Any, override
+"""CCTP V2 integration — cross-chain USDC via burn/attest/mint.
 
-from ..protocol import Protocol, ProtocolMeta
+Three steps: burn on source (depositForBurn), poll Circle's Iris API for
+attestation, mint on destination (receiveMessage). USDC only.
+
+Docs: https://developers.circle.com/stablecoins/cctp-getting-started
+"""
+
+from dataclasses import dataclass
+from typing import override
+
+from eth_typing import ChecksumAddress
+
+from ..blockchain.chains import Chain
+from ..protocol import OrderState, Protocol, ProtocolMeta
 from ..types import ProtocolClass
+
+
+@dataclass(frozen=True, slots=True)
+class CctpBurn:
+    amount: int
+    destination_domain: int
+    mint_recipient: ChecksumAddress
+    burn_token: ChecksumAddress
 
 
 class CctpProtocol(Protocol):
@@ -11,25 +31,10 @@ class CctpProtocol(Protocol):
         return ProtocolMeta(
             name="cctp",
             protocol_class=ProtocolClass.C,
-            supported_chains=(
-                "ethereum",
-                "arbitrum",
-                "optimism",
-                "base",
-                "polygon",
-                "avalanche",
-                "solana",
-            ),
+            cross_chain=True,
+            supported_chains=(),
         )
 
     @override
-    async def quote(self, input_token: str, output_token: str, amount: str) -> dict[str, Any]:
-        raise NotImplementedError
-
-    @override
-    async def execute(self, order_params: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError
-
-    @override
-    async def status(self, order_id: str) -> dict[str, Any]:
+    async def poll(self, order_id: str, chain: Chain) -> OrderState:
         raise NotImplementedError

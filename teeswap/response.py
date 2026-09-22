@@ -1,6 +1,7 @@
 import abc
 import base64
 import json
+from dataclasses import asdict
 from typing import Any, override
 
 
@@ -80,3 +81,13 @@ class CompositeResponse(ToolResponse):
             if mt == "application/json":
                 return body, mt
         return self.parts[0].to_rest()
+
+
+class DataclassResponse(ToolResponse):
+    @override
+    def to_mcp_content(self) -> list[dict[str, Any]]:
+        return [{"type": "text", "text": json.dumps(asdict(self), default=str)}]  # ty: ignore[invalid-argument-type]  # pyrefly: ignore[bad-argument-type]
+
+    @override
+    def to_rest(self) -> tuple[dict[str, Any], str]:
+        return asdict(self), "application/json"  # ty: ignore[invalid-argument-type]  # pyrefly: ignore[bad-argument-type]

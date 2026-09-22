@@ -31,11 +31,12 @@ from teeswap.mcp import (
     ToolDefinition,
     handle_mcp_request,
 )
-from teeswap.response import JsonResponse, ToolResponse
+from teeswap.response import JsonResponse
+from teeswap.types import HasFromDict
 
 
 @dataclass(frozen=True, slots=True)
-class EchoInput:
+class EchoInput(HasFromDict):
     a: int = 0
     b: int = 0
 
@@ -52,7 +53,7 @@ class EchoTool(Tool):
         )
 
     @override
-    async def execute(self, args: Any) -> ToolResponse:
+    async def execute(self, args: EchoInput) -> JsonResponse:
         return JsonResponse({"echoed": True})
 
 

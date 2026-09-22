@@ -1,7 +1,8 @@
 import abc
+import enum
 from dataclasses import dataclass
-from typing import Any
 
+from .blockchain.chains import Chain
 from .common import TeeSwapError
 from .types import ProtocolClass
 
@@ -22,11 +23,31 @@ class PriceCapError(RouteError):
     pass
 
 
+class OrderStatus(enum.StrEnum):
+    PENDING = "pending"
+    OPEN = "open"
+    FILLING = "filling"
+    FULFILLED = "fulfilled"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True, slots=True)
 class ProtocolMeta:
     name: str
     protocol_class: ProtocolClass
-    supported_chains: tuple[str, ...]
+    cross_chain: bool
+    supported_chains: tuple[Chain, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OrderState:
+    order_id: str
+    status: OrderStatus
+    executed_sell: int | None = None
+    executed_buy: int | None = None
+    tx_hash: str | None = None
 
 
 class Protocol(abc.ABC):
@@ -35,10 +56,4 @@ class Protocol(abc.ABC):
     def meta(self) -> ProtocolMeta: ...
 
     @abc.abstractmethod
-    async def quote(self, input_token: str, output_token: str, amount: str) -> dict[str, Any]: ...
-
-    @abc.abstractmethod
-    async def execute(self, order_params: dict[str, Any]) -> dict[str, Any]: ...
-
-    @abc.abstractmethod
-    async def status(self, order_id: str) -> dict[str, Any]: ...
+    async def poll(self, order_id: str, chain: Chain) -> OrderState: ...

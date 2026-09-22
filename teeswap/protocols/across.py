@@ -1,7 +1,34 @@
-from typing import Any, override
+"""Across V3 integration — cross-chain transfers via SpokePool deposit.
 
-from ..protocol import Protocol, ProtocolMeta
+The TEE deposits tokens into SpokePool on the source chain. Across relayers
+fill on the destination chain. One on-chain call per transfer.
+
+Docs: https://docs.across.to
+"""
+
+from dataclasses import dataclass
+from typing import override
+
+from eth_typing import ChecksumAddress
+
+from ..blockchain.chains import Chain
+from ..protocol import OrderState, Protocol, ProtocolMeta
 from ..types import ProtocolClass
+
+
+@dataclass(frozen=True, slots=True)
+class AcrossDeposit:
+    depositor: ChecksumAddress
+    recipient: ChecksumAddress
+    input_token: ChecksumAddress
+    output_token: ChecksumAddress
+    input_amount: int
+    output_amount: int
+    destination_chain_id: int
+    quote_timestamp: int
+    fill_deadline: int
+    exclusivity_deadline: int
+    message: bytes
 
 
 class AcrossProtocol(Protocol):
@@ -11,25 +38,10 @@ class AcrossProtocol(Protocol):
         return ProtocolMeta(
             name="across",
             protocol_class=ProtocolClass.C,
-            supported_chains=(
-                "ethereum",
-                "arbitrum",
-                "optimism",
-                "base",
-                "polygon",
-                "linea",
-                "scroll",
-            ),
+            cross_chain=True,
+            supported_chains=(),
         )
 
     @override
-    async def quote(self, input_token: str, output_token: str, amount: str) -> dict[str, Any]:
-        raise NotImplementedError
-
-    @override
-    async def execute(self, order_params: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError
-
-    @override
-    async def status(self, order_id: str) -> dict[str, Any]:
+    async def poll(self, order_id: str, chain: Chain) -> OrderState:
         raise NotImplementedError

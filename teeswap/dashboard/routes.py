@@ -5,16 +5,24 @@ import secrets
 from litestar import MediaType, Request, Response, Router, get, post
 from litestar.datastructures.state import State
 
-from ..blockchain import RpcMonitor
+from ..blockchain.rpc import RpcMonitor
 from ..facilitator import FacilitatorMonitor
+from ..invoice import InvoiceRegistry
 from .auth import SESSION_COOKIE, OperatorSessions
-from .views import render_facilitators, render_login, render_rpcs
+from .views import (
+    render_facilitators,
+    render_invoices,
+    render_login,
+    render_processes,
+    render_rpcs,
+)
 
 
 def create_dashboard_router(
     password: str,
     facilitator_monitor: FacilitatorMonitor,
     rpc_monitor: RpcMonitor,
+    invoice_registry: InvoiceRegistry,
 ) -> Router:
     sessions = OperatorSessions()
 
@@ -48,7 +56,7 @@ def create_dashboard_router(
         response = Response(
             content="",
             status_code=303,
-            headers={"Location": "/operator"},
+            headers={"Location": "/operator/invoices"},
             media_type=MediaType.HTML,
         )
         response.set_cookie(
@@ -69,22 +77,39 @@ def create_dashboard_router(
         return response
 
     @get("/", media_type=MediaType.HTML)
-    async def dashboard(request: Request[None, None, State]) -> Response[str]:
+    async def dashboard_root(request: Request[None, None, State]) -> Response[str]:
         if not _require_auth(request):
             return _redirect_login()
         return Response(
-            render_facilitators(facilitator_monitor),
+            content="",
+            status_code=303,
+            headers={"Location": "/operator/invoices"},
             media_type=MediaType.HTML,
         )
+
+    @get("/invoices", media_type=MediaType.HTML)
+    async def invoices(request: Request[None, None, State]) -> Response[str]:
+        if not _require_auth(request):
+            return _redirect_login()
+        return Response(render_invoices(invoice_registry), media_type=MediaType.HTML)
+
+    @get("/processes", media_type=MediaType.HTML)
+    async def processes(request: Request[None, None, State]) -> Response[str]:
+        if not _require_auth(request):
+            return _redirect_login()
+        return Response(render_processes(invoice_registry), media_type=MediaType.HTML)
+
+    @get("/facilitators", media_type=MediaType.HTML)
+    async def facilitators(request: Request[None, None, State]) -> Response[str]:
+        if not _require_auth(request):
+            return _redirect_login()
+        return Response(render_facilitators(facilitator_monitor), media_type=MediaType.HTML)
 
     @get("/rpcs", media_type=MediaType.HTML)
     async def rpcs(request: Request[None, None, State]) -> Response[str]:
         if not _require_auth(request):
             return _redirect_login()
-        return Response(
-            render_rpcs(rpc_monitor),
-            media_type=MediaType.HTML,
-        )
+        return Response(render_rpcs(rpc_monitor), media_type=MediaType.HTML)
 
     return Router(
         path="/operator",
@@ -92,7 +117,10 @@ def create_dashboard_router(
             login_page,
             login_submit,
             logout,
-            dashboard,
+            dashboard_root,
+            invoices,
+            processes,
+            facilitators,
             rpcs,
         ],
     )

@@ -61,6 +61,7 @@ select = [
     "W",    # pycodestyle warnings
 ]
 ignore = [
+    "E501",    # line too long — we trust the formatter, manual wrapping is worse than long lines
     "E741",    # ambiguous names (l, I) — the crypto/math code uses them deliberately
     "TRY003",  # long message outside the exception class — see the header
     "EM101",   # string literal in raise — see the header
@@ -81,13 +82,16 @@ ignore = [
 # Tests use assert and exercise internals on purpose.
 "teeswap/tests/**" = ["S101", "S106", "SLF", "ARG"]
 # Default operator password is intentional; chain CAIP-2 IDs are long.
-"teeswap/config.py" = ["S105", "E501"]
+"teeswap/config.py" = ["S105"]
 # Subprocess calls to known binaries (cast, vaportpm) are the architecture, not a vulnerability.
 "teeswap/crypto/vaportpm.py" = ["S603"]
 # container-init re-execs itself after dropping privileges — os.execvp is intentional.
 "teeswap/cli.py" = ["S606"]
 # Wraps Litestar's internal schema registry — private access is the integration point.
 "teeswap/schema.py" = ["SLF001"]
+# HTML builder DSL: lowercase class names are the API (div, span, td), loop var reassignment
+# is the attr normalisation logic, multi-statement class bodies define the tag name inline.
+"teeswap/dashboard/html.py" = ["N801", "N802", "E701", "E702", "PLW2901"]
 
 [format]
 docstring-code-format = false

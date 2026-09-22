@@ -1,20 +1,19 @@
-from typing import Any
+"""HTTP transport — exposes a TeeSwap instance via Litestar."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 from litestar import Litestar, MediaType, Request, Response, Router, post
 from litestar.openapi import OpenAPIConfig
 from litestar.status_codes import HTTP_200_OK
 
-from .blockchain import RpcMonitor
 from .common import PKG_NAME, PKG_VERSION, from_dict
 from .dashboard import create_dashboard_router
-from .facilitator import FacilitatorMonitor
-from .mcp import (
-    Dispatcher,
-    JsonRpcRequest,
-    SessionManager,
-    Tool,
-    handle_mcp_request,
-)
+from .mcp import JsonRpcRequest, Tool, handle_mcp_request
+
+if TYPE_CHECKING:
+    from .instance import TeeSwap
 
 
 def _make_rest_handler(tool: Tool) -> Any:
@@ -38,7 +37,7 @@ def _make_rest_handler(tool: Tool) -> Any:
     )(handler)
 
 
-def _make_mcp_handler(dispatcher: Dispatcher, sessions: SessionManager) -> Any:
+def _make_mcp_handler(instance: TeeSwap) -> Any:
     @post(
         path="/",
         summary="MCP JSON-RPC",
@@ -51,7 +50,9 @@ def _make_mcp_handler(dispatcher: Dispatcher, sessions: SessionManager) -> Any:
         method = request.headers.get("Mcp-Method", rpc.method)
         session_id = request.headers.get("Mcp-Session-Id")
 
-        mcp_result = await handle_mcp_request(dispatcher, sessions, method, rpc, session_id)
+        mcp_result = await handle_mcp_request(
+            instance.dispatcher, instance.sessions, method, rpc, session_id
+        )
 
         resp = Response(
             content=mcp_result.body,
@@ -66,15 +67,11 @@ def _make_mcp_handler(dispatcher: Dispatcher, sessions: SessionManager) -> Any:
     return mcp_handler
 
 
-def create_app(
-    dispatcher: Dispatcher,
-    facilitator_monitor: FacilitatorMonitor,
-    rpc_monitor: RpcMonitor,
-    operator_password: str,
-) -> Litestar:
-    sessions = SessionManager()
+def make_http_app(instance: TeeSwap) -> Litestar:
     rest_handlers = [
-        _make_rest_handler(tool) for tool in dispatcher.tools.values() if not tool.requires_session
+        _make_rest_handler(tool)
+        for tool in instance.dispatcher.tools.values()
+        if not tool.requires_session
     ]
 
     api_router = Router(
@@ -85,23 +82,26 @@ def create_app(
 
     mcp_router = Router(
         path="/mcp",
-        route_handlers=[_make_mcp_handler(dispatcher, sessions)],
+        route_handlers=[_make_mcp_handler(instance)],
         tags=["MCP"],
     )
 
     routers = [
         api_router,
         mcp_router,
-        create_dashboard_router(operator_password, facilitator_monitor, rpc_monitor),
+        create_dashboard_router(
+            instance.config.operator_password,
+            instance.facilitator_monitor,
+            instance.rpc_monitor,
+            instance.invoice_registry,
+        ),
     ]
 
     async def on_startup() -> None:
-        facilitator_monitor.start()
-        rpc_monitor.start()
+        instance.start_background_tasks()
 
     async def on_shutdown() -> None:
-        facilitator_monitor.stop()
-        rpc_monitor.stop()
+        instance.stop_background_tasks()
 
     return Litestar(
         route_handlers=routers,
