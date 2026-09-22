@@ -53,7 +53,7 @@ KVM_GID   := $(shell stat -c %g /dev/kvm 2>/dev/null || echo "")
 KVM_MOUNT := $(shell test -e /dev/kvm && echo "-v /dev/kvm:/dev/kvm")
 DOCKER_OPT_KVM := $(if $(KVM_GID),--group-add $(KVM_GID)) $(KVM_MOUNT)
 
-.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check build anvil-fetch anvil-run anvil-start anvil-stop clean distclean
+.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check ci build anvil-fetch anvil-run anvil-start anvil-stop clean distclean
 
 help:
 	@echo "targets: install | check | bundle-<arch> | payload-<arch> | boot-<arch> | clean | distclean"
@@ -91,6 +91,9 @@ coverage:
 	"$(PY)" -m coverage report -m --fail-under=70
 
 check: lint format-check typecheck test
+
+ci: anvil-start
+	$(MAKE) check; rc=$$?; $(MAKE) anvil-stop; exit $$rc
 
 build:
 	"$(UV)" build --python "$(PY)" --out-dir dist
