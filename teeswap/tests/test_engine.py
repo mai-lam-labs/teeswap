@@ -53,8 +53,8 @@ async def anvil():
     node = Anvil()
     try:
         await node.rpc.chain_id()
-    except httpx.ConnectError:
-        pytest.fail(reason="anvil not running — run make anvil-start")
+    except httpx.ConnectError as e:
+        raise RuntimeError("anvil not running — run make anvil-start") from e
     yield node
     await node.close()
 
