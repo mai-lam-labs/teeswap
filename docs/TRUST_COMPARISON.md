@@ -91,7 +91,7 @@ A compromised process cannot change the PCR value after boot. The only way to ge
 
 **RA-TLS:** Same — attestation is in the TLS handshake. Once the connection is established, every response is trusted implicitly.
 
-**lockboot + Verifiable MCP:** Every tool result carries a `tee-nitro-v1` attestation in `_meta`. Each result has:
+**lockboot + Verifiable MCP:** Every tool result carries a `tee-vaportpm-v1` attestation in `_meta`. Each result has:
 - `inputCommitment` binding it to the specific request
 - `outputCommitment` binding it to the specific response
 - `nonce` preventing replay

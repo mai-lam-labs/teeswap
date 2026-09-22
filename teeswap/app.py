@@ -4,7 +4,10 @@ from litestar import Litestar, MediaType, Request, Response, Router, post
 from litestar.openapi import OpenAPIConfig
 from litestar.status_codes import HTTP_200_OK
 
+from .blockchain import RpcMonitor
 from .common import PKG_NAME, PKG_VERSION, from_dict
+from .dashboard import create_dashboard_router
+from .facilitator import FacilitatorMonitor
 from .mcp import (
     Dispatcher,
     JsonRpcRequest,
@@ -63,7 +66,12 @@ def _make_mcp_handler(dispatcher: Dispatcher, sessions: SessionManager) -> Any:
     return mcp_handler
 
 
-def create_app(dispatcher: Dispatcher) -> Litestar:
+def create_app(
+    dispatcher: Dispatcher,
+    facilitator_monitor: FacilitatorMonitor,
+    rpc_monitor: RpcMonitor,
+    operator_password: str,
+) -> Litestar:
     sessions = SessionManager()
     rest_handlers = [
         _make_rest_handler(tool) for tool in dispatcher.tools.values() if not tool.requires_session
@@ -81,8 +89,24 @@ def create_app(dispatcher: Dispatcher) -> Litestar:
         tags=["MCP"],
     )
 
+    routers = [
+        api_router,
+        mcp_router,
+        create_dashboard_router(operator_password, facilitator_monitor, rpc_monitor),
+    ]
+
+    async def on_startup() -> None:
+        facilitator_monitor.start()
+        rpc_monitor.start()
+
+    async def on_shutdown() -> None:
+        facilitator_monitor.stop()
+        rpc_monitor.stop()
+
     return Litestar(
-        route_handlers=[api_router, mcp_router],
+        route_handlers=routers,
+        on_startup=[on_startup],
+        on_shutdown=[on_shutdown],
         openapi_config=OpenAPIConfig(
             title=PKG_NAME,
             version=PKG_VERSION,

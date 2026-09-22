@@ -10,7 +10,7 @@ TEESwap is an x402-compatible cross-chain swap aggregator running inside a verif
 **Core properties:**
 - Zero starting capital — operates on user tokens, not protocol inventory
 - Verified execution — the full chain from source code to running enclave is auditable via lockboot (GitHub CI → UKI → PCR-pinned attestation)
-- Verifiable MCP — implements SEP-2133 with `tee-nitro-v1` attestation on every tool result, and HPKE blind execution for E2EE
+- Verifiable MCP — implements SEP-2133 with `tee-vaportpm-v1` attestation on every tool result, and HPKE blind execution for E2EE
 - x402 native — discoverable via Bazaar, payable via standard x402 flow, with its own facilitator
 - Risk-aware routing — uses the revocability audit data to score and select routes
 - No shared approval target — eliminates the aggregator gateway exploit pattern (Socket $3.3M, LI.FI $11.6M)
@@ -45,7 +45,7 @@ Within this verified environment, TEESwap runs per-swap gVisor containers for is
 
 ### 3.2 Per-result attestation (Verifiable MCP)
 
-Beyond verifying the running code on connection, every MCP tool result carries a `tee-nitro-v1` attestation per the Verifiable MCP extension (SEP-2133):
+Beyond verifying the running code on connection, every MCP tool result carries a `tee-vaportpm-v1` attestation per the Verifiable MCP extension (SEP-2133):
 
 - `inputCommitment` = `sha256(salt || JCS(arguments))` — binds the proof to exactly the inputs the client sent
 - `outputCommitment` = `sha256(JCS(content))` — binds the proof to exactly the result returned
@@ -143,7 +143,7 @@ output:
   depositAddress: string (only for direct-deposit)
   deadline:      integer (unix timestamp)
   execution:     x402 payment requirements for the swap itself
-  attestation:   Verifiable MCP tee-nitro-v1 proof metadata
+  attestation:   Verifiable MCP tee-vaportpm-v1 proof metadata
 ```
 
 The quote response is itself attested — the risk profile and route selection are provably computed by the TEE.
@@ -343,7 +343,7 @@ A distributable Rust binary that provides the trust layer for any MCP client:
    - HPKE public key binding → key is provably enclave-resident
 3. Establishes HPKE-encrypted channel (Verifiable MCP blind execution)
 4. Exposes plain MCP locally (stdio for agent integration)
-5. Verifies every tool result's `tee-nitro-v1` attestation proof
+5. Verifies every tool result's `tee-vaportpm-v1` attestation proof
 6. Rejects results with mismatched measurements, stale attestations, or invalid signatures
 
 ### 11.2 What it is NOT

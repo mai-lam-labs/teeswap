@@ -4,7 +4,7 @@ Wraps the vaportpm-attest binary (from lockboot) which provides:
 - TPM 2.0 attestation quotes with cloud-specific extensions (AWS Nitro, GCP)
 - PCR-bound deterministic key derivation
 
-Source: https://github.com/aspect-build/lockboot (vaportpm crate)
+Source: https://github.com/lockboot/vaportpm (vaportpm crate)
 """
 
 import hashlib
@@ -15,8 +15,8 @@ from typing import NotRequired, TypedDict
 
 from dacite import DaciteError
 
+from ..common import from_dict
 from .attestation import AttestationError, Signer
-from .common import from_dict
 
 
 class VaportpmError(AttestationError):

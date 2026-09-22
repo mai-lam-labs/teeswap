@@ -13,7 +13,7 @@ import base64
 import pytest
 from cryptography.exceptions import InvalidTag
 
-from teeswap.hpke import (
+from teeswap.crypto.hpke import (
     HpkeKeypair,
     _ecdh,
     _extract_and_expand,

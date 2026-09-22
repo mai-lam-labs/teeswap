@@ -1,8 +1,39 @@
 import enum
 from dataclasses import dataclass, field
-from typing import Annotated
+from typing import Annotated, Any, ClassVar
 
 from litestar.params import Parameter
+
+# --- Validated newtypes ---
+
+
+class Validated:
+    registry: ClassVar[list[type]] = []
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        Validated.registry.append(cls)
+
+
+class HexStr(str, Validated):
+    LENGTH: int | None = None
+
+    def __new__(cls, value: str) -> HexStr:
+        v = str(value)
+        try:
+            raw = bytes.fromhex(v.removeprefix("0x"))
+        except ValueError:
+            raise ValueError(f"invalid hex string: {v!r}") from None
+        if cls.LENGTH is not None and len(raw) != cls.LENGTH:
+            raise ValueError(f"{cls.__name__}: expected {cls.LENGTH} bytes, got {len(raw)}")
+        return super().__new__(cls, v)
+
+
+class HexEd25519PublicKey(HexStr):
+    LENGTH = 32
+
+
+# --- Domain types ---
 
 
 class ChainFamily(enum.StrEnum):

@@ -12,7 +12,7 @@ not from our implementation or the reference implementation.
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from teeswap.attestation import Signer, compute_commitment, jcs
+from teeswap.crypto.attestation import Signer, compute_commitment, jcs
 
 
 def testjcs_sorts_keys() -> None:

@@ -38,7 +38,7 @@ Advertised via the standard `extensions` map during connection:
 {
   "extensions": {
     "io.modelcontextprotocol/verifiable-tools": {
-      "proofFormats": ["tee-nitro-v1", "snarkjs-v2"],
+      "proofFormats": ["tee-vaportpm-v1", "snarkjs-v2"],
       "blindExecution": true,
       "resultTtlMs": 30000
     }
@@ -73,7 +73,7 @@ Pluggable, identified by string:
 | `noir-v1` | ZK (UltraHonk) | No trusted setup |
 | `risc0-v1` | zkVM | Rust guest programs, general computation |
 | `ezkl-v1` | ZKML (Halo2-KZG) | ML model inference proofs |
-| `tee-nitro-v1` | TEE attestation | AWS Nitro COSE/CBOR attestation documents |
+| `tee-vaportpm-v1` | TEE attestation | AWS Nitro COSE/CBOR attestation documents |
 | `tee-sgx-dcap-v1` | TEE attestation | Intel SGX DCAP quotes |
 | `tee-sevsnp-v1` | TEE attestation | AMD SEV-SNP attestation reports |
 | `oracle-sig-v1` | Input provenance | Ed25519 signatures over upstream data |
@@ -251,7 +251,7 @@ The July 2026 spec revision makes MCP stateless. Key changes:
               │         TEESwap                         │         │
               │                                         │         │
               │  vaportpm-attest (attestation gen)       │◄────────┘
-              │  + Verifiable MCP tee-nitro-v1 proofs   │  (we run our
+              │  + Verifiable MCP tee-vaportpm-v1 proofs   │  (we run our
               │  + HPKE blind execution                 │   own infra)
               │  + vaportpm-verify in local proxy       │
               └─────────────────────────────────────────┘
@@ -261,7 +261,7 @@ The July 2026 spec revision makes MCP stateless. Key changes:
 
 | Component | Exists? | Our approach |
 |---|---|---|
-| TEE attestation spec for MCP | Yes (SEP-2133, `tee-nitro-v1`) | Implement the spec using vaportpm |
+| TEE attestation spec for MCP | Yes (SEP-2133, `tee-vaportpm-v1`) | Implement the spec using vaportpm |
 | HPKE blind execution spec | Yes (SEP-2133, `hpke-v1`) | Implement — gives us E2EE for free |
 | Reference implementation | Yes (ripple-node-lab demo) | Study, don't fork — it's teaching code |
 | TEE MCP hosting | Yes (Phala/dstack) | We have our own stack |
@@ -277,18 +277,18 @@ The July 2026 spec revision makes MCP stateless. Key changes:
 ### 7.1 Implement Verifiable MCP, don't invent a protocol
 
 SEP-2133 already defines:
-- How to attach TEE attestations to MCP tool results (`tee-nitro-v1`)
+- How to attach TEE attestations to MCP tool results (`tee-vaportpm-v1`)
 - How to encrypt arguments so hosting can't read them (`hpke-v1` blind execution)
 - How to prove input data came from real APIs (`oracle-sig-v1`, `zktls-tlsn-v1`)
 - How to handle async proof generation for long operations (deferred proofs + tasks)
 
-This is exactly what we need. The implementation is `vaportpm-attest` generating the attestation document, formatted as `tee-nitro-v1` proof metadata on tool results.
+This is exactly what we need. The implementation is `vaportpm-attest` generating the attestation document, formatted as `tee-vaportpm-v1` proof metadata on tool results.
 
 ### 7.2 The local proxy is a Verifiable MCP client
 
 The distributable proxy binary:
 1. Embeds `vaportpm-verify` (pure Rust, zero C deps)
-2. Implements Verifiable MCP client-side: verifies `tee-nitro-v1` proofs on every tool result
+2. Implements Verifiable MCP client-side: verifies `tee-vaportpm-v1` proofs on every tool result
 3. Handles HPKE encryption of arguments (blind execution)
 4. Exposes plain MCP locally (stdio/HTTP) — the upstream agent doesn't need to understand verification
 5. Adds Verifiable MCP support to any MCP client that doesn't natively support SEP-2133

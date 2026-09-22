@@ -36,6 +36,13 @@ BOOT_DISK_SHA256_x86_64  := a1e4a4f791f356100fc33e218007dd02ad67168ae689ef4b6369
 UKI_SHA256_x86_64        := 283c5b1726ebd10cc95c4cbc0d3c751260e642a505baa03ae197672e7ae6d9f2
 EFI_VARS_SHA256_x86_64   := d55f52b13eba249a2d80ef85f63f1234be956c3fa609185f42188acbdf47ac1e
 
+# ---- dev tools (project-local, in dist/tools/) ----
+FOUNDRY_VERSION  := v1.8.3
+FOUNDRY_TARBALL  := foundry_$(FOUNDRY_VERSION)_linux_amd64.tar.gz
+FOUNDRY_SHA256   := 7ca48e6ca3cac1bce1403ca67e5bc1dc3bc1fd818199c9957c7165079c228568
+FOUNDRY_URL      := https://github.com/foundry-rs/foundry/releases/download/$(FOUNDRY_VERSION)/$(FOUNDRY_TARBALL)
+ANVIL            := dist/tools/anvil
+
 SERVE_HOST ?= 10.0.2.1:8000
 FORWARD_PORTS ?= 8402
 
@@ -44,7 +51,7 @@ KVM_GID   := $(shell stat -c %g /dev/kvm 2>/dev/null || echo "")
 KVM_MOUNT := $(shell test -e /dev/kvm && echo "-v /dev/kvm:/dev/kvm")
 DOCKER_OPT_KVM := $(if $(KVM_GID),--group-add $(KVM_GID)) $(KVM_MOUNT)
 
-.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check build clean distclean
+.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check build fetch-anvil clean distclean
 
 help:
 	@echo "targets: install | check | bundle-<arch> | payload-<arch> | boot-<arch> | clean | distclean"
@@ -85,6 +92,18 @@ check: lint format-check typecheck test
 
 build:
 	"$(UV)" build --python "$(PY)" --out-dir dist
+
+# ---- fetch-anvil: project-local Foundry anvil for EVM integration tests ----
+fetch-anvil:
+	@if test -x "$(ANVIL)"; then echo ">> anvil already at $(ANVIL)"; else \
+	  mkdir -p dist/tools && \
+	  curl -LsSf "$(FOUNDRY_URL)" -o dist/tools/$(FOUNDRY_TARBALL) && \
+	  { [ "$$(sha256sum dist/tools/$(FOUNDRY_TARBALL) | cut -d' ' -f1)" = "$(FOUNDRY_SHA256)" ] || \
+	    { echo "error: foundry tarball hash mismatch (expected $(FOUNDRY_SHA256))"; rm -f dist/tools/$(FOUNDRY_TARBALL); exit 1; }; } && \
+	  tar -xzf dist/tools/$(FOUNDRY_TARBALL) -C dist/tools anvil && \
+	  rm dist/tools/$(FOUNDRY_TARBALL) && \
+	  echo ">> anvil $(FOUNDRY_VERSION) ready at $(ANVIL)"; \
+	fi
 
 # ---- bundle-<arch>: Docker image with stripped musl Python + teeswap ----
 bundle-%:

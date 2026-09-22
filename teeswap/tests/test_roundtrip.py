@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, override
 
-from teeswap.attestation import (
+from teeswap.crypto.attestation import (
     HPKE_INFO_ARGS,
     HPKE_INFO_REPLY,
     VERIFIABLE_TOOLS_NS,
@@ -21,7 +21,8 @@ from teeswap.attestation import (
     compute_commitment,
     jcs,
 )
-from teeswap.hpke import HpkeKeypair, hpke_seal
+from teeswap.crypto.hpke import HpkeKeypair, hpke_seal
+from teeswap.crypto.verify import VerificationFailed, Verified, Verifier
 from teeswap.mcp import (
     Dispatcher,
     JsonRpcRequest,
@@ -31,7 +32,6 @@ from teeswap.mcp import (
     handle_mcp_request,
 )
 from teeswap.response import JsonResponse, ToolResponse
-from teeswap.verify import VerificationFailed, Verified, Verifier
 
 
 @dataclass(frozen=True, slots=True)

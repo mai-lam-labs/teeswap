@@ -20,7 +20,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from .common import TeeSwapError
+from ..common import TeeSwapError
 from .hpke import HpkeKeypair, hpke_seal
 
 

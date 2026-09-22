@@ -9,12 +9,17 @@ from dataclasses import asdict
 from typing import Any
 
 import click
+import httpx
 import uvicorn
 
 from .app import create_app
-from .attestation import Signer
-from .common import PKG_NAME, PKG_VERSION, from_dict
-from .hpke import HpkeKeypair
+from .blockchain import ChainRegistry, RpcMonitor
+from .common import DEFAULT_HOST, DEFAULT_PORT, PKG_NAME, PKG_VERSION, from_dict
+from .config import ContainerInitConfig
+from .crypto.attestation import Signer
+from .crypto.hpke import HpkeKeypair
+from .crypto.vaportpm import VaportpmOutput, attest_boot, derive_pcr_bound
+from .facilitator import FacilitatorMonitor, poll_facilitator
 from .mcp import (
     MCP_PROTOCOL_VERSION,
     Dispatcher,
@@ -22,7 +27,6 @@ from .mcp import (
     jsonl_loop,
 )
 from .tools import register_all
-from .vaportpm import VaportpmOutput, attest_boot, derive_pcr_bound
 
 
 def _make_dispatcher(
@@ -57,8 +61,20 @@ def serve(host: str, port: int, key_fd: int | None) -> None:
         signer, hpke_keypair = _read_key_material(key_fd)
 
     dispatcher = _make_dispatcher(signer=signer, hpke_keypair=hpke_keypair)
-    app = create_app(dispatcher)
-    uvicorn.run(app, host=host, port=port)
+    config = ContainerInitConfig()
+    registry = ChainRegistry(config.chains)
+    fac_monitor = FacilitatorMonitor(config.facilitators)
+    rpc_monitor = RpcMonitor(config.rpcs, registry)
+    app = create_app(dispatcher, fac_monitor, rpc_monitor, config.operator_password)
+    production = key_fd is not None
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        workers=1,
+        access_log=not production,
+        log_level="warning" if production else "info",
+    )
 
 
 @cli.command()
@@ -74,12 +90,9 @@ def stdio() -> None:
 def container_init() -> None:
     """Stage2 boot entrypoint — keygen, attest, drop privs, re-exec serve."""
     config_raw = sys.stdin.buffer.read()
-    config: dict[str, Any] = json.loads(config_raw) if config_raw else {}
+    raw: dict[str, Any] = json.loads(config_raw) if config_raw else {}
+    _config = from_dict(ContainerInitConfig, raw.get(PKG_NAME, {}))
 
-    teeswap_config: dict[str, Any] = config.get("teeswap", {})
-    host = teeswap_config.get("bind_host", "0.0.0.0")  # noqa: S104
-    port = teeswap_config.get("bind_port", 8402)
-    run_user = teeswap_config.get("run_user", "nobody")
     signing_seed = derive_pcr_bound(f"{PKG_NAME}-signing-v1", 32)
     hpke_seed = derive_pcr_bound(f"{PKG_NAME}-hpke-v1", 32)
     signer = Signer(private_key_bytes=signing_seed)
@@ -105,7 +118,7 @@ def container_init() -> None:
     os.set_inheritable(read_fd, True)
     _write_key_material(write_fd, signer, hpke_keypair, boot_attestation)
 
-    _drop_privileges(run_user)
+    _drop_privileges("nobody")
 
     os.execvp(
         sys.executable,
@@ -115,9 +128,9 @@ def container_init() -> None:
             PKG_NAME,
             "serve",
             "--host",
-            host,
+            DEFAULT_HOST,
             "--port",
-            str(port),
+            str(DEFAULT_PORT),
             "--key-fd",
             str(read_fd),
         ],
@@ -138,6 +151,30 @@ def list_tools() -> None:
     for entry in dispatcher.tools_list():
         click.echo(f"  {entry['name']}")
         click.echo(f"    {entry['description']}")
+
+
+@cli.command(name="x402-status")
+@click.argument("url")
+def x402_status(url: str) -> None:
+    """Poll an x402 facilitator and print its status."""
+
+    async def _run() -> None:
+        url_clean = url.rstrip("/")
+        async with httpx.AsyncClient() as client:
+            status = await poll_facilitator(client, url_clean)
+        click.echo(f"health:  {'UP' if status.healthy else 'DOWN'}")
+        if not status.healthy:
+            sys.exit(1)
+        result = {
+            "url": status.url,
+            "healthy": status.healthy,
+            "kinds": [{"scheme": k.scheme, "network": k.network} for k in status.kinds],
+            "extensions": list(status.extensions),
+            "signers": list(status.signers),
+        }
+        click.echo(json.dumps(result, indent=2))
+
+    asyncio.run(_run())
 
 
 # --- Key material over pipe ---

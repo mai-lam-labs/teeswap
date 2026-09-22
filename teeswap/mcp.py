@@ -8,9 +8,15 @@ from typing import Any, Literal, TextIO
 
 import cryptography.exceptions
 
-from .attestation import VERIFIABLE_TOOLS_NS, AttestationError, BlindExecutor, ProofFormat, Signer
 from .common import PKG_NAME, PKG_VERSION, from_dict
-from .hpke import HpkeKeypair
+from .crypto.attestation import (
+    VERIFIABLE_TOOLS_NS,
+    AttestationError,
+    BlindExecutor,
+    ProofFormat,
+    Signer,
+)
+from .crypto.hpke import HpkeKeypair
 from .invoice import PaymentRequirement
 from .response import ToolResponse
 from .schema import schema_for_type

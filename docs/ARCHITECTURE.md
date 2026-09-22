@@ -5,11 +5,11 @@
 
 ## Design principles
 
-1. **Unified typed interface.** A single set of typed schemas (Litestar + Pydantic or equivalent) defines all tool inputs and outputs. MCP tool definitions, HTTP endpoints, x402 paywalls, and OpenAPI specs are derived from these types — no hand-maintained duplicates.
-2. **Minimal dependencies.** No large SDK libraries. Chain interaction is via small CLI tools called as subprocesses. HTTP APIs where available. Python core, Rust for crypto.
-3. **Per-swap isolation.** Each swap execution runs in a gVisor container with only the key material for that specific swap. A compromised container can't access other swaps' keys.
-4. **Crypto in Rust, glue in Python.** Attestation (vaportpm), signing (cast), HPKE, and Ed25519 are Rust binaries called as subprocesses. Python handles orchestration, HTTP, state machines, and tool composition.
-5. **Verifiable by default.** Every tool result carries a Verifiable MCP (SEP-2133) `tee-nitro-v1` attestation. The attestation is not optional — it's part of the response construction pipeline.
+1. **Unified typed interface.** A single set of typed schemas (frozen dataclasses + Litestar) defines all tool inputs and outputs. MCP tool definitions, HTTP endpoints, x402 paywalls, and OpenAPI specs are derived from these types — no hand-maintained duplicates.
+2. **Minimal dependencies.** No large SDK libraries. Chain interaction is via small CLI tools called as subprocesses. HTTP APIs where available.
+3. **Operator is adversary.** The TEE protects against the machine operator. Security-sensitive values (keys, bind addresses, privilege level) are hardcoded or PCR-bound, never operator-configurable. Runtime config from cloud metadata is untrusted input.
+4. **Verifiable by default.** Every tool result carries a Verifiable MCP (SEP-2133) `tee-vaportpm-v1` attestation. The attestation is not optional — it's part of the response construction pipeline.
+5. **Event-sourced invoicing.** The invoice is an append-only log of line items. Each execution step produces an item. State is derived, never mutated.
 
 ## System layers
 
@@ -51,24 +51,9 @@
 
 ### Typed schema substrate
 
-All tool interfaces are defined once as typed Python models (Pydantic or msgspec):
+All tool interfaces are defined once as frozen dataclasses in `types.py`:
 
-```python
-class QuoteRequest(Struct):
-    input_token: str
-    input_chain: str
-    input_amount: str   # human-readable decimal
-    output_token: str
-    output_chain: str
-    recipient: str
-    risk_preference: Literal["low", "medium", "high"] = "medium"
-    order: Literal["RECOMMENDED", "FASTEST", "CHEAPEST", "SAFEST"] = "RECOMMENDED"
-    slippage_bps: int = 50  # 1-500
-    exclude_protocols: list[str] = []
-    max_price_cap: str | None = None
-```
-
-From this one definition, we derive:
+From each definition, we derive:
 - **MCP tool schema** — JSON Schema for `teeswap_quote` inputSchema
 - **HTTP endpoint** — `POST /quote` with request body validation
 - **x402 paywall** — middleware that returns 402 before the handler runs
@@ -80,61 +65,39 @@ Litestar handles this natively — route handlers are typed, schemas drop out.
 
 | Style | Transport | How it works |
 |---|---|---|
-| **MCP (stateless)** | Streamable HTTP | `Mcp-Method` / `Mcp-Name` headers, per-request `_meta`, no sessions |
+| **MCP** | Streamable HTTP / stdio | Default 2025-11-25 (stateful), 2026-07-28 (stateless) also supported |
 | **HTTP JSON** | POST | Standard REST-like endpoints, JSON request/response |
 | **x402 Bazaar** | HTTP 402 | Auto-discovered by x402-mcp gateways |
 
 All three are views of the same handler logic. The MCP transport wraps the handler in JSON-RPC. The HTTP transport exposes it directly. x402 is middleware.
 
-### Stateless MCP (2026-07-28)
+### MCP protocol
 
-- No `initialize` handshake, no `Mcp-Session-Id`
-- Each request carries capabilities in `_meta`
-- `Mcp-Method: tools/call`, `Mcp-Name: teeswap_quote` headers for gateway routing
-- `teeswap_routes` response includes `ttlMs` for client-side caching
-- Application state via explicit handles: `quoteId`, `orderId`
-- Quote/execute/status can route to different backend pools via header-based routing
+Default protocol version is `2025-11-25` (stateful, with `initialize` and sessions).
+`2026-07-28` (stateless) is supported when the client requests it. Application
+state uses explicit handles (`quoteId`, `orderId`) so both modes work.
 
 ## Verifiable MCP integration (SEP-2133)
 
-### Server-side (Python + Rust)
+### Server-side attestation pipeline
 
-Every tool result goes through the attestation pipeline before being returned:
+Every tool result goes through the attestation pipeline before being returned.
+Commitment computation, Ed25519 signing, and HPKE are all in-process Python
+(`cryptography` library). Only `vaportpm-attest` is a Rust subprocess (TPM
+interaction). See `teeswap/crypto/attestation.py` for the SEP-2133 implementation
+and `teeswap/crypto/vaportpm.py` for the TPM interface.
 
-```
-Handler produces result
-    │
-    ├── Python: compute inputCommitment = sha256(JCS(arguments))
-    ├── Python: compute outputCommitment = sha256(JCS(content))
-    ├── Python: construct binding payload (circuitHash + commitments + nonce)
-    │
-    ├── Rust subprocess: vaportpm-attest
-    │   └── produces COSE_Sign1/CBOR attestation document
-    │       (PCRs, certificate chain, enclave public key, nonce)
-    │
-    ├── Rust subprocess: ed25519-sign (or vaportpm subcommand)
-    │   └── signs binding payload with enclave key
-    │
-    └── Python: assemble _meta["io.../verifiable-tools"] block
-        (proof, proofFormat, commitments, nonce, teeAttestation)
-```
+### Key lifecycle
 
-### HPKE keypair lifecycle
+On boot (`container-init`), both keys are derived deterministically from the TPM
+via `vaportpm-attest derive`, bound to all PCRs (0-23). Same enclave measurements
+= same keys every boot. A code or config change yields different keys.
 
-On application startup (inside the verified lockboot environment):
-
-1. Python generates an X25519 keypair in memory (`cryptography` library)
-2. Extends a TPM PCR with the hash of the public key (via vaportpm)
-3. `vaportpm-attest` produces an attestation document covering this PCR
-4. The public key is advertised in `server/discover` under `blindPublicKeys["hpke-v1"]`
-
-Verification by client/proxy:
-- Certificate chain → cloud provider root (Nitro/GCP)
-- Code PCRs (14) → pinned to published release values
-- Key PCR → consistent with the advertised HPKE public key (read from attestation, not pinned in advance)
-- Proof of possession → TEE signs a challenge with the private key
-
-The key PCR value changes each boot (ephemeral key). The client doesn't need to know it in advance — it reads it from the attestation and checks consistency. The code PCRs are what gets pinned to the release.
+1. Ed25519 signing key — derived from `derive <pkg>-signing-v1 32`
+2. X25519 HPKE key — derived from `derive <pkg>-hpke-v1 32`
+3. Both public keys are committed into the attestation nonce
+4. `vaportpm-attest attest <nonce>` produces the boot attestation
+5. HPKE public key advertised in `server/discover` under `blindPublicKeys["hpke-v1"]`
 
 ### Blind execution (HPKE)
 
@@ -157,25 +120,15 @@ Encrypted request arrives
 
 No Rust subprocess needed for HPKE — the key lives in Python process memory and the crypto is standard (`x25519` + `AESGCM` from the `cryptography` package).
 
-### Python dependencies for SEP-2133
+### Crypto dependencies
 
 | Need | Solution |
 |---|---|
-| JSON Canonicalization (RFC 8785) | `jcs` or `canonicaljson` package |
+| JCS (RFC 8785, simplified) | `json.dumps(sort_keys=True)` — see `jcs()` in `attestation.py` |
 | SHA-256 | `hashlib` (stdlib) |
-| CBOR decode (for attestation inspection) | `cbor2` |
-| HPKE (X25519 + AES-128-GCM) | `cryptography` package (in-process, key in memory) |
-| Ed25519 sign (binding fields) | `cryptography` package or vaportpm subcommand |
-| Attestation generation | `vaportpm-attest` (Rust subprocess) |
-| PCR extension (HPKE key binding) | vaportpm (Rust subprocess) |
-
-### Rust CLI tools for crypto
-
-| Tool | Commands | Notes |
-|---|---|---|
-| **`vaportpm-attest`** | Generate vTPM attestation document | Already exists |
-| **`vaportpm-verify`** | Verify attestation (proxy-side) | Already exists |
-| **`vaportpm`** | PCR extend (bind HPKE public key) | Already exists or trivial addition |
+| HPKE (X25519 + AES-128-GCM) | `cryptography` — in-process, see `hpke.py` |
+| Ed25519 signing | `cryptography` — in-process |
+| TPM attestation + key derivation | `vaportpm-attest` (Rust subprocess) |
 
 ## Internal tool categories
 
@@ -196,37 +149,14 @@ encode-transfer, encode-swap, sign, balance
 
 Submission for both is via Python `httpx` (raw JSON-RPC). `cast` encodes and signs; Python submits.
 
-### Protocol tools — bridge/DEX wrappers
+### Protocol adapters
 
-Python modules (not separate binaries). Each knows which contract/function/args to use. They compose `cast` calls for encoding and `httpx` for API/RPC.
+Python modules in `protocols/`. Each implements `quote()`, `execute()`, `status()`
+and knows the contract addresses, function signatures, and API endpoints for its
+protocol. They compose `cast` calls for EVM encoding and `httpx` for API/RPC.
 
-**`proto_cow`** — CoW Protocol
-- `submit_order()` — EIP-712 sign via cast, POST to CoW orderbook API
-- `order_status()` — GET from CoW API
-- `cancel_order()` — on-chain cancel via cast
-
-**`proto_across`** — Across V3
-- `deposit()` — encode depositV3 via cast, submit via httpx
-- `fill_status()` — query Across API
-- `refund_status()` — check refund eligibility
-
-**`proto_cctp`** — Circle CCTP V2
-- `burn()` — encode depositForBurn via cast
-- `attest_status()` — poll Circle Iris API
-- `mint()` — encode receiveMessage on destination via cast
-
-Additional protocol modules follow the same pattern. Each is a thin Python file (~100-200 lines) that knows the contract addresses, function signatures, and API endpoints.
-
-### Wallet tools — key operations
-
-Interface to lockboot key management. The orchestrator calls these to derive swap-specific keys and prepare key material for gVisor containers.
-
-```python
-wallet_derive(swap_id: str, chain_id: int) -> KeyInfo
-wallet_sign(key_path: Path, data: bytes, sig_type: str) -> bytes
-```
-
-Implementation is operator-provided (lockboot infrastructure).
+Current adapters: CoW Protocol, Across V3, Circle CCTP V2. Additional protocols
+follow the same interface.
 
 ### Data tools — pricing, risk, monitoring
 
@@ -298,9 +228,9 @@ Agent ──stdio──► Proxy ──E2EE (HPKE)──► TEE server
                    │   ├── Certificate chain → cloud provider root
                    │   ├── PCR 14 → pinned release values (from GitHub release)
                    │   ├── PCR 15 → expected configuration hash
-                   │   └── HPKE public key → bound in attestation user_data
+                   │   └── HPKE public key → committed in attestation nonce
                    │
-                   ├── Per-request: verify tee-nitro-v1 proof on every tool result
+                   ├── Per-request: verify tee-vaportpm-v1 proof on every tool result
                    │   ├── inputCommitment matches what we sent
                    │   ├── outputCommitment matches returned content
                    │   ├── nonce matches (anti-replay)
@@ -319,7 +249,7 @@ The proxy implements Verifiable MCP client-side per SEP-2133. It is not required
 | **`solana-tools-lite`** | Solana tx signing, message verification | Rust | `cargo install` |
 | **`vaportpm-attest`** | Generate vTPM attestation document | Rust | lockboot |
 
-Everything else is Python (`httpx` for RPC/API, Litestar for serving, `cryptography` for HPKE/Ed25519, `jcs`/`cbor2` for SEP-2133 data formats). HPKE is in-process Python — the key lives in application memory, no subprocess needed.
+Everything else is Python (`httpx` for RPC/API, Litestar for serving, `cryptography` for HPKE and signing).
 
 ## Chain support
 
@@ -355,7 +285,7 @@ Agent calls teeswap_quote(USDC, base, 1000, ETH, arbitrum, 0xUser)
     │   └── Risk score: low (A+C, no admin pause, no incidents)
     │
     ├── TEE: computes commitments, generates attestation
-    ├── TEE: returns quote + tee-nitro-v1 proof in _meta
+    ├── TEE: returns quote + tee-vaportpm-v1 proof in _meta
     │
     ├── Proxy: verifies attestation, forwards to agent
     │
