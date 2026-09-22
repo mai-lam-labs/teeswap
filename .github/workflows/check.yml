@@ -15,14 +15,5 @@ jobs:
       - name: Install toolchain
         run: make install
 
-      - name: Lint
-        run: make lint
-
-      - name: Format
-        run: make format-check
-
-      - name: Typecheck
-        run: make typecheck
-
-      - name: Coverage
-        run: make coverage
+      - name: CI (lint + format + typecheck + test with anvil)
+        run: make ci
