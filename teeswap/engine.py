@@ -9,7 +9,6 @@ The reaper runs alongside and expires stale quotes.
 import asyncio
 import logging
 from dataclasses import replace
-from datetime import UTC, datetime
 
 from .blockchain.chains import Chain
 from .blockchain.evm import EthSigner, EvmRpcClient
@@ -25,7 +24,16 @@ from .invoice import (
     InvoiceStatus,
     OutputStatus,
 )
-from .types import AcceptResponse, QuoteRequest, QuoteResponse, Transaction, TxHash, Url
+from .types import (
+    AcceptResponse,
+    Amount,
+    QuoteRequest,
+    QuoteResponse,
+    Timestamp,
+    Transaction,
+    TxHash,
+    Url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +117,7 @@ class Engine:
                 balance = await rpc.get_balance(signer.address)
                 inp = invoice.inputs[index]
                 if balance != inp.received.amount:
-                    inp = replace(inp, received=replace(inp.received, amount=balance))
+                    inp = replace(inp, received=replace(inp.received, amount=Amount(balance)))
                     invoice.inputs[index] = inp
                 if balance >= required.amount:
                     invoice.inputs[index] = replace(inp, status=InputStatus.RECEIVED)
@@ -167,7 +175,7 @@ class Engine:
             submitted = Transaction(
                 chain=chain,
                 hash=TxHash.from_bytes(tx.tx_hash),
-                timestamp=datetime.now(UTC),
+                timestamp=Timestamp.now(),
             )
             step.transactions.append(submitted)
             invoice.outputs[index] = replace(

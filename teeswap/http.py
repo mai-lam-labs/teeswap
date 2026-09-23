@@ -12,7 +12,7 @@ from typing import Any, Self, override
 
 import httpx
 
-from .types import HttpExchange, Millis, Url
+from .types import HttpExchange, Millis, Timestamp, Url
 
 
 class BaseHttpClient(abc.ABC):
@@ -122,7 +122,7 @@ class RecordingClient(HttpClient):
         elapsed = (datetime.now(UTC) - start).total_seconds() * 1000
         self._exchanges.append(
             HttpExchange(
-                timestamp=start,
+                timestamp=Timestamp(start),
                 method=method,
                 url=template_url,
                 request_headers={},

@@ -32,7 +32,7 @@ from teeswap.mcp import (
     handle_mcp_request,
 )
 from teeswap.response import JsonResponse
-from teeswap.types import HasFromDict
+from teeswap.wire import HasFromDict
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,10 +1,10 @@
 import abc
 import base64
-import json
 from typing import Any, override
 
 from litestar import MediaType
-from litestar.serialization import encode_json
+
+from .wire import WireStruct, encode
 
 
 class ToolResponse(abc.ABC):
@@ -21,11 +21,11 @@ class JsonResponse(ToolResponse):
 
     @override
     def to_mcp_content(self) -> list[dict[str, Any]]:
-        return [{"type": "text", "text": json.dumps(self.data)}]
+        return [{"type": "text", "text": encode(self.data).decode()}]
 
     @override
-    def to_rest(self) -> tuple[dict[str, Any], str]:
-        return self.data, "application/json"
+    def to_rest(self) -> tuple[bytes, str]:
+        return encode(self.data), MediaType.JSON
 
 
 class TextResponse(ToolResponse):
@@ -85,8 +85,8 @@ class CompositeResponse(ToolResponse):
         return self.parts[0].to_rest()
 
 
-class DataclassResponse(ToolResponse):
-    """A dataclass tool result, encoded once with Litestar's serializer.
+class DataclassResponse(WireStruct, ToolResponse):
+    """A dataclass tool result, encoded once with wire.encode.
 
     MCP text and REST body are the same bytes, so the output commitment
     covers exactly what a REST client receives.
@@ -94,8 +94,8 @@ class DataclassResponse(ToolResponse):
 
     @override
     def to_mcp_content(self) -> list[dict[str, Any]]:
-        return [{"type": "text", "text": encode_json(self).decode()}]
+        return [{"type": "text", "text": encode(self).decode()}]
 
     @override
     def to_rest(self) -> tuple[bytes, str]:
-        return encode_json(self), MediaType.JSON
+        return encode(self), MediaType.JSON

@@ -1,14 +1,14 @@
 import abc
 import base64
-import json
 import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, TextIO
 
 import cryptography.exceptions
+from dacite import DaciteError
 
-from .common import PKG_NAME, PKG_VERSION, from_dict
+from .common import PKG_NAME, PKG_VERSION, TeeSwapError
 from .crypto.attestation import (
     VERIFIABLE_TOOLS_NS,
     AttestationError,
@@ -19,10 +19,11 @@ from .crypto.attestation import (
 from .crypto.hpke import HpkeKeypair
 from .response import ToolResponse
 from .schema import schema_for_type
-from .types import HasFromDict
+from .wire import HasFromDict, WireError, encode, parse_json
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_VERSIONS = ("2025-11-25", "2026-07-28")
+PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion"
 
 SESSION_TTL_SECONDS = 3600
 
@@ -38,11 +39,85 @@ class PaymentRequirement:
 
 
 @dataclass(frozen=True, slots=True)
-class JsonRpcRequest:
+class JsonRpcRequest(HasFromDict):
     method: str
-    params: dict[str, Any]
+    params: dict[str, Any] = field(default_factory=dict)
     id: str | int | None = None
     jsonrpc: str = "2.0"
+
+
+# --- MCP method params (field names are the wire names) ---
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiableToolsMeta(HasFromDict):
+    nonce: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class McpParams(HasFromDict):
+    """Params any MCP method may carry. _meta is an open namespace by spec."""
+
+    _meta: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        version = self._meta.get(PROTOCOL_VERSION_META)
+        if version is not None and not isinstance(version, str):
+            raise TypeError(f"{PROTOCOL_VERSION_META} must be a string")
+        self._verifiable_tools()
+
+    @property
+    def protocol_version(self) -> str | None:
+        return self._meta.get(PROTOCOL_VERSION_META)
+
+    @property
+    def client_nonce(self) -> str | None:
+        vt = self._verifiable_tools()
+        return vt.nonce if vt is not None else None
+
+    def _verifiable_tools(self) -> VerifiableToolsMeta | None:
+        raw = self._meta.get(VERIFIABLE_TOOLS_NS)
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise TypeError(f"{VERIFIABLE_TOOLS_NS} must be an object")
+        return VerifiableToolsMeta.from_dict(raw)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InitializeParams(McpParams):
+    protocolVersion: str  # noqa: N815  # MCP wire field name
+    capabilities: dict[str, Any]
+    clientInfo: dict[str, Any]  # noqa: N815  # MCP wire field name
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ListToolsParams(McpParams):
+    cursor: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ToolsCallParams(McpParams):
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BlindCallParams(McpParams):
+    name: str
+    inputCommitment: str  # noqa: N815  # SEP-2133 wire field name
+    encryptionScheme: str  # noqa: N815  # SEP-2133 wire field name
+    encryptedArguments: str  # noqa: N815  # SEP-2133 wire field name
+    replyPublicKey: str | None = None  # noqa: N815  # SEP-2133 wire field name
+
+
+_PARAMS_BY_METHOD: dict[str, type[McpParams]] = {
+    "initialize": InitializeParams,
+    "server/discover": McpParams,
+    "tools/list": ListToolsParams,
+    "tools/call": ToolsCallParams,
+    "verifiable-tools/call": BlindCallParams,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +230,10 @@ class Dispatcher:
         if tool.requires_session and not has_session:
             raise ToolNotAvailableError(f"{name} requires a session (use stdio or stateful HTTP)")
 
-        args = from_dict(tool.definition.input_type, arguments)
+        try:
+            args = tool.definition.input_type.from_dict(arguments)
+        except (DaciteError, ValueError, TypeError) as e:
+            raise InvalidToolArgumentsError(f"invalid arguments for {name}: {e}") from e
         return await tool.execute(args)
 
     @property
@@ -175,6 +253,10 @@ class Dispatcher:
 
 
 class ToolNotFoundError(Exception):
+    pass
+
+
+class InvalidToolArgumentsError(TeeSwapError):
     pass
 
 
@@ -255,62 +337,58 @@ async def handle_mcp_request(
     rpc: JsonRpcRequest,
     session_id: str | None,
 ) -> McpResult:
-    has_session = False
+    params_type = _PARAMS_BY_METHOD.get(method)
+    if params_type is None:
+        return McpResult(body=_error(rpc.id, -32601, f"unknown method: {method}"))
+    try:
+        params = params_type.from_dict(rpc.params)
+    except (DaciteError, ValueError, TypeError) as e:
+        return McpResult(body=_error(rpc.id, -32602, f"invalid params: {e}"))
 
-    if method == "initialize":
-        protocol_version = rpc.params.get("protocolVersion", MCP_PROTOCOL_VERSION)
-        if protocol_version not in SUPPORTED_VERSIONS:
-            return McpResult(
-                body=_error(
-                    rpc.id,
-                    -32022,
-                    f"unsupported protocol version: {protocol_version}",
-                    {"supportedVersions": list(SUPPORTED_VERSIONS)},
-                )
-            )
-        session = sessions.create(protocol_version)
+    if isinstance(params, InitializeParams):
+        if params.protocolVersion not in SUPPORTED_VERSIONS:
+            return McpResult(body=_unsupported_version(rpc.id, params.protocolVersion))
+        session = sessions.create(params.protocolVersion)
         return McpResult(
-            body=_ok(rpc.id, _init_result(dispatcher, protocol_version)),
+            body=_ok(rpc.id, _init_result(dispatcher, params.protocolVersion)),
             session_id=session.session_id,
         )
 
+    has_session = False
     if session_id is not None:
-        session = sessions.get(session_id)
-        if session is None:
+        if sessions.get(session_id) is None:
             return McpResult(body=_error(rpc.id, -32600, "invalid or expired session"))
         has_session = True
 
-    meta = rpc.params.get("_meta", {})
-    client_version = meta.get("io.modelcontextprotocol/protocolVersion")
+    client_version = params.protocol_version
     if client_version is not None and client_version not in SUPPORTED_VERSIONS:
-        return McpResult(
-            body=_error(
-                rpc.id,
-                -32022,
-                f"unsupported protocol version: {client_version}",
-                {"supportedVersions": list(SUPPORTED_VERSIONS)},
-            )
-        )
+        return McpResult(body=_unsupported_version(rpc.id, client_version))
 
-    match method:
-        case "server/discover":
-            return McpResult(body=_ok(rpc.id, _discover_result(dispatcher, has_session)))
+    match params:
+        case ToolsCallParams():
+            return await _handle_tools_call(dispatcher, rpc.id, params, has_session)
 
-        case "tools/list":
+        case BlindCallParams():
+            return await _handle_blind_call(dispatcher, rpc.id, params)
+
+        case ListToolsParams():
             tools = dispatcher.tools_list(has_session=has_session)
             result: dict[str, Any] = {"tools": tools}
             if not has_session:
                 result["_meta"] = {"ttlMs": 60000}
             return McpResult(body=_ok(rpc.id, result))
 
-        case "tools/call":
-            return await _handle_tools_call(dispatcher, rpc, has_session)
-
-        case "verifiable-tools/call":
-            return await _handle_blind_call(dispatcher, rpc)
-
         case _:
-            return McpResult(body=_error(rpc.id, -32601, f"unknown method: {method}"))
+            return McpResult(body=_ok(rpc.id, _discover_result(dispatcher, has_session)))
+
+
+def _unsupported_version(req_id: str | int | None, version: str) -> dict[str, Any]:
+    return _error(
+        req_id,
+        -32022,
+        f"unsupported protocol version: {version}",
+        {"supportedVersions": list(SUPPORTED_VERSIONS)},
+    )
 
 
 def _init_result(dispatcher: Dispatcher, protocol_version: str) -> dict[str, Any]:
@@ -358,84 +436,76 @@ def _verifiable_capability(dispatcher: Dispatcher) -> dict[str, Any]:
 
 
 async def _handle_tools_call(
-    dispatcher: Dispatcher, rpc: JsonRpcRequest, has_session: bool = True
+    dispatcher: Dispatcher,
+    req_id: str | int | None,
+    params: ToolsCallParams,
+    has_session: bool = True,
 ) -> McpResult:
-    name = rpc.params.get("name", "")
-    arguments = rpc.params.get("arguments", {})
-
     try:
-        tool_result = await dispatcher.call(name, arguments, has_session=has_session)
-    except ToolNotFoundError as e:
-        return McpResult(body=_error(rpc.id, -32601, str(e)))
-    except ToolNotAvailableError as e:
-        return McpResult(body=_error(rpc.id, -32601, str(e)))
+        tool_result = await dispatcher.call(params.name, params.arguments, has_session=has_session)
+    except (ToolNotFoundError, ToolNotAvailableError) as e:
+        return McpResult(body=_error(req_id, -32601, str(e)))
+    except InvalidToolArgumentsError as e:
+        return McpResult(body=_error(req_id, -32602, str(e)))
 
     content = tool_result.to_mcp_content()
     result_body: dict[str, Any] = {"content": content}
 
     if dispatcher.signer is not None:
-        client_nonce = _extract_client_nonce(rpc)
         verifiable = dispatcher.signer.attest_result(
-            arguments=arguments,
+            arguments=params.arguments,
             content=content,
-            client_nonce=client_nonce,
+            client_nonce=params.client_nonce,
         )
         result_body["_meta"] = verifiable.to_meta()
 
-    return McpResult(body=_ok(rpc.id, result_body))
+    return McpResult(body=_ok(req_id, result_body))
 
 
-async def _handle_blind_call(dispatcher: Dispatcher, rpc: JsonRpcRequest) -> McpResult:
+async def _handle_blind_call(
+    dispatcher: Dispatcher, req_id: str | int | None, params: BlindCallParams
+) -> McpResult:
     blind = dispatcher.blind_executor
     if blind is None:
-        return McpResult(body=_error(rpc.id, -32601, "blind execution not configured"))
+        return McpResult(body=_error(req_id, -32601, "blind execution not configured"))
 
-    name = rpc.params.get("name", "")
-    input_commitment = rpc.params.get("inputCommitment", "")
-    encryption_scheme = rpc.params.get("encryptionScheme", "")
-    encrypted_arguments = rpc.params.get("encryptedArguments", "")
-    client_nonce = _extract_client_nonce(rpc)
-    reply_public_key = rpc.params.get("replyPublicKey")
-
-    if encryption_scheme != "hpke-v1":
-        return McpResult(body=_error(rpc.id, -32602, f"unsupported scheme: {encryption_scheme}"))
+    if params.encryptionScheme != "hpke-v1":
+        return McpResult(
+            body=_error(req_id, -32602, f"unsupported scheme: {params.encryptionScheme}")
+        )
 
     try:
         decrypted = blind.decrypt_call(
-            name,
-            encrypted_arguments,
-            input_commitment,
-            encryption_scheme,
+            params.name,
+            params.encryptedArguments,
+            params.inputCommitment,
+            params.encryptionScheme,
         )
-        blind.verify_commitment(decrypted, input_commitment)
-    except (ValueError, KeyError, cryptography.exceptions.InvalidTag) as e:
-        return McpResult(body=_error(rpc.id, -32602, f"decryption failed: {e}"))
+        blind.verify_commitment(decrypted, params.inputCommitment)
+    except (DaciteError, ValueError, TypeError, cryptography.exceptions.InvalidTag) as e:
+        return McpResult(body=_error(req_id, -32602, f"decryption failed: {e}"))
     except AttestationError as e:
-        return McpResult(body=_error(rpc.id, -32602, str(e)))
+        return McpResult(body=_error(req_id, -32602, str(e)))
 
     try:
-        tool_result = await dispatcher.call(name, decrypted.arguments)
+        tool_result = await dispatcher.call(params.name, decrypted.arguments)
     except ToolNotFoundError as e:
-        return McpResult(body=_error(rpc.id, -32601, str(e)))
+        return McpResult(body=_error(req_id, -32601, str(e)))
+    except InvalidToolArgumentsError as e:
+        return McpResult(body=_error(req_id, -32602, str(e)))
 
     content = tool_result.to_mcp_content()
 
     content, meta = blind.attest_and_encrypt(
         decrypted=decrypted,
         content=content,
-        tool_name=name,
-        client_input_commitment=input_commitment,
-        client_nonce=client_nonce,
-        reply_public_key_b64=reply_public_key,
+        tool_name=params.name,
+        client_input_commitment=params.inputCommitment,
+        client_nonce=params.client_nonce,
+        reply_public_key_b64=params.replyPublicKey,
     )
 
-    return McpResult(body=_ok(rpc.id, {"content": content, "_meta": meta}))
-
-
-def _extract_client_nonce(rpc: JsonRpcRequest) -> str | None:
-    meta = rpc.params.get("_meta", {})
-    vt = meta.get(VERIFIABLE_TOOLS_NS, {})
-    return vt.get("nonce")
+    return McpResult(body=_ok(req_id, {"content": content, "_meta": meta}))
 
 
 # --- JSONL transport ---
@@ -449,7 +519,7 @@ async def jsonl_loop(
     writer: TextIO,
 ) -> None:
     def write(obj: dict[str, Any]) -> None:
-        writer.write(json.dumps(obj))
+        writer.write(encode(obj).decode())
         writer.write("\n")
         writer.flush()
 
@@ -462,15 +532,17 @@ async def jsonl_loop(
             continue
 
         try:
-            raw = json.loads(stripped)
-        except json.JSONDecodeError as e:
+            raw = parse_json(stripped)
+        except WireError as e:
             write_error(None, -32700, f"parse error: {e}")
             continue
 
         try:
-            rpc = from_dict(JsonRpcRequest, raw)
-        except (TypeError, KeyError, ValueError) as e:
-            write_error(raw.get("id"), -32600, f"invalid request: {e}")
+            rpc = JsonRpcRequest.from_dict(raw)
+        except (DaciteError, TypeError, ValueError) as e:
+            write_error(
+                raw.get("id") if isinstance(raw, dict) else None, -32600, f"invalid request: {e}"
+            )
             continue
 
         result = await handle_mcp_request(

@@ -5,7 +5,7 @@ import os
 import pwd
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import dataclass
 from typing import Any
 
 import click
@@ -13,7 +13,7 @@ import httpx
 import uvicorn
 
 from .app import make_http_app
-from .common import DEFAULT_HOST, DEFAULT_PORT, PKG_NAME, PKG_VERSION, from_dict
+from .common import DEFAULT_HOST, DEFAULT_PORT, PKG_NAME, PKG_VERSION
 from .config import TeeSwapConfig
 from .crypto.attestation import Signer
 from .crypto.hpke import HpkeKeypair
@@ -21,13 +21,15 @@ from .crypto.vaportpm import VaportpmOutput, attest_boot, derive_pcr_bound
 from .facilitator import poll_facilitator
 from .instance import KeyMaterial, TeeSwap
 from .mcp import MCP_PROTOCOL_VERSION, jsonl_loop
+from .types import Hex32
+from .wire import WireStruct, decode_object, encode
 
 
 def _load_config(config_path: str | None) -> TeeSwapConfig:
     if config_path is None:
         return TeeSwapConfig()
-    with open(config_path) as f:
-        raw = json.load(f)
+    with open(config_path, "rb") as f:
+        raw = decode_object(f.read())
     return TeeSwapConfig.from_dict(raw.get(PKG_NAME, {}))
 
 
@@ -79,8 +81,8 @@ def stdio(config_path: str | None) -> None:
 def container_init() -> None:
     """Stage2 boot entrypoint — keygen, attest, drop privs, re-exec serve."""
     config_raw = sys.stdin.buffer.read()
-    raw: dict[str, Any] = json.loads(config_raw) if config_raw else {}
-    config_dict = raw.get(PKG_NAME, {})
+    raw: dict[str, Any] = decode_object(config_raw) if config_raw else {}
+    config = TeeSwapConfig.from_dict(raw.get(PKG_NAME, {}))
 
     signing_seed = derive_pcr_bound(f"{PKG_NAME}-signing-v1", 32)
     hpke_seed = derive_pcr_bound(f"{PKG_NAME}-hpke-v1", 32)
@@ -106,7 +108,17 @@ def container_init() -> None:
 
     read_fd, write_fd = os.pipe()
     os.set_inheritable(read_fd, True)
-    _write_key_material(write_fd, signer, hpke_keypair, evm_seed, config_dict, boot_attestation)
+    _write_key_material(
+        write_fd,
+        KeyMaterialWire(
+            signing_key=Hex32.from_bytes(signer.private_key_bytes),
+            hpke_private_key=Hex32.from_bytes(hpke_keypair.private_key_bytes),
+            hpke_public_key=Hex32.from_bytes(hpke_keypair.public_key_bytes),
+            evm_root_key=Hex32.from_bytes(evm_seed),
+            config=config,
+            boot_attestation=boot_attestation,
+        ),
+    )
 
     _drop_privileges("nobody")
 
@@ -170,46 +182,41 @@ def x402_status(url: str) -> None:
 # --- Key material over pipe ---
 
 
-def _write_key_material(
-    fd: int,
-    signer: Signer,
-    hpke_keypair: HpkeKeypair,
-    evm_root_key: bytes,
-    config_dict: dict[str, Any],
-    boot_attestation: VaportpmOutput | None = None,
-) -> None:
-    obj: dict[str, Any] = {
-        "signing_key": signer.private_key_bytes.hex(),
-        "hpke_private_key": hpke_keypair.private_key_bytes.hex(),
-        "hpke_public_key": hpke_keypair.public_key_bytes.hex(),
-        "evm_root_key": evm_root_key.hex(),
-        "config": config_dict,
-    }
-    if boot_attestation is not None:
-        obj["boot_attestation"] = asdict(boot_attestation)
+@dataclass(frozen=True, slots=True)
+class KeyMaterialWire(WireStruct):
+    """Key material handed from container-init to serve over an inherited pipe."""
+
+    signing_key: Hex32
+    hpke_private_key: Hex32
+    hpke_public_key: Hex32
+    evm_root_key: Hex32
+    config: TeeSwapConfig
+    boot_attestation: VaportpmOutput | None = None
+
+
+def _write_key_material(fd: int, wire: KeyMaterialWire) -> None:
     with os.fdopen(fd, "wb") as f:
-        f.write(json.dumps(obj).encode())
+        f.write(encode(wire))
 
 
 def _read_key_material(fd: int) -> tuple[KeyMaterial, TeeSwapConfig]:
     with os.fdopen(fd, "rb") as f:
-        raw = f.read()
-    data: dict[str, Any] = json.loads(raw)
-    signer = Signer(private_key_bytes=bytes.fromhex(data["signing_key"]))
+        wire = KeyMaterialWire.from_dict(decode_object(f.read()))
 
-    attestation_raw: dict[str, Any] | None = data.get("boot_attestation")
-    if attestation_raw is not None:
-        attestation = from_dict(VaportpmOutput, attestation_raw)
-        signer.set_boot_attestation(attestation)
+    signer = Signer(private_key_bytes=wire.signing_key.to_bytes())
+    if wire.boot_attestation is not None:
+        signer.set_boot_attestation(wire.boot_attestation)
 
     hpke_keypair = HpkeKeypair(
-        private_key_bytes=bytes.fromhex(data["hpke_private_key"]),
-        public_key_bytes=bytes.fromhex(data["hpke_public_key"]),
+        private_key_bytes=wire.hpke_private_key.to_bytes(),
+        public_key_bytes=wire.hpke_public_key.to_bytes(),
     )
-    evm_root_key = bytes.fromhex(data["evm_root_key"])
-    keys = KeyMaterial(signer=signer, hpke_keypair=hpke_keypair, evm_root_key=evm_root_key)
-    config = TeeSwapConfig.from_dict(data.get("config", {}))
-    return keys, config
+    keys = KeyMaterial(
+        signer=signer,
+        hpke_keypair=hpke_keypair,
+        evm_root_key=wire.evm_root_key.to_bytes(),
+    )
+    return keys, wire.config
 
 
 # --- Privilege drop ---

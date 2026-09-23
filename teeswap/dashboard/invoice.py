@@ -8,7 +8,6 @@ Routes:
     GET /invoice/{id}.json  — machine-readable status
 """
 
-from datetime import UTC, datetime
 from typing import Annotated
 
 from litestar import MediaType, Response, Router, get
@@ -16,6 +15,7 @@ from litestar.params import Parameter
 from litestar.status_codes import HTTP_200_OK, HTTP_404_NOT_FOUND
 
 from ..invoice import InvoiceId, InvoiceNotFoundError, InvoiceRegistry, InvoiceView
+from ..types import Timestamp
 from .html import (
     a,
     div,
@@ -145,19 +145,19 @@ def _fmt_token(symbol: str, contract: str | None, chain_caip2: str) -> str:
     return f"{symbol} (native) on {chain_caip2}"
 
 
-def _fmt_time(dt: datetime | None) -> str:
-    if dt is None:
+def _fmt_time(ts: Timestamp | None) -> str:
+    if ts is None:
         return "—"
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    return ts.dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _elapsed(start: datetime | None, end: datetime | None) -> str:
+def _elapsed(start: Timestamp | None, end: Timestamp | None) -> str:
     if start is None:
         return ""
-    finish = end or datetime.now(UTC)
+    finish = end or Timestamp.now()
     secs = (finish - start).total_seconds()
     if secs < 60:
-        return f"{secs:.1f}s"
+        return f"{secs:.0f}s"
     return f"{secs / 60:.1f}m"
 
 
@@ -332,11 +332,11 @@ def create_invoice_router(registry: InvoiceRegistry) -> Router:
     @get("/{full_id:str}", media_type=MediaType.HTML)
     async def invoice_view(
         full_id: Annotated[str, Parameter(description="Invoice ID with .html or .json extension")],
-    ) -> Response[str | bytes]:
+    ) -> Response[bytes]:
         quote_id, dot, fmt = full_id.rpartition(".")
         if not dot or fmt not in ("html", "json"):
             return Response(
-                content="Use .html or .json extension",
+                content=b"Use .html or .json extension",
                 status_code=HTTP_404_NOT_FOUND,
                 media_type=MediaType.TEXT,
             )
@@ -344,7 +344,7 @@ def create_invoice_router(registry: InvoiceRegistry) -> Router:
             view = registry.get(InvoiceId(quote_id)).view()
         except InvoiceNotFoundError:
             return Response(
-                content="Invoice not found",
+                content=b"Invoice not found",
                 status_code=HTTP_404_NOT_FOUND,
                 media_type=MediaType.TEXT,
             )
@@ -353,7 +353,7 @@ def create_invoice_router(registry: InvoiceRegistry) -> Router:
             body, media_type = view.to_rest()
             return Response(content=body, status_code=HTTP_200_OK, media_type=media_type)
         return Response(
-            content=render_invoice_html(view),
+            content=render_invoice_html(view).encode(),
             status_code=HTTP_200_OK,
             media_type=MediaType.HTML,
         )

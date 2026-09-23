@@ -8,17 +8,24 @@ The quote carries the grouped form, so each invoice input is a distinct token.
 """
 
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
 
 from .blockchain.chains import Chain, ChainFamily
 from .blockchain.rpc import jsonrpc
 from .config import FeeConfig
 from .http import BaseHttpClient
-from .invoice import InvoiceId
+from .invoice import QUOTE_TTL, InvoiceId
 from .protocol import NoRouteError
-from .types import Balance, QuoteRequest, QuoteResponse, Token, TokenAmount, Url
+from .types import (
+    Amount,
+    Balance,
+    QuoteRequest,
+    QuoteResponse,
+    Timestamp,
+    Token,
+    TokenAmount,
+    Url,
+)
 
-QUOTE_TTL = timedelta(minutes=5)
 ETH_TRANSFER_GAS = 21_000
 
 
@@ -47,7 +54,9 @@ async def compute_quote(
     total_requested = sum(o.amount.amount for o in request.outputs)
     output_estimates = tuple(
         Balance(
-            amount=TokenAmount(token=token, amount=available * o.amount.amount // total_requested),
+            amount=TokenAmount(
+                token=token, amount=Amount(available * o.amount.amount // total_requested)
+            ),
             address=o.address,
         )
         for o in request.outputs
@@ -59,9 +68,9 @@ async def compute_quote(
         quote_id=quote_id,
         inputs=inputs,
         outputs=output_estimates,
-        gas=TokenAmount(token=token, amount=total_gas_wei),
-        fee=TokenAmount(token=token, amount=fee_amount),
-        expires_at=datetime.now(UTC) + QUOTE_TTL,
+        gas=TokenAmount(token=token, amount=Amount(total_gas_wei)),
+        fee=TokenAmount(token=token, amount=Amount(fee_amount)),
+        expires_at=Timestamp.now() + QUOTE_TTL,
     )
 
 
@@ -69,7 +78,7 @@ def _group_by_token(amounts: tuple[TokenAmount, ...]) -> tuple[TokenAmount, ...]
     totals: dict[Token, int] = {}
     for a in amounts:
         totals[a.token] = totals.get(a.token, 0) + a.amount
-    return tuple(TokenAmount(token=t, amount=n) for t, n in totals.items())
+    return tuple(TokenAmount(token=t, amount=Amount(n)) for t, n in totals.items())
 
 
 def _native_transfer_token(inputs: tuple[TokenAmount, ...], outputs: tuple[Balance, ...]) -> Token:

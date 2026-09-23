@@ -52,11 +52,11 @@ def test_signer_plain_call_uses_empty_salt() -> None:
         content=[{"type": "text", "text": "3"}],
     )
     assert (
-        result.input_commitment
+        result.inputCommitment
         == "0x43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"
     )
     assert (
-        result.output_commitment
+        result.outputCommitment
         == "0xdf3c1a607fa724ac6ecfcad943cd9f66624ebabed781a444564d3ed953c24b4e"
     )
 
@@ -70,7 +70,7 @@ def test_signer_blind_call_uses_salt() -> None:
         salt=salt,
     )
     assert (
-        result.input_commitment
+        result.inputCommitment
         == "0x884c76820ff75d4829ee314f2ca19ada0b6ea1c6c4853a64b1301616c97e6ef9"
     )
 
@@ -110,8 +110,8 @@ def test_proof_is_verifiable() -> None:
     )
     binding = jcs(
         {
-            "inputCommitment": result.input_commitment,
-            "outputCommitment": result.output_commitment,
+            "inputCommitment": result.inputCommitment,
+            "outputCommitment": result.outputCommitment,
             "nonce": result.nonce,
         }
     )

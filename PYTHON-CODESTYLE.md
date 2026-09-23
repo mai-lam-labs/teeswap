@@ -21,7 +21,7 @@ deferred annotations (PEP 649), and all 3.14 features.
 - Built-in generics and unions: `list[T]`, `dict[K, V]`, `tuple[...]`,
   `X | None`. Never `typing.List`, `Optional`, `Union`.
 - PEP 695 generics: `def f[T](cls: type[T]) -> T:` not `TypeVar`.
-- `type` statement for type aliases.
+- `type` statement for type aliases (except in hydrated fields, see §6).
 - `StrEnum` for wire values. `@override` on every ABC override.
 - `Annotated[T, Parameter(...)]` for Litestar field descriptions.
 - `from __future__ import annotations` is unnecessary on 3.14. Do not add.
@@ -33,9 +33,8 @@ The type checker is a design tool, not a formality.
 1. No `Any` except at a genuinely dynamic boundary (JSON-RPC params,
    wire format dicts). Bare `dict` is implicit `Any` — pyrefly strict
    rejects it; always specify `dict[str, X]`.
-2. The wire-to-typed boundary uses `from_dict[T]` (typed dacite wrapper
-   in `common.py`) or explicit construction from TypedDicts — never raw
-   dict access with string keys scattered through business logic.
+2. The wire-to-typed boundary is `HasFromDict.from_dict` (see §6) —
+   never raw dict access with string keys scattered through business logic.
 3. Never add type ignore/suppress comments without understanding the
    error and getting explicit confirmation. Each suppression is a
    decision, not boilerplate.
@@ -108,19 +107,39 @@ for descriptions. Litestar's `SchemaCreator` derives JSON Schema from
 these types. MCP tool definitions derive `inputSchema` from the same
 types via `schema_for_type()`.
 
-Litestar maps types to schemas by exact match, so a custom type such as
-a `str` subclass (`HexStr`) gets an empty schema. Give it an
-`OpenAPISchemaPlugin` in `schema.py` and add it to `SCHEMA_PLUGINS`,
-which both `schema_for_type()` and the app use. The plugin builds the
-schema from the type itself (`HexStr.pattern()`), so the schema and the
-validator share one definition.
+All wire handling lives in `wire.py`; Litestar only routes and receives bytes.
 
-dacite hydrates dicts into dataclasses via `from_dict[T]` in `common.py`
-— one typed wrapper with one suppression for dacite's upstream type bug.
+- **In:** `decode_object`/`parse_json` parse JSON (fractional numbers become
+  `Decimal`, never `float`), and anything built from a dict inherits
+  `HasFromDict` and is hydrated with `T.from_dict(data)`: strict keys,
+  `Validated` casts, str → enum, list → tuple. No other code parses dicts
+  into typed values.
+- **Out:** `encode(obj)` writes every response, error body, pipe message and
+  commitment input (`jcs` is `encode`): sorted keys, compact, raw UTF-8,
+  `null` for `None`. Its input type `Encodable` lists what it accepts, so
+  the type checker rejects anything else; at runtime it raises on anything
+  it doesn't know, including `float`, `bytes` and bare `datetime`.
+- **Opt-in:** a dataclass crosses the wire only by inheriting `WireStruct`
+  (`HasFromDict` + `HasToWire`, encoded field by field; override `to_wire`
+  for a different shape). Internal dataclasses, e.g. `Invoice` with its
+  signer, are not encodable. Hydrate-only types (MCP params) use
+  `HasFromDict` alone.
+- **Round trip:** for every wire type, `T.from_dict(decode_object(encode(x))) == x`.
+- **Scalar wire types** subclass `Validated`: `__new__` parses the wire form,
+  `to_wire()` produces it, `json_schema()` describes it (`ValidatedSchemaPlugin`
+  hands that to Litestar's OpenAPI). Examples: `HexStr` (0x string),
+  `Amount` (decimal string: JS loses precision past 2**53), `Percent`
+  (0–100, `Decimal`, JSON number), `Timestamp` (wraps a UTC `datetime`,
+  whole seconds, RFC 3339 `…Z`). Other types needing a specific shape
+  implement `HasToWire.to_wire()`.
 
-camelCase ↔ snake_case conversion happens at wire format boundaries
-only (e.g. `verify_meta` parsing `_meta` dicts), not via automatic
-renaming.
+Wire types use the wire's field names, camelCase included; there is no
+renaming layer. Each camelCase field carries its own `# noqa: N815` with
+the reason. Open namespaces (MCP `_meta`) are typed `dict[str, Any]` and
+the entries we use are hydrated from them explicitly.
+
+Aliases used in hydrated fields are plain unions (`Url = SecureUrl | str`),
+not `type` statements: dacite cannot see through `TypeAliasType`.
 
 ## 7. Small things
 

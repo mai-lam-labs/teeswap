@@ -13,14 +13,15 @@ Blind execution: HPKE-encrypted arguments (RFC 9180, see hpke.py).
 import base64
 import enum
 import hashlib
-import json
 import os
-from dataclasses import asdict, dataclass
-from typing import Any
+from dataclasses import asdict, dataclass, replace
+from typing import Any, override
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ..common import TeeSwapError
+from ..types import Hex32
+from ..wire import Encodable, HasFromDict, WireStruct, encode, parse_json
 from .hpke import HpkeKeypair, hpke_seal
 
 
@@ -43,26 +44,36 @@ HPKE_INFO_REPLY = f"{VERIFIABLE_TOOLS_NS}/hpke-v1/reply".encode()
 
 
 @dataclass(frozen=True, slots=True)
-class VerifiableResult:
-    input_commitment: str
-    output_commitment: str
-    nonce: str | None
-    proof: str
-    proof_format: ProofFormat
-    tee_attestation: dict[str, Any] | None
+class VerifiableResult(WireStruct):
+    """The SEP-2133 verifiable-tools _meta block; field names are the wire names."""
 
-    def to_meta(self) -> dict[str, Any]:
-        meta: dict[str, Any] = {
-            "inputCommitment": self.input_commitment,
-            "outputCommitment": self.output_commitment,
+    inputCommitment: str  # noqa: N815  # SEP-2133 wire field name
+    outputCommitment: str  # noqa: N815  # SEP-2133 wire field name
+    proof: str
+    proofFormat: ProofFormat  # noqa: N815  # SEP-2133 wire field name
+    nonce: str | None = None
+    teeAttestation: dict[str, Any] | None = None  # noqa: N815  # SEP-2133 wire field name
+    encryptedContent: bool = False  # noqa: N815  # SEP-2133 wire field name
+
+    @override
+    def to_wire(self) -> Encodable:
+        """The SEP-2133 block: unset optional fields are omitted, not null."""
+        meta: dict[str, Encodable] = {
+            "inputCommitment": self.inputCommitment,
+            "outputCommitment": self.outputCommitment,
             "proof": self.proof,
-            "proofFormat": self.proof_format.value,
+            "proofFormat": self.proofFormat.value,
         }
         if self.nonce is not None:
             meta["nonce"] = self.nonce
-        if self.tee_attestation is not None:
-            meta["teeAttestation"] = self.tee_attestation
-        return {VERIFIABLE_TOOLS_NS: meta}
+        if self.teeAttestation is not None:
+            meta["teeAttestation"] = self.teeAttestation
+        if self.encryptedContent:
+            meta["encryptedContent"] = True
+        return meta
+
+    def to_meta(self) -> dict[str, Any]:
+        return {VERIFIABLE_TOOLS_NS: self.to_wire()}
 
 
 # --- Signer (boot-time key, per-request signing) ---
@@ -105,12 +116,12 @@ class Signer:
         signature = self._key.sign(jcs(binding_fields))
 
         return VerifiableResult(
-            input_commitment=input_commitment,
-            output_commitment=output_commitment,
+            inputCommitment=input_commitment,
+            outputCommitment=output_commitment,
             nonce=client_nonce,
             proof="0x" + signature.hex(),
-            proof_format=ProofFormat.TEE_VAPORTPM_V1,
-            tee_attestation=self._boot_attestation,
+            proofFormat=ProofFormat.TEE_VAPORTPM_V1,
+            teeAttestation=self._boot_attestation,
         )
 
     def attest_blind_result(
@@ -160,23 +171,23 @@ def compute_commitment(prefix: bytes, obj: dict[str, Any] | list[dict[str, Any]]
 
 
 def jcs(obj: dict[str, Any] | list[Any]) -> bytes:
-    """RFC 8785 JSON Canonicalization Scheme — simplified.
+    """Canonical JSON for commitments: the same bytes wire.encode sends.
 
-    Full 8785 specifies UTF-16 key sort order and ES2015 number serialization.
-    We require all numeric values to be string-encoded (amounts, hashes, keys),
-    so sorted-key compact JSON is sufficient.  Both signer and verifier share
-    this function; interop with a full 8785 implementation is only guaranteed
-    when the input contains no bare numeric JSON values.
+    Sorted keys, compact, raw UTF-8. Not full RFC 8785 (no ES2015 number
+    formatting), but amounts are strings on the wire and floats are rejected,
+    so the numbers that make 8785 hard never reach it.
     """
-    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+    return encode(obj)
 
 
 # --- Blind execution (HPKE + protocol layer) ---
 
 
 @dataclass(frozen=True, slots=True)
-class DecryptedBlindCall:
-    salt: bytes
+class DecryptedBlindCall(HasFromDict):
+    """The decrypted blind-call payload."""
+
+    salt: Hex32
     arguments: dict[str, Any]
 
 
@@ -212,18 +223,17 @@ class BlindExecutor:
         aad = build_args_aad(tool_name, input_commitment, encryption_scheme)
         raw = base64.urlsafe_b64decode(encrypted_arguments_b64 + "==")
         plaintext = self.keypair.open(HPKE_INFO_ARGS, aad, raw)
-        payload = json.loads(plaintext)
-        salt = bytes.fromhex(payload["salt"].removeprefix("0x"))
-        return DecryptedBlindCall(salt=salt, arguments=payload["arguments"])
+        payload = parse_json(plaintext)
+        if not isinstance(payload, dict):
+            raise TypeError("blind payload must be a JSON object")
+        return DecryptedBlindCall.from_dict(payload)
 
     def verify_commitment(
         self,
         decrypted: DecryptedBlindCall,
         client_input_commitment: str,
     ) -> None:
-        if len(decrypted.salt) != 32:
-            raise AttestationError("salt must be exactly 32 bytes")
-        computed = compute_commitment(decrypted.salt, decrypted.arguments)
+        computed = compute_commitment(decrypted.salt.to_bytes(), decrypted.arguments)
         if computed != client_input_commitment:
             raise AttestationError("inputCommitment mismatch")
 
@@ -239,10 +249,9 @@ class BlindExecutor:
         verifiable = self.signer.attest_blind_result(
             arguments=decrypted.arguments,
             content=content,
-            salt=decrypted.salt,
+            salt=decrypted.salt.to_bytes(),
             client_nonce=client_nonce,
         )
-        meta = verifiable.to_meta()
 
         if reply_public_key_b64 is not None:
             reply_aad = build_reply_aad(tool_name, client_input_commitment, client_nonce)
@@ -251,6 +260,6 @@ class BlindExecutor:
             sealed = hpke_seal(reply_public_bytes, HPKE_INFO_REPLY, reply_aad, plaintext)
             encrypted_content = base64.urlsafe_b64encode(sealed).decode().rstrip("=")
             content = [{"type": "text", "text": encrypted_content}]
-            meta[VERIFIABLE_TOOLS_NS]["encryptedContent"] = True
+            verifiable = replace(verifiable, encryptedContent=True)
 
-        return content, meta
+        return content, verifiable.to_meta()

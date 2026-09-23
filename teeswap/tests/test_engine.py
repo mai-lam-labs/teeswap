@@ -18,15 +18,18 @@ from teeswap.blockchain.rpc import RpcConfig, jsonrpc
 from teeswap.config import Operator, TeeSwapConfig
 from teeswap.http import HttpClient
 from teeswap.instance import TeeSwap
-from teeswap.invoice import InputStatus, OutputStatus
+from teeswap.invoice import InputStatus, InvoiceView, OutputStatus
 from teeswap.types import (
     Address,
+    Amount,
     Balance,
     InvoiceRequest,
     QuoteRequest,
+    QuoteResponse,
     Token,
     TokenAmount,
 )
+from teeswap.wire import decode_object, encode
 
 ANVIL_URL = "http://127.0.0.1:8545"
 ANVIL_CHAIN = Chain(
@@ -85,26 +88,35 @@ async def test_eth_split_via_api(anvil: Anvil):
     recipient_a = EthSigner.derive(ROOT_KEY, b"recipient-a").address
     recipient_b = EthSigner.derive(ROOT_KEY, b"recipient-b").address
 
-    quote_response = await instance.api.quote(
-        QuoteRequest(
-            inputs=(
-                TokenAmount(token=ETH, amount=ONE_ETH * 40 // 100),
-                TokenAmount(token=ETH, amount=ONE_ETH * 60 // 100),
+    request = QuoteRequest(
+        inputs=(
+            TokenAmount(token=ETH, amount=Amount(ONE_ETH * 40 // 100)),
+            TokenAmount(token=ETH, amount=Amount(ONE_ETH * 60 // 100)),
+        ),
+        outputs=(
+            Balance(
+                amount=TokenAmount(token=ETH, amount=Amount(ONE_ETH * 60 // 100)),
+                address=Address(ANVIL_CHAIN, recipient_a),
             ),
-            outputs=(
-                Balance(
-                    amount=TokenAmount(token=ETH, amount=ONE_ETH * 60 // 100),
-                    address=Address(ANVIL_CHAIN, recipient_a),
-                ),
-                Balance(
-                    amount=TokenAmount(token=ETH, amount=ONE_ETH * 40 // 100),
-                    address=Address(ANVIL_CHAIN, recipient_b),
-                ),
+            Balance(
+                amount=TokenAmount(token=ETH, amount=Amount(ONE_ETH * 40 // 100)),
+                address=Address(ANVIL_CHAIN, recipient_b),
             ),
-        )
+        ),
     )
-    quote_id = quote_response.quote_id
-    assert quote_response.inputs == (TokenAmount(token=ETH, amount=ONE_ETH),)
+
+    # the quote goes over REST as JSON, so hydration is exercised the way clients hit it
+    app = make_http_app(instance)
+    async with AsyncTestClient(app) as client:
+        resp = await client.post(
+            "/teeswap/quote",
+            content=encode(request),
+            headers={"content-type": "application/json"},
+        )
+    assert resp.status_code == 200, resp.text
+    quote = QuoteResponse.from_dict(decode_object(resp.content))
+    quote_id = quote.quote_id
+    assert quote.inputs == (TokenAmount(token=ETH, amount=Amount(ONE_ETH)),)
 
     accept_response = await instance.api.accept(InvoiceRequest(quote_id=quote_id))
     deposit_address = accept_response.deposits[0].address.value
@@ -141,7 +153,6 @@ async def test_eth_split_via_api(anvil: Anvil):
     assert invoice_view.outputs == status_response.outputs
 
     # --- Invoice view routes ---
-    app = make_http_app(instance)
     async with AsyncTestClient(app) as client:
         html_resp = await client.get(f"/invoice/{quote_id}.html")
         assert html_resp.status_code == 200
@@ -152,11 +163,8 @@ async def test_eth_split_via_api(anvil: Anvil):
 
         json_resp = await client.get(f"/invoice/{quote_id}.json")
         assert json_resp.status_code == 200
-        data = json_resp.json()
-        assert data["status"] == "delivered"
-        assert data["inputs"][0]["deposit"]["address"]["value"] == deposit_address
-        assert data["outputs"][0]["transactions"][0]["hash"].startswith("0x")
-        assert len(data["actions"]) == 2
+        # what a client reads back is exactly the invoice the TEE holds
+        assert InvoiceView.from_dict(decode_object(json_resp.content)) == invoice_view
 
         not_found = await client.get("/invoice/inv_bogus.html")
         assert not_found.status_code == 404

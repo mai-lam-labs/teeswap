@@ -15,7 +15,7 @@ import asyncio
 import enum
 import secrets
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 from .blockchain.chains import Chain
 from .blockchain.evm import EthSigner
@@ -25,13 +25,16 @@ from .protocol import Protocol
 from .response import DataclassResponse
 from .types import (
     Address,
+    Amount,
     Balance,
     HttpExchange,
     QuoteRequest,
     QuoteResponse,
+    Timestamp,
     TokenAmount,
     Transaction,
 )
+from .wire import WireStruct
 
 
 class InvoiceError(TeeSwapError):
@@ -68,12 +71,12 @@ class StepStatus(enum.StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class StepView:
+class StepView(WireStruct):
     operation: str
     status: StepStatus
     chain: Chain | None
-    started_at: datetime | None
-    completed_at: datetime | None
+    started_at: Timestamp | None
+    completed_at: Timestamp | None
     error: str | None
     transactions: tuple[Transaction, ...]
 
@@ -83,26 +86,26 @@ class Step:
     operation: str
     chain: Chain | None
     status: StepStatus = StepStatus.PENDING
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
+    started_at: Timestamp | None = None
+    completed_at: Timestamp | None = None
     transactions: list[Transaction] = field(default_factory=list)
     http_exchanges: list[HttpExchange] = field(default_factory=list)
     error: str | None = None
 
     def start(self) -> None:
         self.status = StepStatus.EXECUTING
-        self.started_at = datetime.now(UTC)
+        self.started_at = Timestamp.now()
 
     def wait(self) -> None:
         self.status = StepStatus.WAITING
 
     def complete(self) -> None:
         self.status = StepStatus.COMPLETED
-        self.completed_at = datetime.now(UTC)
+        self.completed_at = Timestamp.now()
 
     def fail(self, error: str) -> None:
         self.status = StepStatus.FAILED
-        self.completed_at = datetime.now(UTC)
+        self.completed_at = Timestamp.now()
         self.error = error
 
     def view(self) -> StepView:
@@ -118,7 +121,7 @@ class Step:
 
 
 @dataclass(frozen=True, slots=True)
-class ActionView:
+class ActionView(WireStruct):
     description: str
     protocol: str | None
     source_chain: Chain
@@ -132,7 +135,7 @@ class Action:
     description: str
     source_chain: Chain
     destination_chain: Chain | None
-    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    started_at: Timestamp = field(default_factory=Timestamp.now)
     steps: list[Step] = field(default_factory=list)
 
     def add_step(self, operation: str, chain: Chain | None = None) -> Step:
@@ -188,14 +191,14 @@ class OutputStatus(enum.StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class InvoiceInput:
+class InvoiceInput(WireStruct):
     deposit: Balance
     received: TokenAmount
     status: InputStatus = InputStatus.AWAITING
 
 
 @dataclass(frozen=True, slots=True)
-class InvoiceOutput:
+class InvoiceOutput(WireStruct):
     balance: Balance
     status: OutputStatus = OutputStatus.PENDING
     transactions: tuple[Transaction, ...] = ()
@@ -209,8 +212,8 @@ class InvoiceView(DataclassResponse):
     quote_id: str
     operator: Operator
     status: InvoiceStatus
-    created_at: datetime
-    expires_at: datetime
+    created_at: Timestamp
+    expires_at: Timestamp
     inputs: tuple[InvoiceInput, ...]
     outputs: tuple[InvoiceOutput, ...]
     gas: TokenAmount
@@ -225,8 +228,8 @@ DEPOSIT_TTL = timedelta(minutes=30)
 @dataclass(slots=True)
 class Invoice:
     id: InvoiceId
-    created_at: datetime
-    expires_at: datetime
+    created_at: Timestamp
+    expires_at: Timestamp
     request: QuoteRequest
     quote: QuoteResponse
     operator: Operator
@@ -242,11 +245,11 @@ class Invoice:
     def accept(self) -> None:
         if self.status != InvoiceStatus.QUOTED:
             raise InvoiceStateError(f"cannot accept invoice in state {self.status}")
-        if datetime.now(UTC) > self.expires_at:
+        if Timestamp.now() > self.expires_at:
             self.status = InvoiceStatus.EXPIRED
             raise InvoiceExpiredError(self.id)
         self.status = InvoiceStatus.AWAITING_DEPOSIT
-        self.expires_at = datetime.now(UTC) + DEPOSIT_TTL
+        self.expires_at = Timestamp.now() + DEPOSIT_TTL
 
     def view(self) -> InvoiceView:
         return InvoiceView(
@@ -264,7 +267,7 @@ class Invoice:
 
     @property
     def is_expired(self) -> bool:
-        return datetime.now(UTC) > self.expires_at and self.status in (
+        return Timestamp.now() > self.expires_at and self.status in (
             InvoiceStatus.QUOTED,
             InvoiceStatus.AWAITING_DEPOSIT,
         )
@@ -293,7 +296,7 @@ class InvoiceRegistry:
         self, request: QuoteRequest, quote: QuoteResponse, signer: EthSigner
     ) -> Invoice:
         inv_id = InvoiceId(quote.quote_id)
-        now = datetime.now(UTC)
+        now = Timestamp.now()
         invoice = Invoice(
             id=inv_id,
             created_at=now,
@@ -305,7 +308,7 @@ class InvoiceRegistry:
             inputs=[
                 InvoiceInput(
                     deposit=Balance(amount=inp, address=Address(inp.token.chain, signer.address)),
-                    received=TokenAmount(token=inp.token, amount=0),
+                    received=TokenAmount(token=inp.token, amount=Amount(0)),
                 )
                 for inp in quote.inputs
             ],

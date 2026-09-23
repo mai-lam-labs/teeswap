@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from datetime import datetime
 from typing import override
 
 from .config import FeeConfig
@@ -16,14 +15,14 @@ from .invoice import (
 from .mcp import Tool, ToolDefinition
 from .quote import compute_quote
 from .response import DataclassResponse
-from .types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
+from .types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse, Timestamp
 
 
 @dataclass(frozen=True)
 class StatusResponse(DataclassResponse):
     quote_id: str
     status: InvoiceStatus
-    expires_at: datetime
+    expires_at: Timestamp
     inputs: tuple[InvoiceInput, ...]
     outputs: tuple[InvoiceOutput, ...]
 

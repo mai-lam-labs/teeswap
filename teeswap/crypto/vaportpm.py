@@ -8,14 +8,13 @@ Source: https://github.com/lockboot/vaportpm (vaportpm crate)
 """
 
 import hashlib
-import json
 import subprocess
 from dataclasses import dataclass
 from typing import NotRequired, TypedDict
 
 from dacite import DaciteError
 
-from ..common import from_dict
+from ..wire import WireError, WireStruct, decode_object
 from .attestation import AttestationError, Signer
 
 
@@ -65,36 +64,36 @@ class RawVaportpmOutput(TypedDict):
 
 
 @dataclass(frozen=True, slots=True)
-class EccPublicKeyCoords:
+class EccPublicKeyCoords(WireStruct):
     x: str
     y: str
 
 
 @dataclass(frozen=True, slots=True)
-class TpmAttestationData:
+class TpmAttestationData(WireStruct):
     attest_data: str
     signature: str
 
 
 @dataclass(frozen=True, slots=True)
-class NitroAttestationData:
+class NitroAttestationData(WireStruct):
     document: str
 
 
 @dataclass(frozen=True, slots=True)
-class GcpAttestationData:
+class GcpAttestationData(WireStruct):
     ak_cert_chain: str
 
 
 @dataclass(frozen=True, slots=True)
-class AttestationContainer:
+class AttestationContainer(WireStruct):
     tpm: dict[str, TpmAttestationData]
     nitro: NitroAttestationData | None = None
     gcp: GcpAttestationData | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class VaportpmOutput:
+class VaportpmOutput(WireStruct):
     nonce: str
     pcrs: dict[str, dict[str, str]]
     ak_pubkeys: dict[str, EccPublicKeyCoords]
@@ -188,7 +187,6 @@ def derive_pcr_bound(label: str, length: int) -> bytes:
 
 def _parse_vaportpm_output(raw_json: str) -> VaportpmOutput:
     try:
-        data = json.loads(raw_json)
-        return from_dict(VaportpmOutput, data)
-    except (json.JSONDecodeError, DaciteError, KeyError, TypeError) as e:
+        return VaportpmOutput.from_dict(decode_object(raw_json))
+    except (WireError, DaciteError, KeyError, TypeError) as e:
         raise VaportpmParseError(f"failed to parse vaportpm output: {e}") from e

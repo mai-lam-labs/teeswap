@@ -18,6 +18,7 @@ import httpx
 
 from ..http import BaseHttpClient, HttpClient
 from ..types import Url
+from ..wire import WireStruct
 from .chains import Chain, ChainFamily, ChainRegistry
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ DEFAULT_CONCURRENCY = 6
 
 
 @dataclass(frozen=True, slots=True)
-class RpcConfig:
+class RpcConfig(WireStruct):
     chain: str
     urls: tuple[Url, ...]
 

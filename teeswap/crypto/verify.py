@@ -4,6 +4,7 @@ from typing import Any
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from dacite import DaciteError
 
 from .attestation import (
     VERIFIABLE_TOOLS_NS,
@@ -20,6 +21,7 @@ class VerifyFailure(enum.StrEnum):
     OUTPUT_COMMITMENT_MISMATCH = "outputCommitmentMismatch"
     NONCE_MISMATCH = "nonceMismatch"
     UNSUPPORTED_PROOF_FORMAT = "unsupportedProofFormat"
+    MALFORMED_META = "malformedMeta"
     INVALID_SIGNATURE = "invalidSignature"
 
 
@@ -55,26 +57,26 @@ class Verifier:
         expected_nonce: str | None = None,
         salt: bytes = b"",
     ) -> VerificationOutcome:
-        if not result.input_commitment or not result.output_commitment:
+        if not result.inputCommitment or not result.outputCommitment:
             return VerificationFailed(VerifyFailure.MISSING_COMMITMENT)
 
-        if result.proof_format not in self._proof_formats:
+        if result.proofFormat not in self._proof_formats:
             return VerificationFailed(VerifyFailure.UNSUPPORTED_PROOF_FORMAT)
 
         if expected_nonce is not None and result.nonce != expected_nonce:
             return VerificationFailed(VerifyFailure.NONCE_MISMATCH)
 
         computed_input = compute_commitment(salt, arguments)
-        if computed_input != result.input_commitment:
+        if computed_input != result.inputCommitment:
             return VerificationFailed(VerifyFailure.INPUT_COMMITMENT_MISMATCH)
 
         computed_output = compute_commitment(b"", content)
-        if computed_output != result.output_commitment:
+        if computed_output != result.outputCommitment:
             return VerificationFailed(VerifyFailure.OUTPUT_COMMITMENT_MISMATCH)
 
         binding_fields: dict[str, str] = {
-            "inputCommitment": result.input_commitment,
-            "outputCommitment": result.output_commitment,
+            "inputCommitment": result.inputCommitment,
+            "outputCommitment": result.outputCommitment,
         }
         if result.nonce is not None:
             binding_fields["nonce"] = result.nonce
@@ -88,9 +90,9 @@ class Verifier:
             return VerificationFailed(VerifyFailure.INVALID_SIGNATURE)
 
         return Verified(
-            input_commitment=result.input_commitment,
-            output_commitment=result.output_commitment,
-            proof_format=result.proof_format,
+            input_commitment=result.inputCommitment,
+            output_commitment=result.outputCommitment,
+            proof_format=result.proofFormat,
         )
 
     def verify_meta(
@@ -101,13 +103,11 @@ class Verifier:
         expected_nonce: str | None = None,
         salt: bytes = b"",
     ) -> VerificationOutcome:
-        vt_meta = meta.get(VERIFIABLE_TOOLS_NS, {})
-        result = VerifiableResult(
-            input_commitment=vt_meta.get("inputCommitment", ""),
-            output_commitment=vt_meta.get("outputCommitment", ""),
-            nonce=vt_meta.get("nonce"),
-            proof=vt_meta.get("proof", ""),
-            proof_format=ProofFormat(vt_meta["proofFormat"]),
-            tee_attestation=vt_meta.get("teeAttestation"),
-        )
+        vt_meta = meta.get(VERIFIABLE_TOOLS_NS)
+        if not isinstance(vt_meta, dict):
+            return VerificationFailed(VerifyFailure.MALFORMED_META)
+        try:
+            result = VerifiableResult.from_dict(vt_meta)
+        except DaciteError, ValueError, TypeError:
+            return VerificationFailed(VerifyFailure.MALFORMED_META)
         return self.verify(result, arguments, content, expected_nonce, salt)

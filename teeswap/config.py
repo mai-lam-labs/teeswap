@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from .blockchain.chains import Chain, ChainFamily
 from .blockchain.rpc import RpcConfig
-from .types import HasFromDict
+from .wire import WireStruct
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,7 +13,7 @@ class FeeConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class Operator:
+class Operator(WireStruct):
     """The invoice issuer. Every field is optional; the invoice shows whatever is set."""
 
     legal_name: str | None = None
@@ -23,9 +23,9 @@ class Operator:
 
 
 @dataclass(frozen=True, slots=True)
-class FacilitatorConfig:
+class FacilitatorConfig(WireStruct):
     url: str
-    poll_interval: float = 300.0
+    poll_interval: int = 300  # seconds
 
 
 _DEFAULT_FACILITATORS: tuple[FacilitatorConfig, ...] = (
@@ -159,7 +159,7 @@ _DEFAULT_RPCS: tuple[RpcConfig, ...] = (
 
 
 @dataclass(frozen=True, slots=True)
-class TeeSwapConfig(HasFromDict):
+class TeeSwapConfig(WireStruct):
     facilitators: tuple[FacilitatorConfig, ...] = _DEFAULT_FACILITATORS
     chains: tuple[Chain, ...] = _DEFAULT_CHAINS
     rpcs: tuple[RpcConfig, ...] = _DEFAULT_RPCS

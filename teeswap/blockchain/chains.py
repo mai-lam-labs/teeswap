@@ -8,6 +8,8 @@ TeeSwapConfig; defaults are provided.
 import enum
 from dataclasses import dataclass
 
+from ..wire import WireStruct
+
 
 class ChainFamily(enum.StrEnum):
     EVM = "evm"
@@ -22,7 +24,7 @@ class ChainFamily(enum.StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class Chain:
+class Chain(WireStruct):
     caip2: str
     family: ChainFamily
     name: str

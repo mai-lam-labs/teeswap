@@ -235,7 +235,7 @@ def render_invoices(registry: InvoiceRegistry) -> str:
                             td(", ".join(deposits) or "—", cls="mono")
                             td(str(len(inv.actions)))
                             td(current.description if current else "—")
-                            td(inv.created_at.strftime("%Y-%m-%d %H:%M"), cls="age")
+                            td(inv.created_at.dt.strftime("%Y-%m-%d %H:%M"), cls="age")
     return str(doc)
 
 
@@ -268,7 +268,7 @@ def render_processes(registry: InvoiceRegistry) -> str:
                                 _badge(step.status.value if step else "—", "warn")
                             td(step.chain.name if step and step.chain else "—")
                             td(
-                                step.started_at.strftime("%H:%M:%S")
+                                step.started_at.dt.strftime("%H:%M:%S")
                                 if step and step.started_at
                                 else "—",
                                 cls="age",
