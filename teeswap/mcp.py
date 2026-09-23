@@ -1,5 +1,6 @@
 import abc
 import base64
+import logging
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ from .response import ToolResponse
 from .schema import schema_for_type
 from .wire import HasFromDict, WireError, encode, parse_json
 
+logger = logging.getLogger(__name__)
+
 MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_VERSIONS = ("2025-11-25", "2026-07-28")
 PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion"
@@ -41,9 +44,46 @@ class PaymentRequirement:
 @dataclass(frozen=True, slots=True)
 class JsonRpcRequest(HasFromDict):
     method: str
+    id: str | int
     params: dict[str, Any] = field(default_factory=dict)
-    id: str | int | None = None
     jsonrpc: str = "2.0"
+
+
+@dataclass(frozen=True, slots=True)
+class JsonRpcNotification(HasFromDict):
+    method: str
+    params: dict[str, Any] = field(default_factory=dict)
+    jsonrpc: str = "2.0"
+
+
+type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification
+
+
+def parse_message(data: dict[str, Any]) -> JsonRpcMessage:
+    """JSON-RPC 2.0: with an "id" it is a request (always answered), without one a
+    notification (never answered, not even with an error)."""
+    if "id" in data:
+        return JsonRpcRequest.from_dict(data)
+    return JsonRpcNotification.from_dict(data)
+
+
+# Client notifications we accept and deliberately take no action on, and why that is
+# within the MCP spec. If we start sending server-initiated requests or add long-running
+# tools, initialized/cancelled/progress need real handling.
+IGNORED_NOTIFICATIONS: dict[str, str] = {
+    "notifications/initialized": "only gates server-initiated requests; we send none",
+    "notifications/cancelled": (
+        "spec allows ignoring when cancellation isn't possible: stdio handles one request"
+        " at a time and HTTP calls are short, so the request has completed"
+    ),
+    "notifications/progress": "only concerns server-initiated requests; we send none",
+    "notifications/roots/list_changed": "we don't use client roots",
+}
+
+
+def handle_mcp_notification(notification: JsonRpcNotification) -> None:
+    if notification.method not in IGNORED_NOTIFICATIONS:
+        logger.debug("ignoring unknown notification %s", notification.method)
 
 
 # --- MCP method params (field names are the wire names) ---
@@ -337,6 +377,21 @@ async def handle_mcp_request(
     rpc: JsonRpcRequest,
     session_id: str | None,
 ) -> McpResult:
+    """Always answers: anything unexpected becomes -32603 without details, logged here."""
+    try:
+        return await _dispatch_request(dispatcher, sessions, method, rpc, session_id)
+    except Exception:
+        logger.exception("internal error handling %s", method)
+        return McpResult(body=_error(rpc.id, -32603, "internal error"))
+
+
+async def _dispatch_request(
+    dispatcher: Dispatcher,
+    sessions: SessionManager,
+    method: str,
+    rpc: JsonRpcRequest,
+    session_id: str | None,
+) -> McpResult:
     params_type = _PARAMS_BY_METHOD.get(method)
     if params_type is None:
         return McpResult(body=_error(rpc.id, -32601, f"unknown method: {method}"))
@@ -447,9 +502,29 @@ async def _handle_tools_call(
         return McpResult(body=_error(req_id, -32601, str(e)))
     except InvalidToolArgumentsError as e:
         return McpResult(body=_error(req_id, -32602, str(e)))
+    except TeeSwapError as e:
+        # a domain failure is a tool result the model can see and act on, not a protocol error
+        return _attested_result(dispatcher, req_id, params, _error_content(e), is_error=True)
 
-    content = tool_result.to_mcp_content()
+    return _attested_result(
+        dispatcher, req_id, params, tool_result.to_mcp_content(), is_error=False
+    )
+
+
+def _error_content(error: TeeSwapError) -> list[dict[str, Any]]:
+    return [{"type": "text", "text": str(error)}]
+
+
+def _attested_result(
+    dispatcher: Dispatcher,
+    req_id: str | int | None,
+    params: ToolsCallParams,
+    content: list[dict[str, Any]],
+    is_error: bool,
+) -> McpResult:
     result_body: dict[str, Any] = {"content": content}
+    if is_error:
+        result_body["isError"] = True
 
     if dispatcher.signer is not None:
         verifiable = dispatcher.signer.attest_result(
@@ -487,14 +562,17 @@ async def _handle_blind_call(
     except AttestationError as e:
         return McpResult(body=_error(req_id, -32602, str(e)))
 
+    is_error = False
     try:
         tool_result = await dispatcher.call(params.name, decrypted.arguments)
+        content = tool_result.to_mcp_content()
     except ToolNotFoundError as e:
         return McpResult(body=_error(req_id, -32601, str(e)))
     except InvalidToolArgumentsError as e:
         return McpResult(body=_error(req_id, -32602, str(e)))
-
-    content = tool_result.to_mcp_content()
+    except TeeSwapError as e:
+        content = _error_content(e)
+        is_error = True
 
     content, meta = blind.attest_and_encrypt(
         decrypted=decrypted,
@@ -505,7 +583,10 @@ async def _handle_blind_call(
         reply_public_key_b64=params.replyPublicKey,
     )
 
-    return McpResult(body=_ok(req_id, {"content": content, "_meta": meta}))
+    result_body: dict[str, Any] = {"content": content, "_meta": meta}
+    if is_error:
+        result_body["isError"] = True
+    return McpResult(body=_ok(req_id, result_body))
 
 
 # --- JSONL transport ---
@@ -537,20 +618,28 @@ async def jsonl_loop(
             write_error(None, -32700, f"parse error: {e}")
             continue
 
+        if not isinstance(raw, dict):
+            write_error(None, -32600, "invalid request: expected a JSON object")
+            continue
         try:
-            rpc = JsonRpcRequest.from_dict(raw)
+            message = parse_message(raw)
         except (DaciteError, TypeError, ValueError) as e:
-            write_error(
-                raw.get("id") if isinstance(raw, dict) else None, -32600, f"invalid request: {e}"
-            )
+            write_error(raw.get("id"), -32600, f"invalid request: {e}")
             continue
 
-        result = await handle_mcp_request(
-            dispatcher=dispatcher,
-            sessions=sessions,
-            method=rpc.method,
-            rpc=rpc,
-            session_id=session.session_id,
-        )
-
-        write(result.body)
+        match message:
+            case JsonRpcNotification():
+                handle_mcp_notification(message)
+            case JsonRpcRequest():
+                result = await handle_mcp_request(
+                    dispatcher=dispatcher,
+                    sessions=sessions,
+                    method=message.method,
+                    rpc=message,
+                    session_id=session.session_id,
+                )
+                try:
+                    write(result.body)
+                except WireError:
+                    logger.exception("could not encode the reply to %s", message.method)
+                    write_error(message.id, -32603, "internal error")

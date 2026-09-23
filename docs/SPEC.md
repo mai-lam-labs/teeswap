@@ -220,7 +220,7 @@ The TEE Engine registers on x402 Bazaar and MCP registries. Agents discover TEES
 
 ### 6.2 Quote (x402 micro-fee)
 
-Agent calls `teeswap_quote`. The MCP client handles the 402→payment→response flow:
+Agent calls `teeswap_quote`. Payment follows the x402 MCP transport (see `X402.md`): the first call returns an `isError` result with `PaymentRequired`, the client repeats the call with `params._meta["x402/payment"]`, and the paid result carries `_meta["x402/payment-response"]`:
 
 ```
 Agent ──teeswap_quote──► Proxy ──(E2EE)──► TEE

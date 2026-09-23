@@ -24,6 +24,7 @@ from .invoice import (
     InvoiceStatus,
     OutputStatus,
 )
+from .protocol import NoRouteError
 from .types import (
     AcceptResponse,
     Amount,
@@ -57,7 +58,7 @@ class Engine:
     def rpc_url_for_chain(self, chain: Chain) -> Url:
         url = self._rpc_urls.get(chain.caip2)
         if url is None:
-            raise ValueError(f"no RPC URL configured for {chain.name} ({chain.caip2})")
+            raise NoRouteError(f"no RPC configured for {chain.name} ({chain.caip2})")
         return url
 
     def create_invoice(self, request: QuoteRequest, quote: QuoteResponse) -> Invoice:
@@ -127,7 +128,7 @@ class Engine:
                     invoice.inputs[index] = replace(inp, status=InputStatus.EXPIRED)
                     step.fail("deposit timeout")
                     invoice.status = InvoiceStatus.EXPIRED
-                    raise InvoiceExpiredError(invoice.id)
+                    raise InvoiceExpiredError(f"invoice {invoice.id} expired awaiting deposit")
                 await asyncio.sleep(DEPOSIT_POLL_INTERVAL)
 
     async def _execute_transfers(self, invoice: Invoice, signer: EthSigner) -> None:

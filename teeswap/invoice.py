@@ -247,7 +247,7 @@ class Invoice:
             raise InvoiceStateError(f"cannot accept invoice in state {self.status}")
         if Timestamp.now() > self.expires_at:
             self.status = InvoiceStatus.EXPIRED
-            raise InvoiceExpiredError(self.id)
+            raise InvoiceExpiredError(f"quote {self.id} has expired")
         self.status = InvoiceStatus.AWAITING_DEPOSIT
         self.expires_at = Timestamp.now() + DEPOSIT_TTL
 
@@ -320,7 +320,7 @@ class InvoiceRegistry:
     def get(self, invoice_id: InvoiceId) -> Invoice:
         invoice = self._invoices.get(invoice_id)
         if invoice is None:
-            raise InvoiceNotFoundError(invoice_id)
+            raise InvoiceNotFoundError(f"no invoice {invoice_id}")
         return invoice
 
     def all(self) -> list[Invoice]:

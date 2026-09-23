@@ -7,6 +7,7 @@ HasFromDict.from_dict, the same path MCP uses, never by Litestar's decoder.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import GenericAlias
 from typing import TYPE_CHECKING, Any
@@ -18,13 +19,23 @@ from litestar.openapi import OpenAPIConfig
 from litestar.openapi.spec import OpenAPIMediaType, Operation, RequestBody
 from litestar.status_codes import (
     HTTP_200_OK,
+    HTTP_202_ACCEPTED,
     HTTP_400_BAD_REQUEST,
+    HTTP_404_NOT_FOUND,
+    HTTP_422_UNPROCESSABLE_ENTITY,
     HTTP_500_INTERNAL_SERVER_ERROR,
 )
 
 from .common import PKG_NAME, PKG_VERSION, TeeSwapError
 from .dashboard import create_dashboard_router, create_invoice_router
-from .mcp import JsonRpcRequest, Tool, handle_mcp_request
+from .invoice import InvoiceNotFoundError
+from .mcp import (
+    JsonRpcNotification,
+    Tool,
+    handle_mcp_notification,
+    handle_mcp_request,
+    parse_message,
+)
 from .schema import SCHEMA_PLUGINS, schema_object_for_type
 from .wire import HasFromDict, WireError, decode_object, encode
 
@@ -38,9 +49,9 @@ class RequestError(TeeSwapError):
     pass
 
 
-def _hydrate[T: HasFromDict](cls: type[T], raw: bytes) -> T:
+def _hydrate[T](parse: Callable[[dict[str, Any]], T], raw: bytes) -> T:
     try:
-        return cls.from_dict(decode_object(raw))
+        return parse(decode_object(raw))
     except (WireError, DaciteError, ValueError, TypeError) as e:
         raise RequestError(str(e)) from e
 
@@ -58,6 +69,10 @@ def _on_error(_: Request[Any, Any, Any], exc: Exception) -> Response[bytes]:
     match exc:
         case RequestError():
             return _error_response(HTTP_400_BAD_REQUEST, str(exc))
+        case InvoiceNotFoundError():
+            return _error_response(HTTP_404_NOT_FOUND, str(exc))
+        case TeeSwapError():
+            return _error_response(HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
         case HTTPException():
             return _error_response(exc.status_code, exc.detail)
         case _:
@@ -84,7 +99,7 @@ def _make_rest_handler(tool: Tool) -> Any:
     defn = tool.definition
 
     async def handler(request: Request[Any, Any, Any]) -> Response[Any]:
-        args = _hydrate(defn.input_type, await request.body())
+        args = _hydrate(defn.input_type.from_dict, await request.body())
         result = await tool.execute(args)
         body, media_type = result.to_rest()
         return Response(content=body, status_code=HTTP_200_OK, media_type=media_type)
@@ -112,7 +127,10 @@ def _make_mcp_handler(instance: TeeSwap) -> Any:
         "Supports initialize, server/discover, tools/list, tools/call, and verifiable-tools/call.",
     )
     async def mcp_handler(request: Request[Any, Any, Any]) -> Response[Any]:
-        rpc = _hydrate(JsonRpcRequest, await request.body())
+        rpc = _hydrate(parse_message, await request.body())
+        if isinstance(rpc, JsonRpcNotification):
+            handle_mcp_notification(rpc)
+            return Response(content=b"", status_code=HTTP_202_ACCEPTED, media_type=MediaType.TEXT)
         method = request.headers.get("Mcp-Method", rpc.method)
         session_id = request.headers.get("Mcp-Session-Id")
 

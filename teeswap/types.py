@@ -189,9 +189,7 @@ class Percent(Decimal, Validated):
     @override
     @classmethod
     def json_schema(cls) -> WireSchema:
-        return WireSchema(
-            type="number", minimum=Decimal(0), maximum=Decimal(100), description="percentage"
-        )
+        return WireSchema(type="number", minimum=0, maximum=100, description="percentage")
 
 
 # --- Duration types ---

@@ -59,8 +59,9 @@ class WireSchema:
     description: str
     format: str | None = None
     pattern: str | None = None
-    minimum: Decimal | None = None
-    maximum: Decimal | None = None
+    # ints, not floats: these end up in MCP inputSchema, which encode() must accept
+    minimum: int | None = None
+    maximum: int | None = None
 
 
 class Validated(HasToWire):

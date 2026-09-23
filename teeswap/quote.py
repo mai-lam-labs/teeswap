@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 from .blockchain.chains import Chain, ChainFamily
 from .blockchain.rpc import jsonrpc
+from .common import TeeSwapError
 from .config import FeeConfig
 from .http import BaseHttpClient
 from .invoice import QUOTE_TTL, InvoiceId
@@ -27,6 +28,10 @@ from .types import (
 )
 
 ETH_TRANSFER_GAS = 21_000
+
+
+class QuoteError(TeeSwapError):
+    pass
 
 
 async def compute_quote(
@@ -47,11 +52,13 @@ async def compute_quote(
 
     available = input_amount - total_gas_wei - fee_amount
     if available <= 0:
-        raise ValueError(
+        raise QuoteError(
             f"input {input_amount} insufficient for gas ({total_gas_wei}) + fee ({fee_amount})"
         )
 
     total_requested = sum(o.amount.amount for o in request.outputs)
+    if total_requested == 0:
+        raise QuoteError("outputs must request a non-zero total amount")
     output_estimates = tuple(
         Balance(
             amount=TokenAmount(

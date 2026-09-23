@@ -5,7 +5,7 @@
 
 ## Design principles
 
-1. **Unified typed interface.** A single set of typed schemas (frozen dataclasses + Litestar) defines all tool inputs and outputs. MCP tool definitions, HTTP endpoints, x402 paywalls, and OpenAPI specs are derived from these types — no hand-maintained duplicates.
+1. **Unified typed interface.** A single set of typed schemas (frozen dataclasses + Litestar) defines all tool inputs and outputs. MCP tool definitions, HTTP endpoints, x402 payment requirements, and OpenAPI specs are derived from these types — no hand-maintained duplicates.
 2. **Minimal dependencies.** No large SDK libraries. Chain interaction is via small CLI tools called as subprocesses. HTTP APIs where available.
 3. **Operator is adversary.** The TEE protects against the machine operator. Security-sensitive values (keys, bind addresses, privilege level) are hardcoded or PCR-bound, never operator-configurable. Runtime config from cloud metadata is untrusted input.
 4. **Verifiable by default.** Every tool result carries a Verifiable MCP (SEP-2133) `tee-vaportpm-v1` attestation. The attestation is not optional — it's part of the response construction pipeline.
@@ -56,7 +56,7 @@ All tool interfaces are defined once as frozen dataclasses in `types.py`:
 From each definition, we derive:
 - **MCP tool schema** — JSON Schema for `teeswap_quote` inputSchema
 - **HTTP endpoint** — `POST /quote` with request body validation
-- **x402 paywall** — middleware that returns 402 before the handler runs
+- **x402 payment** — paid tools return `PaymentRequired`; each transport renders it in its own x402 form (see `X402.md`)
 - **OpenAPI spec** — auto-generated documentation
 
 Litestar handles this natively — route handlers are typed, schemas drop out.
@@ -69,7 +69,7 @@ Litestar handles this natively — route handlers are typed, schemas drop out.
 | **HTTP JSON** | POST | Standard REST-like endpoints, JSON request/response |
 | **x402 Bazaar** | HTTP 402 | Auto-discovered by x402-mcp gateways |
 
-All three are views of the same handler logic. The MCP transport wraps the handler in JSON-RPC. The HTTP transport exposes it directly. x402 is middleware.
+All three are views of the same handler logic. The MCP transport wraps the handler in JSON-RPC. The HTTP transport exposes it directly. x402 payment is part of a paid tool's result, not middleware: each transport translates it (see `X402.md`).
 
 ### MCP protocol
 
