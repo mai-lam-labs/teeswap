@@ -45,6 +45,14 @@ ANVIL            := dist/tools/anvil
 ANVIL_PORT       ?= 8545
 ANVIL_PID        := dist/tools/anvil.pid
 
+# ---- local x402 facilitator (x402-rs, pinned by digest) ----
+FACILITATOR_IMAGE     := ghcr.io/x402-rs/x402-facilitator@sha256:3a71fd6e3ff5ae00c30bcfbff35e5cf858bb37b9b97de032f46545c18e953d71
+FACILITATOR_CONTAINER := teeswap-facilitator
+FACILITATOR_PORT      ?= 18080
+FACILITATOR_DIR       := dist/tools/facilitator
+# anvil's first dev account: the facilitator pays gas for settlement from it
+FACILITATOR_KEY       := 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
 SERVE_HOST ?= 10.0.2.1:8000
 FORWARD_PORTS ?= 8402
 
@@ -53,7 +61,7 @@ KVM_GID   := $(shell stat -c %g /dev/kvm 2>/dev/null || echo "")
 KVM_MOUNT := $(shell test -e /dev/kvm && echo "-v /dev/kvm:/dev/kvm")
 DOCKER_OPT_KVM := $(if $(KVM_GID),--group-add $(KVM_GID)) $(KVM_MOUNT)
 
-.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check ci build anvil-fetch anvil-run anvil-start anvil-stop clean distclean
+.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check ci build anvil-fetch anvil-run anvil-start anvil-stop facilitator-start facilitator-stop clean distclean
 
 help:
 	@echo "targets: install | check | bundle-<arch> | payload-<arch> | boot-<arch> | clean | distclean"
@@ -126,6 +134,7 @@ anvil-start: anvil-fetch
 	    echo "error: anvil failed to start"; rm -f "$(ANVIL_PID)"; exit 1; \
 	  fi; \
 	fi
+	@"$(PY)" -m $(SRC).tests.localchain http://127.0.0.1:$(ANVIL_PORT)
 
 anvil-stop:
 	@if test -f "$(ANVIL_PID)" && kill -0 $$(cat "$(ANVIL_PID)") 2>/dev/null; then \
@@ -135,6 +144,42 @@ anvil-stop:
 	  echo ">> anvil not running"; \
 	  rm -f "$(ANVIL_PID)"; \
 	fi
+
+# ---- facilitator: local x402 facilitator against anvil (needs anvil-start first) ----
+facilitator-start:
+	@curl -s -m 2 -o /dev/null -X POST -H 'content-type: application/json' \
+	  --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
+	  http://127.0.0.1:$(ANVIL_PORT) || { echo "error: anvil not running on :$(ANVIL_PORT) — run make anvil-start"; exit 1; }
+	@# the contracts the facilitator requires are installed by anvil-start (tests/localchain.py)
+	@mkdir -p $(FACILITATOR_DIR)
+	@printf '%s\n' \
+	  '{' \
+	  '  "port": $(FACILITATOR_PORT),' \
+	  '  "host": "127.0.0.1",' \
+	  '  "chains": {' \
+	  '    "eip155:31337": {' \
+	  '      "eip1559": true,' \
+	  '      "signers": ["$(FACILITATOR_KEY)"],' \
+	  '      "rpc": [{"http": "http://127.0.0.1:$(ANVIL_PORT)"}]' \
+	  '    }' \
+	  '  },' \
+	  '  "schemes": [{"id": "v2-eip155-exact", "chains": "eip155:31337"}]' \
+	  '}' > $(FACILITATOR_DIR)/config.json
+	@docker rm -f $(FACILITATOR_CONTAINER) >/dev/null 2>&1 || true
+	@docker run -d --name $(FACILITATOR_CONTAINER) --network host \
+	  -v "$(CURDIR)/$(FACILITATOR_DIR)/config.json:/app/config.json:ro" \
+	  $(FACILITATOR_IMAGE) >/dev/null
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+	  if curl -sf -m 2 -o /dev/null http://127.0.0.1:$(FACILITATOR_PORT)/supported; then \
+	    echo ">> facilitator started on :$(FACILITATOR_PORT)"; exit 0; fi; \
+	  sleep 1; \
+	done; \
+	echo "error: facilitator did not start:"; docker logs $(FACILITATOR_CONTAINER) 2>&1 | tail -5; \
+	docker rm -f $(FACILITATOR_CONTAINER) >/dev/null; exit 1
+
+facilitator-stop:
+	@if docker rm -f $(FACILITATOR_CONTAINER) >/dev/null 2>&1; then \
+	  echo ">> facilitator stopped"; else echo ">> facilitator not running"; fi
 
 # ---- bundle-<arch>: Docker image with stripped musl Python + teeswap ----
 bundle-%:
