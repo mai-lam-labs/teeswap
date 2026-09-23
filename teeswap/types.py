@@ -1,13 +1,14 @@
 import enum
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Annotated, Any, ClassVar, Self, override
 
 import dacite
-from eth_typing import Hash32
+from eth_utils.address import is_checksum_address
 from litestar.params import Parameter
 
-from .blockchain.chains import Chain
+from .blockchain.chains import Chain, ChainFamily
 from .response import DataclassResponse
 
 # --- Base mixins ---
@@ -35,20 +36,33 @@ class HasFromDict:
 
 
 class HexStr(str, Validated):
-    LENGTH: int | None = None
+    """Hex-encoded bytes, stored canonically as lowercase with a 0x prefix.
 
-    def __new__(cls, value: str) -> HexStr:
-        v = str(value)
-        try:
-            raw = bytes.fromhex(v.removeprefix("0x"))
-        except ValueError:
-            raise ValueError(f"invalid hex string: {v!r}") from None
-        if cls.LENGTH is not None and len(raw) != cls.LENGTH:
-            raise ValueError(f"{cls.__name__}: expected {cls.LENGTH} bytes, got {len(raw)}")
-        return super().__new__(cls, v)
+    pattern() is the single definition of what is accepted: the constructor
+    matches against it and the JSON Schema publishes it, so the two cannot drift.
+    """
+
+    LENGTH: ClassVar[int | None] = None
+
+    @classmethod
+    def pattern(cls) -> str:
+        count = "*" if cls.LENGTH is None else f"{{{cls.LENGTH}}}"
+        return f"^(0x)?(?:[0-9a-fA-F]{{2}}){count}$"
+
+    def __new__(cls, value: str) -> Self:
+        # dacite's cast hands over raw JSON values; str() would turn 1234 into valid hex
+        if not isinstance(value, str):
+            raise TypeError(f"{cls.__name__}: expected str, got {type(value).__name__}")
+        if re.fullmatch(cls.pattern(), value) is None:
+            raise ValueError(f"{cls.__name__}: not a match for {cls.pattern()}: {value!r}")
+        return super().__new__(cls, "0x" + value.removeprefix("0x").lower())
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> Self:
+        return cls(raw.hex())
 
 
-class HexEd25519PublicKey(HexStr):
+class TxHash(HexStr):
     LENGTH = 32
 
 
@@ -56,13 +70,7 @@ class HexEd25519PublicKey(HexStr):
 
 
 class Millis(int):
-    def to_seconds(self) -> Seconds:
-        return Seconds(self / 1000)
-
-
-class Seconds(float):
-    def to_millis(self) -> Millis:
-        return Millis(int(self * 1000))
+    pass
 
 
 # --- URL with secrets ---
@@ -78,6 +86,9 @@ class SecureUrl:
     @override
     def __str__(self) -> str:
         return self.id or self.url
+
+
+type Url = SecureUrl | str
 
 
 # --- Domain types ---
@@ -97,24 +108,35 @@ class TokenAmount:
     amount: int
 
 
-class AmountQualifier(enum.StrEnum):
-    EXACT = "exact"
-    AT_LEAST = "at_least"
-    BEST_RATE = "best_rate"
+@dataclass(frozen=True, slots=True)
+class Address:
+    """An account on a specific chain (CAIP-10)."""
+
+    chain: Chain
+    value: str
+
+    def __post_init__(self) -> None:
+        if self.chain.family == ChainFamily.EVM and not is_checksum_address(self.value):
+            raise ValueError(f"not an EIP-55 checksummed address: {self.value!r}")
 
 
 @dataclass(frozen=True, slots=True)
-class TokenRequirement:
-    token: Token
-    amount: int
-    qualifier: AmountQualifier
-    tolerance_percent: float | None = None
+class Balance:
+    amount: TokenAmount
+    address: Address
+
+    def __post_init__(self) -> None:
+        if self.amount.token.chain != self.address.chain:
+            raise ValueError(
+                f"{self.amount.token.symbol} is on {self.amount.token.chain.caip2}, "
+                f"address is on {self.address.chain.caip2}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
 class Transaction:
     chain: Chain
-    hash: Hash32
+    hash: TxHash
     timestamp: datetime
 
 
@@ -142,66 +164,37 @@ class ProtocolClass(enum.StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class Output:
-    token: Annotated[Token, Parameter(description="Token to deliver")]
-    amount: Annotated[int, Parameter(description="Amount in smallest units")]
-    recipient: Annotated[str, Parameter(description="Destination address")]
-
-
-@dataclass(frozen=True, slots=True)
 class QuoteRequest(HasFromDict):
-    input: Annotated[TokenAmount, Parameter(description="What the user is depositing")]
-    outputs: Annotated[tuple[Output, ...], Parameter(description="Where to send the results")]
+    inputs: Annotated[
+        tuple[TokenAmount, ...],
+        Parameter(description="What the user is depositing; amounts of the same token are summed"),
+    ]
+    outputs: Annotated[tuple[Balance, ...], Parameter(description="Where to send the results")]
     tolerance_percent: Annotated[
         float, Parameter(description="Acceptable slippage as a percentage", ge=0, le=10)
     ] = 0.5
 
 
-@dataclass(frozen=True, slots=True)
-class GasEstimate:
-    token: Token
-    amount: Annotated[int, Parameter(description="Estimated gas cost in smallest units")]
-
-
-@dataclass(frozen=True, slots=True)
-class OutputEstimate:
-    recipient: str
-    token: Token
-    amount: Annotated[int, Parameter(description="Estimated amount after gas and fees")]
-
-
 @dataclass(frozen=True)
 class QuoteResponse(DataclassResponse):
     quote_id: Annotated[str, Parameter(description="Use this ID with teeswap_accept")]
-    input: TokenAmount
-    outputs: tuple[OutputEstimate, ...]
-    gas: GasEstimate
+    inputs: Annotated[tuple[TokenAmount, ...], Parameter(description="Inputs, one per token")]
+    outputs: Annotated[
+        tuple[Balance, ...], Parameter(description="Estimated amounts after gas and fees")
+    ]
+    gas: Annotated[TokenAmount, Parameter(description="Estimated gas cost")]
     fee: TokenAmount
     expires_at: Annotated[datetime, Parameter(description="Quote expires at this time (UTC)")]
 
 
 @dataclass(frozen=True, slots=True)
-class AcceptRequest(HasFromDict):
+class InvoiceRequest(HasFromDict):
     quote_id: Annotated[str, Parameter(description="Quote ID from teeswap_quote")]
-
-
-@dataclass(frozen=True, slots=True)
-class DepositInstruction:
-    address: Annotated[str, Parameter(description="Send funds to this address")]
-    amount: Annotated[TokenAmount, Parameter(description="Exact amount to deposit")]
-    chain: Annotated[Chain, Parameter(description="Chain to deposit on")]
 
 
 @dataclass(frozen=True)
 class AcceptResponse(DataclassResponse):
     quote_id: str
-    deposits: Annotated[
-        tuple[DepositInstruction, ...], Parameter(description="What to deposit and where")
-    ]
+    deposits: Annotated[tuple[Balance, ...], Parameter(description="What to deposit and where")]
     expires_at: Annotated[datetime, Parameter(description="Deposits must arrive before this time")]
     instructions: Annotated[str, Parameter(description="Human-readable deposit instructions")]
-
-
-@dataclass(frozen=True, slots=True)
-class StatusRequest(HasFromDict):
-    quote_id: Annotated[str, Parameter(description="Quote/invoice ID")]

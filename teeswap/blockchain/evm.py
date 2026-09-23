@@ -15,7 +15,7 @@ from eth_typing import BlockNumber, ChainId, ChecksumAddress, Hash32, HexStr
 
 from ..common import TeeSwapError
 from ..http import BaseHttpClient
-from ..types import SecureUrl
+from ..types import Url
 from .rpc import jsonrpc
 
 
@@ -102,7 +102,7 @@ class EthSigner:
 
 
 class EvmRpcClient:
-    def __init__(self, client: BaseHttpClient, url: SecureUrl | str) -> None:
+    def __init__(self, client: BaseHttpClient, url: Url) -> None:
         self._client = client
         self._url = url
 

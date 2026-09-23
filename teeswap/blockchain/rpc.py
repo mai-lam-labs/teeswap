@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 
 from ..http import BaseHttpClient, HttpClient
-from ..types import SecureUrl
+from ..types import Url
 from .chains import Chain, ChainFamily, ChainRegistry
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ DEFAULT_CONCURRENCY = 6
 @dataclass(frozen=True, slots=True)
 class RpcConfig:
     chain: str
-    urls: tuple[SecureUrl | str, ...]
+    urls: tuple[Url, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +66,7 @@ class RpcSnapshot:
 
 async def jsonrpc(
     client: BaseHttpClient,
-    url: SecureUrl | str,
+    url: Url,
     method: str,
     params: list[Any] | None = None,
     timeout: float = REQUEST_TIMEOUT,
@@ -92,7 +92,7 @@ class JsonRpcError(Exception):
 
 async def _rest_get(
     client: BaseHttpClient,
-    url: SecureUrl | str,
+    url: Url,
 ) -> Any:
     resp = await client.get(url, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
@@ -101,7 +101,7 @@ async def _rest_get(
 
 async def _rest_post(
     client: BaseHttpClient,
-    url: SecureUrl | str,
+    url: Url,
     body: Any = None,
 ) -> Any:
     resp = await client.post(url, json=body or {}, timeout=REQUEST_TIMEOUT)
@@ -130,7 +130,7 @@ def _parse_hex_or_int(value: Any) -> int:
     return int(s, 16) if s.startswith("0x") else int(s)
 
 
-async def _probe_evm(client: BaseHttpClient, url: SecureUrl | str, chain: Chain) -> _CheckResult:
+async def _probe_evm(client: BaseHttpClient, url: Url, chain: Chain) -> _CheckResult:
     chain_id_raw = await jsonrpc(client, url, "eth_chainId")
     block_raw = await jsonrpc(client, url, "eth_blockNumber")
 
@@ -153,7 +153,7 @@ async def _probe_evm(client: BaseHttpClient, url: SecureUrl | str, chain: Chain)
     )
 
 
-async def _probe_svm(client: BaseHttpClient, url: SecureUrl | str, chain: Chain) -> _CheckResult:
+async def _probe_svm(client: BaseHttpClient, url: Url, chain: Chain) -> _CheckResult:
     health = await jsonrpc(client, url, "getHealth")
     slot = await jsonrpc(client, url, "getSlot")
     genesis = await jsonrpc(client, url, "getGenesisHash")
@@ -168,9 +168,7 @@ async def _probe_svm(client: BaseHttpClient, url: SecureUrl | str, chain: Chain)
     )
 
 
-async def _probe_stellar(
-    client: BaseHttpClient, url: SecureUrl | str, chain: Chain
-) -> _CheckResult:
+async def _probe_stellar(client: BaseHttpClient, url: Url, chain: Chain) -> _CheckResult:
     data = await _rest_get(client, url)
     expected = chain.caip2.split(":")[1]
     passphrase = data.get("network_passphrase", "")
@@ -184,9 +182,7 @@ async def _probe_stellar(
     )
 
 
-async def _probe_algorand(
-    client: BaseHttpClient, url: SecureUrl | str, chain: Chain
-) -> _CheckResult:
+async def _probe_algorand(client: BaseHttpClient, url: Url, chain: Chain) -> _CheckResult:
     data = await _rest_get(client, f"{url}/v2/status")
     genesis_hash = data.get("genesis-hash", "")
     expected_hash = chain.caip2.split(":")[1]
@@ -198,7 +194,7 @@ async def _probe_algorand(
     )
 
 
-async def _probe_near(client: BaseHttpClient, url: SecureUrl | str, chain: Chain) -> _CheckResult:
+async def _probe_near(client: BaseHttpClient, url: Url, chain: Chain) -> _CheckResult:
     result = await jsonrpc(client, url, "status")
     actual_chain_id = result.get("chain_id", "")
     expected = chain.caip2.split(":")[1]
@@ -207,7 +203,7 @@ async def _probe_near(client: BaseHttpClient, url: SecureUrl | str, chain: Chain
     return _CheckResult(healthy=True, chain_id_match=match, block_height=block)
 
 
-async def _probe_sui(client: BaseHttpClient, url: SecureUrl | str, chain: Chain) -> _CheckResult:
+async def _probe_sui(client: BaseHttpClient, url: Url, chain: Chain) -> _CheckResult:
     checkpoint = await jsonrpc(client, url, "sui_getLatestCheckpointSequenceNumber")
     chain_id = await jsonrpc(client, url, "sui_getChainIdentifier")
     expected = chain.caip2.split(":")[1]
@@ -219,7 +215,7 @@ async def _probe_sui(client: BaseHttpClient, url: SecureUrl | str, chain: Chain)
     )
 
 
-async def _probe_xrpl(client: BaseHttpClient, url: SecureUrl | str, chain: Chain) -> _CheckResult:
+async def _probe_xrpl(client: BaseHttpClient, url: Url, chain: Chain) -> _CheckResult:
     data = await _rest_post(client, url, {"method": "server_info", "params": [{}]})
     info = data.get("result", {}).get("info", {})
     net_id = str(info.get("network_id", ""))
@@ -229,7 +225,7 @@ async def _probe_xrpl(client: BaseHttpClient, url: SecureUrl | str, chain: Chain
     return _CheckResult(healthy=True, chain_id_match=match, block_height=ledger)
 
 
-async def _probe_tron(client: BaseHttpClient, url: SecureUrl | str, chain: Chain) -> _CheckResult:
+async def _probe_tron(client: BaseHttpClient, url: Url, chain: Chain) -> _CheckResult:
     chain_id_raw = await jsonrpc(client, url, "eth_chainId")
     block_raw = await jsonrpc(client, url, "eth_blockNumber")
     expected_id = chain.caip2.split(":")[1]
@@ -242,7 +238,7 @@ async def _probe_tron(client: BaseHttpClient, url: SecureUrl | str, chain: Chain
     )
 
 
-async def _probe_aptos(client: BaseHttpClient, url: SecureUrl | str, chain: Chain) -> _CheckResult:
+async def _probe_aptos(client: BaseHttpClient, url: Url, chain: Chain) -> _CheckResult:
     data = await _rest_get(client, f"{url}/v1")
     actual_chain_id = str(data.get("chain_id", ""))
     expected = chain.caip2.split(":")[1]
@@ -251,7 +247,7 @@ async def _probe_aptos(client: BaseHttpClient, url: SecureUrl | str, chain: Chai
     return _CheckResult(healthy=True, chain_id_match=match, block_height=block)
 
 
-type Probe = Callable[[BaseHttpClient, SecureUrl | str, Chain], Coroutine[Any, Any, _CheckResult]]
+type Probe = Callable[[BaseHttpClient, Url, Chain], Coroutine[Any, Any, _CheckResult]]
 
 _PROBES: dict[ChainFamily, Probe] = {
     ChainFamily.EVM: _probe_evm,
@@ -269,13 +265,13 @@ _PROBES: dict[ChainFamily, Probe] = {
 # --- Unified check ---
 
 
-def _url_str(url: SecureUrl | str) -> str:
+def _url_str(url: Url) -> str:
     return str(url)
 
 
 async def check_rpc(
     client: BaseHttpClient,
-    url: SecureUrl | str,
+    url: Url,
     chain: Chain,
 ) -> RpcStatus:
     now = time.time()
@@ -369,9 +365,7 @@ class RpcMonitor:
     def snapshot(self) -> RpcSnapshot:
         return self._snapshot
 
-    async def _check_with_limit(
-        self, client: BaseHttpClient, url: SecureUrl | str, chain: Chain
-    ) -> RpcStatus:
+    async def _check_with_limit(self, client: BaseHttpClient, url: Url, chain: Chain) -> RpcStatus:
         async with self._semaphore:
             return await check_rpc(client, url, chain)
 

@@ -90,10 +90,10 @@ coverage:
 	"$(PY)" -m coverage run --source=$(SRC) -m pytest $(SRC)/tests -q --tb=short --no-header
 	"$(PY)" -m coverage report -m --fail-under=70
 
-check: lint format-check typecheck test
+check: anvil-start
+	$(MAKE) lint format-check typecheck test; rc=$$?; $(MAKE) anvil-stop; exit $$rc
 
-ci: anvil-start
-	$(MAKE) check; rc=$$?; $(MAKE) anvil-stop; exit $$rc
+ci: check
 
 build:
 	"$(UV)" build --python "$(PY)" --out-dir dist

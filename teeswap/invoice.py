@@ -1,7 +1,10 @@
 """Invoice — the append-only record of work performed for a user.
 
-Lifecycle: quote (stateless estimate with TTL) → accept (signer derived,
-deposit address assigned, coroutine started) → funded → executing → delivered.
+Lifecycle: quote (signer derived, inputs and outputs known, TTL) → accept
+(coroutine started, deposits watched) → funded → executing → delivered.
+
+Inputs and outputs carry their own state, set by the engine as it goes; the
+Action/Step work log is the detailed record of how it got there.
 
 One ID throughout. The quote IS the invoice before it's accepted.
 
@@ -17,8 +20,18 @@ from datetime import UTC, datetime, timedelta
 from .blockchain.chains import Chain
 from .blockchain.evm import EthSigner
 from .common import TeeSwapError
+from .config import Operator
 from .protocol import Protocol
-from .types import HttpExchange, QuoteRequest, QuoteResponse, Transaction
+from .response import DataclassResponse
+from .types import (
+    Address,
+    Balance,
+    HttpExchange,
+    QuoteRequest,
+    QuoteResponse,
+    TokenAmount,
+    Transaction,
+)
 
 
 class InvoiceError(TeeSwapError):
@@ -54,6 +67,17 @@ class StepStatus(enum.StrEnum):
     FAILED = "failed"
 
 
+@dataclass(frozen=True, slots=True)
+class StepView:
+    operation: str
+    status: StepStatus
+    chain: Chain | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    error: str | None
+    transactions: tuple[Transaction, ...]
+
+
 @dataclass(slots=True)
 class Step:
     operation: str
@@ -80,6 +104,26 @@ class Step:
         self.status = StepStatus.FAILED
         self.completed_at = datetime.now(UTC)
         self.error = error
+
+    def view(self) -> StepView:
+        return StepView(
+            operation=self.operation,
+            status=self.status,
+            chain=self.chain,
+            started_at=self.started_at,
+            completed_at=self.completed_at,
+            error=self.error,
+            transactions=tuple(self.transactions),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ActionView:
+    description: str
+    protocol: str | None
+    source_chain: Chain
+    destination_chain: Chain | None
+    steps: tuple[StepView, ...]
 
 
 @dataclass(slots=True)
@@ -109,6 +153,15 @@ class Action:
             s.status in (StepStatus.COMPLETED, StepStatus.FAILED) for s in self.steps
         )
 
+    def view(self) -> ActionView:
+        return ActionView(
+            description=self.description,
+            protocol=self.protocol.meta.name if self.protocol else None,
+            source_chain=self.source_chain,
+            destination_chain=self.destination_chain,
+            steps=tuple(step.view() for step in self.steps),
+        )
+
 
 # --- Invoice ---
 
@@ -122,6 +175,49 @@ class InvoiceStatus(enum.StrEnum):
     EXPIRED = "expired"
 
 
+class InputStatus(enum.StrEnum):
+    AWAITING = "awaiting"
+    RECEIVED = "received"
+    EXPIRED = "expired"
+
+
+class OutputStatus(enum.StrEnum):
+    PENDING = "pending"
+    SUBMITTED = "submitted"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class InvoiceInput:
+    deposit: Balance
+    received: TokenAmount
+    status: InputStatus = InputStatus.AWAITING
+
+
+@dataclass(frozen=True, slots=True)
+class InvoiceOutput:
+    balance: Balance
+    status: OutputStatus = OutputStatus.PENDING
+    transactions: tuple[Transaction, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class InvoiceView(DataclassResponse):
+    """The public invoice: what the invoice page shows, as data."""
+
+    quote_id: str
+    operator: Operator
+    status: InvoiceStatus
+    created_at: datetime
+    expires_at: datetime
+    inputs: tuple[InvoiceInput, ...]
+    outputs: tuple[InvoiceOutput, ...]
+    gas: TokenAmount
+    fee: TokenAmount
+    actions: tuple[ActionView, ...]
+
+
 QUOTE_TTL = timedelta(minutes=5)
 DEPOSIT_TTL = timedelta(minutes=30)
 
@@ -133,25 +229,38 @@ class Invoice:
     expires_at: datetime
     request: QuoteRequest
     quote: QuoteResponse
-    source_chain: Chain
+    operator: Operator
+    signer: EthSigner
+    inputs: list[InvoiceInput]
+    outputs: list[InvoiceOutput]
 
     status: InvoiceStatus = InvoiceStatus.QUOTED
 
-    signer: EthSigner | None = None
-    deposit_address: str | None = None
     actions: list[Action] = field(default_factory=list)
     task: asyncio.Task[None] | None = field(default=None, repr=False)
 
-    def accept(self, signer: EthSigner) -> None:
+    def accept(self) -> None:
         if self.status != InvoiceStatus.QUOTED:
             raise InvoiceStateError(f"cannot accept invoice in state {self.status}")
         if datetime.now(UTC) > self.expires_at:
             self.status = InvoiceStatus.EXPIRED
             raise InvoiceExpiredError(self.id)
-        self.signer = signer
-        self.deposit_address = signer.address
         self.status = InvoiceStatus.AWAITING_DEPOSIT
         self.expires_at = datetime.now(UTC) + DEPOSIT_TTL
+
+    def view(self) -> InvoiceView:
+        return InvoiceView(
+            quote_id=str(self.id),
+            operator=self.operator,
+            status=self.status,
+            created_at=self.created_at,
+            expires_at=self.expires_at,
+            inputs=tuple(self.inputs),
+            outputs=tuple(self.outputs),
+            gas=self.quote.gas,
+            fee=self.quote.fee,
+            actions=tuple(action.view() for action in self.actions),
+        )
 
     @property
     def is_expired(self) -> bool:
@@ -176,10 +285,13 @@ class Invoice:
 
 
 class InvoiceRegistry:
-    def __init__(self) -> None:
+    def __init__(self, operator: Operator) -> None:
+        self._operator = operator
         self._invoices: dict[InvoiceId, Invoice] = {}
 
-    def create_quote(self, request: QuoteRequest, quote: QuoteResponse, chain: Chain) -> Invoice:
+    def create_quote(
+        self, request: QuoteRequest, quote: QuoteResponse, signer: EthSigner
+    ) -> Invoice:
         inv_id = InvoiceId(quote.quote_id)
         now = datetime.now(UTC)
         invoice = Invoice(
@@ -188,7 +300,16 @@ class InvoiceRegistry:
             expires_at=now + QUOTE_TTL,
             request=request,
             quote=quote,
-            source_chain=chain,
+            operator=self._operator,
+            signer=signer,
+            inputs=[
+                InvoiceInput(
+                    deposit=Balance(amount=inp, address=Address(inp.token.chain, signer.address)),
+                    received=TokenAmount(token=inp.token, amount=0),
+                )
+                for inp in quote.inputs
+            ],
+            outputs=[InvoiceOutput(balance=out) for out in quote.outputs],
         )
         self._invoices[inv_id] = invoice
         return invoice

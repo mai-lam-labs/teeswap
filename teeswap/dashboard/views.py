@@ -228,11 +228,11 @@ def render_invoices(registry: InvoiceRegistry) -> str:
                             with td():
                                 _badge(inv.status.value.upper(), css)
                             td(str(inv.id), cls="mono")
-                            td(inv.source_chain.name)
-                            inp = inv.request.input
-                            td(f"{inp.amount} {inp.token.symbol}")
+                            td(", ".join(sorted({i.token.chain.name for i in inv.quote.inputs})))
+                            td(", ".join(f"{i.amount} {i.token.symbol}" for i in inv.quote.inputs))
                             td(f"{len(inv.request.outputs)} output(s)")
-                            td((inv.deposit_address or "—")[:10] + "…", cls="mono")
+                            deposits = [i.deposit.address.value[:10] + "…" for i in inv.inputs]
+                            td(", ".join(deposits) or "—", cls="mono")
                             td(str(len(inv.actions)))
                             td(current.description if current else "—")
                             td(inv.created_at.strftime("%Y-%m-%d %H:%M"), cls="age")

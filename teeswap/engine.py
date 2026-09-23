@@ -8,6 +8,7 @@ The reaper runs alongside and expires stale quotes.
 
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from .blockchain.chains import Chain
@@ -16,14 +17,15 @@ from .blockchain.rpc import jsonrpc
 from .http import HttpClient, RecordingClient
 from .invoice import (
     Action,
+    InputStatus,
     Invoice,
     InvoiceExpiredError,
     InvoiceId,
     InvoiceRegistry,
-    InvoiceStateError,
     InvoiceStatus,
+    OutputStatus,
 )
-from .types import AcceptResponse, DepositInstruction, SecureUrl, Transaction
+from .types import AcceptResponse, QuoteRequest, QuoteResponse, Transaction, TxHash, Url
 
 logger = logging.getLogger(__name__)
 
@@ -37,66 +39,64 @@ class Engine:
         self,
         registry: InvoiceRegistry,
         root_key: bytes,
-        rpc_urls: dict[str, SecureUrl | str],
+        rpc_urls: dict[str, Url],
     ) -> None:
         self._registry = registry
         self._root_key = root_key
         self._rpc_urls = rpc_urls
         self._reaper_task: asyncio.Task[None] | None = None
 
-    def rpc_url_for_chain(self, chain: Chain) -> SecureUrl | str:
+    def rpc_url_for_chain(self, chain: Chain) -> Url:
         url = self._rpc_urls.get(chain.caip2)
         if url is None:
             raise ValueError(f"no RPC URL configured for {chain.name} ({chain.caip2})")
         return url
 
+    def create_invoice(self, request: QuoteRequest, quote: QuoteResponse) -> Invoice:
+        signer = EthSigner.derive(self._root_key, quote.quote_id.encode())
+        return self._registry.create_quote(request, quote, signer)
+
     def accept(self, invoice_id: InvoiceId) -> AcceptResponse:
         invoice = self._registry.get(invoice_id)
-        signer = EthSigner.derive(self._root_key, invoice_id.encode())
-        invoice.accept(signer)
+        invoice.accept()
 
         invoice.task = asyncio.create_task(self._run_invoice(invoice))
 
-        deposit = DepositInstruction(
-            address=signer.address,
-            amount=invoice.request.input,
-            chain=invoice.source_chain,
-        )
-        inp = invoice.request.input
+        deposits = tuple(inp.deposit for inp in invoice.inputs)
         return AcceptResponse(
             quote_id=str(invoice.id),
-            deposits=(deposit,),
+            deposits=deposits,
             expires_at=invoice.expires_at,
-            instructions=f"Send {inp.amount} {inp.token.symbol} to {signer.address} on {invoice.source_chain.name}",
+            instructions="; ".join(
+                f"Send {d.amount.amount} {d.amount.token.symbol} to {d.address.value} "
+                f"on {d.address.chain.name}"
+                for d in deposits
+            ),
         )
 
     async def _run_invoice(self, invoice: Invoice) -> None:
         signer = invoice.signer
-        if signer is None:
-            raise InvoiceStateError("invoice has no signer")
-
         try:
-            rpc_url = self.rpc_url_for_chain(invoice.source_chain)
-            await self._wait_for_deposit(invoice, signer, rpc_url)
+            for index in range(len(invoice.inputs)):
+                await self._wait_for_deposit(invoice, index, signer)
 
             invoice.status = InvoiceStatus.EXECUTING
-            await self._execute_transfers(invoice, signer, rpc_url)
+            await self._execute_transfers(invoice, signer)
 
             invoice.status = InvoiceStatus.DELIVERED
+        except InvoiceExpiredError:
+            logger.info("invoice %s expired awaiting deposit", invoice.id)
         except Exception:
             logger.exception("invoice %s failed", invoice.id)
             invoice.status = InvoiceStatus.FAILED
 
-    async def _wait_for_deposit(
-        self,
-        invoice: Invoice,
-        signer: EthSigner,
-        rpc_url: SecureUrl | str,
-    ) -> None:
+    async def _wait_for_deposit(self, invoice: Invoice, index: int, signer: EthSigner) -> None:
+        required = invoice.inputs[index].deposit.amount
+        chain = required.token.chain
         action = Action(
             protocol=None,
-            description="wait for deposit",
-            source_chain=invoice.source_chain,
+            description=f"wait for {required.token.symbol} deposit",
+            source_chain=chain,
             destination_chain=None,
         )
         invoice.actions.append(action)
@@ -104,64 +104,74 @@ class Engine:
         step.start()
 
         async with HttpClient() as client:
-            rpc = EvmRpcClient(client, rpc_url)
-            expected = invoice.request.input.amount
+            rpc = EvmRpcClient(client, self.rpc_url_for_chain(chain))
             while True:
                 balance = await rpc.get_balance(signer.address)
-                if balance >= expected:
+                inp = invoice.inputs[index]
+                if balance != inp.received.amount:
+                    inp = replace(inp, received=replace(inp.received, amount=balance))
+                    invoice.inputs[index] = inp
+                if balance >= required.amount:
+                    invoice.inputs[index] = replace(inp, status=InputStatus.RECEIVED)
                     step.complete()
                     return
                 if invoice.is_expired:
+                    invoice.inputs[index] = replace(inp, status=InputStatus.EXPIRED)
                     step.fail("deposit timeout")
                     invoice.status = InvoiceStatus.EXPIRED
                     raise InvoiceExpiredError(invoice.id)
                 await asyncio.sleep(DEPOSIT_POLL_INTERVAL)
 
-    async def _execute_transfers(
-        self,
-        invoice: Invoice,
-        signer: EthSigner,
-        rpc_url: SecureUrl | str,
-    ) -> None:
+    async def _execute_transfers(self, invoice: Invoice, signer: EthSigner) -> None:
+        # the quote only routes same-chain native transfers, so everything is on the input's chain
+        chain = invoice.inputs[0].deposit.address.chain
+        rpc_url = self.rpc_url_for_chain(chain)
+        chain_id = int(chain.caip2.split(":")[1])
         action = Action(
             protocol=None,
-            description=f"split {invoice.request.input.token.symbol} to {len(invoice.quote.outputs)} recipients",
-            source_chain=invoice.source_chain,
+            description=f"send {chain.native_token} to {len(invoice.outputs)} recipients",
+            source_chain=chain,
             destination_chain=None,
         )
         invoice.actions.append(action)
 
-        chain_id = int(invoice.source_chain.caip2.split(":")[1])
-
-        for i, output in enumerate(invoice.quote.outputs):
-            step = action.add_step(f"transfer_{i}")
+        for index, out in enumerate(invoice.outputs):
+            step = action.add_step(f"transfer_{index}")
             step.start()
 
             recording = RecordingClient(step.http_exchanges)
             rpc = EvmRpcClient(recording, rpc_url)
 
-            gas_price = int(await jsonrpc(recording, rpc_url, "eth_gasPrice"), 16)
-            nonce = await rpc.get_nonce(signer.address)
+            try:
+                gas_price = int(await jsonrpc(recording, rpc_url, "eth_gasPrice"), 16)
+                nonce = await rpc.get_nonce(signer.address)
 
-            tx = signer.sign_transaction(
-                {
-                    "to": output.recipient,
-                    "value": output.amount,
-                    "gas": ETH_TRANSFER_GAS,
-                    "maxFeePerGas": gas_price * 2,
-                    "maxPriorityFeePerGas": gas_price // 10,
-                    "nonce": nonce,
-                    "chainId": chain_id,
-                }
-            )
-
-            await rpc.submit_tx(tx.raw_tx)
-            step.transactions.append(
-                Transaction(
-                    chain=invoice.source_chain,
-                    hash=tx.tx_hash,
-                    timestamp=datetime.now(UTC),
+                tx = signer.sign_transaction(
+                    {
+                        "to": out.balance.address.value,
+                        "value": out.balance.amount.amount,
+                        "gas": ETH_TRANSFER_GAS,
+                        "maxFeePerGas": gas_price * 2,
+                        "maxPriorityFeePerGas": gas_price // 10,
+                        "nonce": nonce,
+                        "chainId": chain_id,
+                    }
                 )
+
+                await rpc.submit_tx(tx.raw_tx)
+            except Exception as e:
+                invoice.outputs[index] = replace(out, status=OutputStatus.FAILED, error=str(e))
+                step.fail(str(e))
+                raise
+
+            submitted = Transaction(
+                chain=chain,
+                hash=TxHash.from_bytes(tx.tx_hash),
+                timestamp=datetime.now(UTC),
+            )
+            step.transactions.append(submitted)
+            invoice.outputs[index] = replace(
+                out, status=OutputStatus.SUBMITTED, transactions=(submitted,)
             )
             step.complete()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import GenericAlias
 from typing import TYPE_CHECKING, Any
 
 from litestar import Litestar, MediaType, Request, Response, Router, post
@@ -9,8 +10,9 @@ from litestar.openapi import OpenAPIConfig
 from litestar.status_codes import HTTP_200_OK
 
 from .common import PKG_NAME, PKG_VERSION, from_dict
-from .dashboard import create_dashboard_router
+from .dashboard import create_dashboard_router, create_invoice_router
 from .mcp import JsonRpcRequest, Tool, handle_mcp_request
+from .schema import SCHEMA_PLUGINS
 
 if TYPE_CHECKING:
     from .instance import TeeSwap
@@ -29,9 +31,12 @@ def _make_rest_handler(tool: Tool) -> Any:
     handler.__name__ = short_name
     handler.__qualname__ = short_name
     handler.__annotations__["data"] = input_type
+    # built at runtime, so Litestar derives the OpenAPI response schema from the tool's output type
+    handler.__annotations__["return"] = GenericAlias(Response, (defn.output_type,))
 
     return post(
         path=defn.rest_path,
+        status_code=HTTP_200_OK,
         summary=short_name,
         description=defn.description,
     )(handler)
@@ -89,6 +94,7 @@ def make_http_app(instance: TeeSwap) -> Litestar:
     routers = [
         api_router,
         mcp_router,
+        create_invoice_router(instance.invoice_registry),
         create_dashboard_router(
             instance.config.operator_password,
             instance.facilitator_monitor,
@@ -107,6 +113,7 @@ def make_http_app(instance: TeeSwap) -> Litestar:
         route_handlers=routers,
         on_startup=[on_startup],
         on_shutdown=[on_shutdown],
+        plugins=SCHEMA_PLUGINS,
         openapi_config=OpenAPIConfig(
             title=PKG_NAME,
             version=PKG_VERSION,

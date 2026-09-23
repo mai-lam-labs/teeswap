@@ -108,6 +108,13 @@ for descriptions. Litestar's `SchemaCreator` derives JSON Schema from
 these types. MCP tool definitions derive `inputSchema` from the same
 types via `schema_for_type()`.
 
+Litestar maps types to schemas by exact match, so a custom type such as
+a `str` subclass (`HexStr`) gets an empty schema. Give it an
+`OpenAPISchemaPlugin` in `schema.py` and add it to `SCHEMA_PLUGINS`,
+which both `schema_for_type()` and the app use. The plugin builds the
+schema from the type itself (`HexStr.pattern()`), so the schema and the
+validator share one definition.
+
 dacite hydrates dicts into dataclasses via `from_dict[T]` in `common.py`
 — one typed wrapper with one suppression for dacite's upstream type bug.
 

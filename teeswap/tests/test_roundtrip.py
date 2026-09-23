@@ -49,6 +49,7 @@ class EchoTool(Tool):
             name="echo",
             description="Echoes input back.",
             input_type=EchoInput,
+            output_type=JsonResponse,
             annotations={"readOnly": True, "openWorld": True},
         )
 

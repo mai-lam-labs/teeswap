@@ -13,6 +13,16 @@ class FeeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class Operator:
+    """The invoice issuer. Every field is optional; the invoice shows whatever is set."""
+
+    legal_name: str | None = None
+    registration_number: str | None = None
+    postal_address: str | None = None
+    extra: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class FacilitatorConfig:
     url: str
     poll_interval: float = 300.0
@@ -154,3 +164,4 @@ class TeeSwapConfig(HasFromDict):
     chains: tuple[Chain, ...] = _DEFAULT_CHAINS
     rpcs: tuple[RpcConfig, ...] = _DEFAULT_RPCS
     operator_password: str = "password"
+    operator: Operator = Operator()

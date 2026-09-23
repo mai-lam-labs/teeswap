@@ -64,6 +64,7 @@ class ToolDefinition:
     name: str
     description: str
     input_type: type[HasFromDict]
+    output_type: type[ToolResponse]
     annotations: dict[str, bool]
     path: str | None = None
     tags: tuple[str, ...] = ()

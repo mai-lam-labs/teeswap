@@ -1,8 +1,10 @@
 import abc
 import base64
 import json
-from dataclasses import asdict
 from typing import Any, override
+
+from litestar import MediaType
+from litestar.serialization import encode_json
 
 
 class ToolResponse(abc.ABC):
@@ -84,10 +86,16 @@ class CompositeResponse(ToolResponse):
 
 
 class DataclassResponse(ToolResponse):
-    @override
-    def to_mcp_content(self) -> list[dict[str, Any]]:
-        return [{"type": "text", "text": json.dumps(asdict(self), default=str)}]  # ty: ignore[invalid-argument-type]  # pyrefly: ignore[bad-argument-type]
+    """A dataclass tool result, encoded once with Litestar's serializer.
+
+    MCP text and REST body are the same bytes, so the output commitment
+    covers exactly what a REST client receives.
+    """
 
     @override
-    def to_rest(self) -> tuple[dict[str, Any], str]:
-        return asdict(self), "application/json"  # ty: ignore[invalid-argument-type]  # pyrefly: ignore[bad-argument-type]
+    def to_mcp_content(self) -> list[dict[str, Any]]:
+        return [{"type": "text", "text": encode_json(self).decode()}]
+
+    @override
+    def to_rest(self) -> tuple[bytes, str]:
+        return encode_json(self), MediaType.JSON

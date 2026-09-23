@@ -15,10 +15,10 @@ from .crypto.attestation import Signer
 from .crypto.hpke import HpkeKeypair
 from .engine import Engine
 from .facilitator import FacilitatorMonitor
-from .invoice import InvoiceRegistry
+from .invoice import InvoiceRegistry, InvoiceView
 from .mcp import Dispatcher, SessionManager
-from .tools import AcceptTool, QuoteTool, StatusResponse, StatusTool
-from .types import AcceptRequest, AcceptResponse, QuoteRequest, QuoteResponse, StatusRequest
+from .tools import AcceptTool, InvoiceTool, QuoteTool, StatusResponse, StatusTool
+from .types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
 
 
 @dataclass
@@ -30,20 +30,28 @@ class KeyMaterial:
 
 class Api:
     def __init__(
-        self, quote_tool: QuoteTool, accept_tool: AcceptTool, status_tool: StatusTool
+        self,
+        quote_tool: QuoteTool,
+        accept_tool: AcceptTool,
+        status_tool: StatusTool,
+        invoice_tool: InvoiceTool,
     ) -> None:
         self._quote = quote_tool
         self._accept = accept_tool
         self._status = status_tool
+        self._invoice = invoice_tool
 
     async def quote(self, request: QuoteRequest) -> QuoteResponse:
         return await self._quote.execute(request)
 
-    async def accept(self, request: AcceptRequest) -> AcceptResponse:
+    async def accept(self, request: InvoiceRequest) -> AcceptResponse:
         return await self._accept.execute(request)
 
-    async def status(self, request: StatusRequest) -> StatusResponse:
+    async def status(self, request: InvoiceRequest) -> StatusResponse:
         return await self._status.execute(request)
+
+    async def invoice(self, request: InvoiceRequest) -> InvoiceView:
+        return await self._invoice.execute(request)
 
 
 class TeeSwap:
@@ -68,7 +76,7 @@ class TeeSwap:
         self.chain_registry = ChainRegistry(parsed.chains)
         self.facilitator_monitor = FacilitatorMonitor(parsed.facilitators)
         self.rpc_monitor = RpcMonitor(parsed.rpcs, self.chain_registry)
-        self.invoice_registry = InvoiceRegistry()
+        self.invoice_registry = InvoiceRegistry(parsed.operator)
 
         rpc_urls = {rpc.chain: rpc.urls[0] for rpc in parsed.rpcs if rpc.urls}
         self.engine = Engine(
@@ -80,13 +88,15 @@ class TeeSwap:
         self.dispatcher = Dispatcher(signer=keys.signer, hpke_keypair=keys.hpke_keypair)
         self.sessions = SessionManager()
 
-        quote_tool = QuoteTool(self.engine, self.invoice_registry)
+        quote_tool = QuoteTool(self.engine)
         accept_tool = AcceptTool(self.engine)
         status_tool = StatusTool(self.invoice_registry)
+        invoice_tool = InvoiceTool(self.invoice_registry)
         self.dispatcher.register(quote_tool)
         self.dispatcher.register(accept_tool)
         self.dispatcher.register(status_tool)
-        self.api = Api(quote_tool, accept_tool, status_tool)
+        self.dispatcher.register(invoice_tool)
+        self.api = Api(quote_tool, accept_tool, status_tool, invoice_tool)
 
     def start_background_tasks(self) -> None:
         self.facilitator_monitor.start()

@@ -12,14 +12,14 @@ from typing import Any, Self, override
 
 import httpx
 
-from .types import HttpExchange, Millis, SecureUrl
+from .types import HttpExchange, Millis, Url
 
 
 class BaseHttpClient(abc.ABC):
     @abc.abstractmethod
     async def post(
         self,
-        url: SecureUrl | str,
+        url: Url,
         *,
         json: Any = None,
         timeout: float = 10.0,
@@ -28,13 +28,13 @@ class BaseHttpClient(abc.ABC):
     @abc.abstractmethod
     async def get(
         self,
-        url: SecureUrl | str,
+        url: Url,
         *,
         timeout: float = 10.0,
     ) -> httpx.Response: ...
 
 
-def _resolve(url: SecureUrl | str) -> tuple[str, str, dict[str, str]]:
+def _resolve(url: Url) -> tuple[str, str, dict[str, str]]:
     if isinstance(url, str):
         return url, url, {}
     expanded = url.url
@@ -58,7 +58,7 @@ class HttpClient(BaseHttpClient):
     @override
     async def post(
         self,
-        url: SecureUrl | str,
+        url: Url,
         *,
         json: Any = None,
         timeout: float = 10.0,
@@ -69,7 +69,7 @@ class HttpClient(BaseHttpClient):
     @override
     async def get(
         self,
-        url: SecureUrl | str,
+        url: Url,
         *,
         timeout: float = 10.0,
     ) -> httpx.Response:
@@ -87,7 +87,7 @@ class RecordingClient(HttpClient):
     @override
     async def post(
         self,
-        url: SecureUrl | str,
+        url: Url,
         *,
         json: Any = None,
         timeout: float = 10.0,
@@ -101,7 +101,7 @@ class RecordingClient(HttpClient):
     @override
     async def get(
         self,
-        url: SecureUrl | str,
+        url: Url,
         *,
         timeout: float = 10.0,
     ) -> httpx.Response:
