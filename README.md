@@ -20,8 +20,10 @@ Each tool is exposed over MCP (`POST /mcp`) and REST (`POST /teeswap/<name>`).
 
 | Tool | Does |
 |---|---|
-| `teeswap_quote` | Quote a transfer: inputs, outputs, estimated gas and fee |
-| `teeswap_accept` | Accept a quote; returns deposit addresses |
+| `teeswap_quote` | Quote a transfer funded by deposit: inputs, outputs, estimated gas, plan |
+| `teeswap_accept` | Accept a deposit-funded quote; returns deposit addresses |
+| `teeswap_quote_x402` | Quote a transfer funded by an x402 payment (one token input) |
+| `teeswap_accept_x402` | Pay for an x402-funded quote (x402 paid tool) and start it |
 | `teeswap_status` | Overall status plus each input and output |
 | `teeswap_invoice` | The full invoice, including the work log |
 

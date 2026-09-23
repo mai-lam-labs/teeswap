@@ -1,6 +1,6 @@
 """x402 v2 wire types and transport constants (see docs/X402.md).
 
-Field names are the spec's. Transport-neutral: a PaidTool returns PaymentTerms;
+Field names are the spec's. Transport-neutral: a PaidTool returns X402PaymentSpec;
 the MCP and HTTP layers add the resource (they know where the call was made)
 and render the PaymentRequired in their own transport.
 """
@@ -8,6 +8,7 @@ and render the PaymentRequired in their own transport.
 from dataclasses import dataclass, field
 from typing import Any
 
+from .response import ToolResponse
 from .types import Amount
 from .wire import WireStruct
 
@@ -62,7 +63,7 @@ class PaymentPayload(WireStruct):
 
 
 @dataclass(frozen=True, slots=True)
-class PaymentTerms:
+class X402PaymentSpec:
     """What a PaidTool returns when it needs paying: the transport adds the resource."""
 
     error: str
@@ -72,3 +73,32 @@ class PaymentTerms:
         return PaymentRequired(
             x402Version=X402_VERSION, error=self.error, resource=resource, accepts=self.accepts
         )
+
+
+@dataclass(frozen=True, slots=True)
+class VerifyResponse(WireStruct):
+    isValid: bool  # noqa: N815  # x402 wire field name
+    payer: str
+    invalidReason: str | None = None  # noqa: N815  # x402 wire field name
+    # sent by x402-rs, not in the spec
+    invalidReasonDetails: str | None = None  # noqa: N815  # x402-rs wire field name
+
+
+@dataclass(frozen=True, slots=True)
+class SettleResponse(WireStruct):
+    success: bool
+    payer: str
+    transaction: str
+    network: str
+    errorReason: str | None = None  # noqa: N815  # x402 wire field name
+    # sent by x402-rs, not in the spec
+    errorMessage: str | None = None  # noqa: N815  # x402-rs wire field name
+
+
+@dataclass(frozen=True, slots=True)
+class X402PaymentResult:
+    """What a PaidTool returns when paid and settled: the transport reports the
+    settlement (MCP _meta["x402/payment-response"], HTTP PAYMENT-RESPONSE)."""
+
+    response: ToolResponse
+    settlement: SettleResponse

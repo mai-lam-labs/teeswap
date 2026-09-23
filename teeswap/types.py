@@ -1,4 +1,3 @@
-import enum
 import functools
 import re
 from dataclasses import dataclass, field
@@ -58,12 +57,12 @@ class HexStr(str, Validated):
         )
 
 
-class TxHash(HexStr):
-    LENGTH = 32
-
-
 class Hex32(HexStr):
     LENGTH = 32
+
+
+class TxHash(Hex32):
+    pass
 
 
 class Amount(int, Validated):
@@ -228,6 +227,13 @@ class Token(WireStruct):
     contract: str | None
     decimals: int
 
+    @classmethod
+    def native(cls, chain: Chain) -> Token:
+        """The chain's native token (what gas is paid in)."""
+        return cls(
+            symbol=chain.native_token, chain=chain, contract=None, decimals=chain.native_decimals
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class TokenAmount(WireStruct):
@@ -280,13 +286,6 @@ class HttpExchange:
     latency: Millis
 
 
-class ProtocolClass(enum.StrEnum):
-    A = "A"
-    B = "B"
-    C = "C"
-    D = "D"
-
-
 # --- Quote / Invoice request types ---
 
 DEFAULT_TOLERANCE = Percent("0.5")
@@ -308,11 +307,12 @@ class QuoteRequest(WireStruct):
 class QuoteResponse(DataclassResponse):
     quote_id: Annotated[str, Parameter(description="Use this ID with teeswap_accept")]
     inputs: Annotated[tuple[TokenAmount, ...], Parameter(description="Inputs, one per token")]
-    outputs: Annotated[
-        tuple[Balance, ...], Parameter(description="Estimated amounts after gas and fees")
-    ]
+    outputs: Annotated[tuple[Balance, ...], Parameter(description="Estimated amounts after gas")]
     gas: Annotated[TokenAmount, Parameter(description="Estimated gas cost")]
-    fee: TokenAmount
+    plan: Annotated[
+        tuple[str, ...],
+        Parameter(description="Provisional plan: what Mai expects to do (may change)"),
+    ]
     expires_at: Annotated[Timestamp, Parameter(description="Quote expires at this time")]
 
 

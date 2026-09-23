@@ -99,7 +99,8 @@ coverage:
 	"$(PY)" -m coverage report -m --fail-under=70
 
 check: anvil-start
-	$(MAKE) lint format-check typecheck test; rc=$$?; $(MAKE) anvil-stop; exit $$rc
+	$(MAKE) facilitator-start && $(MAKE) lint format-check typecheck test; rc=$$?; \
+	  $(MAKE) facilitator-stop anvil-stop; exit $$rc
 
 ci: check
 

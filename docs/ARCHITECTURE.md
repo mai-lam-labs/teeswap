@@ -149,14 +149,13 @@ encode-transfer, encode-swap, sign, balance
 
 Submission for both is via Python `httpx` (raw JSON-RPC). `cast` encodes and signs; Python submits.
 
-### Protocol adapters
+### Operations
 
-Python modules in `protocols/`. Each implements `quote()`, `execute()`, `status()`
-and knows the contract addresses, function signatures, and API endpoints for its
-protocol. They compose `cast` calls for EVM encoding and `httpx` for API/RPC.
-
-Current adapters: CoW Protocol, Across V3, Circle CCTP V2. Additional protocols
-follow the same interface.
+What Mai does for a job is a sequence of operations (await a deposit, transfer to
+a recipient), chosen by the planner from the job's holdings and re-planned when
+reality diverges. See `EXECUTION.md`. Today: native EVM transfers; USDC via an
+x402 facilitator is next. Other protocols (DEXes, bridges) would be further
+operations behind the same interface.
 
 ### Data tools — pricing, risk, monitoring
 

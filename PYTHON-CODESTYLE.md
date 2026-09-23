@@ -41,7 +41,7 @@ The type checker is a design tool, not a formality.
 
 ### ABCs for polymorphic interfaces
 
-`Tool`, `ToolResponse`, `Protocol` — the ABC defines the interface,
+`Tool` / `PaidTool`, `ToolResponse`, `Operation` — the ABC defines the interface,
 each subclass owns its implementation. `@override` on every overridden
 method (pyrefly strict enforces this).
 
@@ -72,20 +72,30 @@ A closed set of values is an enum.
 Each module owns its error types. Root: `TeeSwapError` in `common.py`.
 
 ```
-common.py           TeeSwapError
-attestation.py        AttestationError
-                        VaportpmError
-                        VaportpmParseError
-                        CommitmentMismatchError
-chain.py              ChainError
-                        RpcError / TransactionError / SigningError
-state.py              OrderError
-                        InvalidTransitionError / OrderExpiredError
-protocol.py           RouteError
-                        NoRouteError / SlippageError / PriceCapError
-x402.py               PaymentError
-                        InvoiceNotFoundError
+common.py              TeeSwapError
+wire.py                  WireError
+crypto/attestation.py    AttestationError
+crypto/vaportpm.py         VaportpmError / VaportpmParseError
+blockchain/evm.py        EvmError
+                           SigningError
+facilitator.py           FacilitatorError
+execution/invoice.py     InvoiceError
+                           InvoiceNotFoundError / InvoiceExpiredError / InvoiceStateError
+                             InvoiceFundingError
+execution/ledger.py      LedgerError
+execution/planner.py     RouteError
+                           NoRouteError
+execution/quote.py       QuoteError
+execution/operations.py  OperationError
+execution/engine.py      X402SettlementError
+mcp.py                   ToolNotFoundError / ToolNotAvailableError / InvalidToolArgumentsError
+app.py                   RequestError
 ```
+
+`TeeSwapError` subclasses are domain failures: tools report them to the client
+(an `isError` result, a 4xx). Anything else is unexpected: logged, and answered
+with `-32603` / 500. `blockchain/rpc.py`'s `JsonRpcError` is deliberately not a
+`TeeSwapError`: an upstream RPC failure is unexpected, not the client's doing.
 
 No centralised `errors.py`. Errors live where they're raised.
 

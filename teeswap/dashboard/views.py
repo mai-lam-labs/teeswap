@@ -3,8 +3,8 @@
 import time
 
 from ..blockchain.rpc import RpcMonitor, RpcStatus
+from ..execution.invoice import InvoiceRegistry
 from ..facilitator import FacilitatorMonitor
-from ..invoice import InvoiceRegistry
 from .html import (
     a,
     button,
@@ -231,7 +231,7 @@ def render_invoices(registry: InvoiceRegistry) -> str:
                             td(", ".join(sorted({i.token.chain.name for i in inv.quote.inputs})))
                             td(", ".join(f"{i.amount} {i.token.symbol}" for i in inv.quote.inputs))
                             td(f"{len(inv.request.outputs)} output(s)")
-                            deposits = [i.deposit.address.value[:10] + "…" for i in inv.inputs]
+                            deposits = [d.address.value[:10] + "…" for d in inv.deposits]
                             td(", ".join(deposits) or "—", cls="mono")
                             td(str(len(inv.actions)))
                             td(current.description if current else "—")

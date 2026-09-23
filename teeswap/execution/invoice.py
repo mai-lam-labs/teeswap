@@ -17,24 +17,26 @@ import secrets
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from .blockchain.chains import Chain
-from .blockchain.evm import EthSigner
-from .common import TeeSwapError
-from .config import Operator
-from .protocol import Protocol
-from .response import DataclassResponse
-from .types import (
+from ..blockchain.chains import Chain
+from ..blockchain.evm import EthSigner
+from ..common import TeeSwapError
+from ..config import Operator
+from ..response import DataclassResponse
+from ..types import (
     Address,
     Amount,
     Balance,
+    Hex32,
     HttpExchange,
     QuoteRequest,
     QuoteResponse,
     Timestamp,
     TokenAmount,
     Transaction,
+    TxHash,
 )
-from .wire import WireStruct
+from ..wire import WireStruct
+from .ledger import Custody, Holdings, Movement, MovementKind, Place, Position
 
 
 class InvoiceError(TeeSwapError):
@@ -50,6 +52,10 @@ class InvoiceExpiredError(InvoiceError):
 
 
 class InvoiceStateError(InvoiceError):
+    pass
+
+
+class InvoiceFundingError(InvoiceStateError):
     pass
 
 
@@ -123,7 +129,6 @@ class Step:
 @dataclass(frozen=True, slots=True)
 class ActionView(WireStruct):
     description: str
-    protocol: str | None
     source_chain: Chain
     destination_chain: Chain | None
     steps: tuple[StepView, ...]
@@ -131,7 +136,6 @@ class ActionView(WireStruct):
 
 @dataclass(slots=True)
 class Action:
-    protocol: Protocol | None
     description: str
     source_chain: Chain
     destination_chain: Chain | None
@@ -159,7 +163,6 @@ class Action:
     def view(self) -> ActionView:
         return ActionView(
             description=self.description,
-            protocol=self.protocol.meta.name if self.protocol else None,
             source_chain=self.source_chain,
             destination_chain=self.destination_chain,
             steps=tuple(step.view() for step in self.steps),
@@ -178,6 +181,13 @@ class InvoiceStatus(enum.StrEnum):
     EXPIRED = "expired"
 
 
+class Funding(enum.StrEnum):
+    """How the job's inputs reach its address; chosen at quote time."""
+
+    DEPOSIT = "deposit"  # the client transfers them
+    X402 = "x402"  # an x402 payment, settled by a facilitator, delivers them
+
+
 class InputStatus(enum.StrEnum):
     AWAITING = "awaiting"
     RECEIVED = "received"
@@ -185,24 +195,27 @@ class InputStatus(enum.StrEnum):
 
 
 class OutputStatus(enum.StrEnum):
-    PENDING = "pending"
-    SUBMITTED = "submitted"
-    FAILED = "failed"
+    PENDING = "pending"  # not sent, or a sent attempt came back
+    SUBMITTED = "submitted"  # in flight
+    DELIVERED = "delivered"
 
 
 @dataclass(frozen=True, slots=True)
 class InvoiceInput(WireStruct):
+    """An input's progress, derived from the holdings."""
+
     deposit: Balance
     received: TokenAmount
-    status: InputStatus = InputStatus.AWAITING
+    status: InputStatus
 
 
 @dataclass(frozen=True, slots=True)
 class InvoiceOutput(WireStruct):
+    """An output's progress, derived from the holdings; transactions include failed attempts."""
+
     balance: Balance
-    status: OutputStatus = OutputStatus.PENDING
-    transactions: tuple[Transaction, ...] = ()
-    error: str | None = None
+    status: OutputStatus
+    transactions: tuple[Transaction, ...]
 
 
 @dataclass(frozen=True)
@@ -211,13 +224,15 @@ class InvoiceView(DataclassResponse):
 
     quote_id: str
     operator: Operator
+    funding: Funding
     status: InvoiceStatus
     created_at: Timestamp
     expires_at: Timestamp
     inputs: tuple[InvoiceInput, ...]
     outputs: tuple[InvoiceOutput, ...]
     gas: TokenAmount
-    fee: TokenAmount
+    holdings: tuple[Position, ...]
+    movements: tuple[Movement, ...]
     actions: tuple[ActionView, ...]
 
 
@@ -234,20 +249,37 @@ class Invoice:
     quote: QuoteResponse
     operator: Operator
     signer: EthSigner
-    inputs: list[InvoiceInput]
-    outputs: list[InvoiceOutput]
+    funding: Funding
 
     status: InvoiceStatus = InvoiceStatus.QUOTED
+    # facilitators that failed an operation for this job; the planner won't pick them again
+    excluded_facilitators: set[str] = field(default_factory=set)
 
+    holdings: Holdings = field(default_factory=Holdings)
     actions: list[Action] = field(default_factory=list)
     task: asyncio.Task[None] | None = field(default=None, repr=False)
+    # held while an x402 payment settles, so one quote is never paid for twice
+    payment_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
-    def accept(self) -> None:
+    def require_funding(self, funding: Funding) -> None:
+        if self.funding != funding:
+            raise InvoiceFundingError(
+                f"invoice {self.id} is funded by {self.funding}, not {funding}"
+            )
+
+    def check_acceptable(self) -> None:
         if self.status != InvoiceStatus.QUOTED:
             raise InvoiceStateError(f"cannot accept invoice in state {self.status}")
         if Timestamp.now() > self.expires_at:
             self.status = InvoiceStatus.EXPIRED
             raise InvoiceExpiredError(f"quote {self.id} has expired")
+
+    def accept(self) -> None:
+        self.check_acceptable()
+        self.begin()
+
+    def begin(self) -> None:
+        """Start awaiting the inputs. After an x402 payment settles this can't be refused."""
         self.status = InvoiceStatus.AWAITING_DEPOSIT
         self.expires_at = Timestamp.now() + DEPOSIT_TTL
 
@@ -255,15 +287,81 @@ class Invoice:
         return InvoiceView(
             quote_id=str(self.id),
             operator=self.operator,
+            funding=self.funding,
             status=self.status,
             created_at=self.created_at,
             expires_at=self.expires_at,
-            inputs=tuple(self.inputs),
-            outputs=tuple(self.outputs),
+            inputs=self.input_states(),
+            outputs=self.output_states(),
             gas=self.quote.gas,
-            fee=self.quote.fee,
+            holdings=self.holdings.positions,
+            movements=self.holdings.movements,
             actions=tuple(action.view() for action in self.actions),
         )
+
+    # --- Goal and progress: the goal is the quote; progress is read from the holdings ---
+
+    def job_address(self, chain: Chain) -> Address:
+        """The address the job's key controls on `chain`."""
+        return Address(chain, self.signer.address)
+
+    def held(self, chain: Chain) -> Place:
+        return Place(address=self.job_address(chain), custody=Custody.HELD)
+
+    @property
+    def deposits(self) -> tuple[Balance, ...]:
+        return tuple(
+            Balance(amount=inp, address=self.job_address(inp.token.chain))
+            for inp in self.quote.inputs
+        )
+
+    def input_states(self) -> tuple[InvoiceInput, ...]:
+        states: list[InvoiceInput] = []
+        for deposit in self.deposits:
+            token = deposit.amount.token
+            received = self.holdings.received(token, deposit.address)
+            if received >= deposit.amount.amount:
+                status = InputStatus.RECEIVED
+            elif self.status == InvoiceStatus.EXPIRED:
+                status = InputStatus.EXPIRED
+            else:
+                status = InputStatus.AWAITING
+            states.append(
+                InvoiceInput(
+                    deposit=deposit,
+                    received=TokenAmount(token=token, amount=Amount(received)),
+                    status=status,
+                )
+            )
+        return tuple(states)
+
+    def output_states(self) -> tuple[InvoiceOutput, ...]:
+        """Match each output to the transfers that carried exactly it (recipient and amount).
+
+        Identical outputs are interchangeable, so any matching order is correct. An output
+        claims its returned attempts and at most one live attempt (in flight or delivered).
+        """
+        attempts = _transfer_attempts(self.holdings.movements)
+        claimed: set[int] = set()
+        states: list[InvoiceOutput] = []
+        for goal in self.quote.outputs:
+            status = OutputStatus.PENDING
+            transactions: list[Transaction] = []
+            for i, attempt in enumerate(attempts):
+                if i in claimed or attempt.balance != goal:
+                    continue
+                claimed.add(i)
+                transactions.extend(attempt.transactions)
+                if attempt.outcome == Custody.DELIVERED:
+                    status = OutputStatus.DELIVERED
+                    break
+                if attempt.outcome == Custody.IN_FLIGHT:
+                    status = OutputStatus.SUBMITTED
+                    break
+            states.append(
+                InvoiceOutput(balance=goal, status=status, transactions=tuple(transactions))
+            )
+        return tuple(states)
 
     @property
     def is_expired(self) -> bool:
@@ -284,6 +382,44 @@ class Invoice:
         return self.task is not None and not self.task.done()
 
 
+@dataclass(frozen=True, slots=True)
+class _TransferAttempt:
+    balance: Balance
+    transactions: tuple[Transaction, ...]
+    outcome: Custody  # IN_FLIGHT, DELIVERED, or HELD when it came back
+
+
+def _transfer_attempts(movements: tuple[Movement, ...]) -> list[_TransferAttempt]:
+    """Every transfer sent (held -> in flight), with where its funds ended up and the
+    on-chain transactions involved."""
+    outcomes: dict[Hex32, Custody] = {}
+    transactions: dict[Hex32, dict[TxHash, Transaction]] = {}
+    for m in movements:
+        for place in (m.source, m.destination):
+            if place is None or place.custody != Custody.IN_FLIGHT or place.reference is None:
+                continue
+            if m.transaction is not None:
+                tx = Transaction(
+                    chain=place.address.chain, hash=m.transaction, timestamp=m.timestamp
+                )
+                transactions.setdefault(place.reference, {}).setdefault(m.transaction, tx)
+        if m.source is not None and m.source.custody == Custody.IN_FLIGHT and m.source.reference:
+            outcomes[m.source.reference] = m.destination.custody
+    attempts: list[_TransferAttempt] = []
+    for m in movements:
+        ref = m.destination.reference
+        if m.kind != MovementKind.TRANSIT or m.destination.custody != Custody.IN_FLIGHT or not ref:
+            continue
+        attempts.append(
+            _TransferAttempt(
+                balance=Balance(amount=m.amount, address=m.destination.address),
+                transactions=tuple(transactions.get(ref, {}).values()),
+                outcome=outcomes.get(ref, Custody.IN_FLIGHT),
+            )
+        )
+    return attempts
+
+
 # --- Registry ---
 
 
@@ -293,7 +429,7 @@ class InvoiceRegistry:
         self._invoices: dict[InvoiceId, Invoice] = {}
 
     def create_quote(
-        self, request: QuoteRequest, quote: QuoteResponse, signer: EthSigner
+        self, request: QuoteRequest, quote: QuoteResponse, signer: EthSigner, funding: Funding
     ) -> Invoice:
         inv_id = InvoiceId(quote.quote_id)
         now = Timestamp.now()
@@ -305,14 +441,7 @@ class InvoiceRegistry:
             quote=quote,
             operator=self._operator,
             signer=signer,
-            inputs=[
-                InvoiceInput(
-                    deposit=Balance(amount=inp, address=Address(inp.token.chain, signer.address)),
-                    received=TokenAmount(token=inp.token, amount=Amount(0)),
-                )
-                for inp in quote.inputs
-            ],
-            outputs=[InvoiceOutput(balance=out) for out in quote.outputs],
+            funding=funding,
         )
         self._invoices[inv_id] = invoice
         return invoice

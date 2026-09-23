@@ -10,14 +10,22 @@ from dataclasses import dataclass
 
 from .blockchain import ChainRegistry
 from .blockchain.rpc import RpcMonitor
-from .config import FeeConfig, TeeSwapConfig
+from .config import TeeSwapConfig
 from .crypto.attestation import Signer
 from .crypto.hpke import HpkeKeypair
-from .engine import Engine
+from .execution.engine import Engine
+from .execution.invoice import InvoiceRegistry, InvoiceView
 from .facilitator import FacilitatorMonitor
-from .invoice import InvoiceRegistry, InvoiceView
 from .mcp import Dispatcher, SessionManager
-from .tools import AcceptTool, InvoiceTool, QuoteTool, StatusResponse, StatusTool
+from .tools import (
+    AcceptTool,
+    AcceptX402Tool,
+    InvoiceTool,
+    QuoteTool,
+    QuoteX402Tool,
+    StatusResponse,
+    StatusTool,
+)
 from .types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
 
 
@@ -70,7 +78,6 @@ class TeeSwap:
             )
 
         self.config = parsed
-        self.fee_config = FeeConfig()
         self.keys = keys
 
         self.chain_registry = ChainRegistry(parsed.chains)
@@ -83,6 +90,7 @@ class TeeSwap:
             registry=self.invoice_registry,
             root_key=keys.evm_root_key,
             rpc_urls=rpc_urls,
+            facilitators=self.facilitator_monitor,
         )
 
         self.dispatcher = Dispatcher(signer=keys.signer, hpke_keypair=keys.hpke_keypair)
@@ -96,6 +104,8 @@ class TeeSwap:
         self.dispatcher.register(accept_tool)
         self.dispatcher.register(status_tool)
         self.dispatcher.register(invoice_tool)
+        self.dispatcher.register(QuoteX402Tool(self.engine))
+        self.dispatcher.register(AcceptX402Tool(self.engine))
         self.api = Api(quote_tool, accept_tool, status_tool, invoice_tool)
 
     def start_background_tasks(self) -> None:

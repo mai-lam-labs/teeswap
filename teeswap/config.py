@@ -6,13 +6,6 @@ from .wire import WireStruct
 
 
 @dataclass(frozen=True, slots=True)
-class FeeConfig:
-    quote_fee_usd: str = "0.005"
-    swap_fee_bps: int = 10
-    max_slippage_bps: int = 500
-
-
-@dataclass(frozen=True, slots=True)
 class Operator(WireStruct):
     """The invoice issuer. Every field is optional; the invoice shows whatever is set."""
 

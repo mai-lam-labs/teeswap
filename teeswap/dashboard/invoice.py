@@ -14,7 +14,7 @@ from litestar import MediaType, Response, Router, get
 from litestar.params import Parameter
 from litestar.status_codes import HTTP_200_OK, HTTP_404_NOT_FOUND
 
-from ..invoice import InvoiceId, InvoiceNotFoundError, InvoiceRegistry, InvoiceView
+from ..execution.invoice import InvoiceId, InvoiceNotFoundError, InvoiceRegistry, InvoiceView
 from ..types import Timestamp
 from .html import (
     a,
@@ -230,18 +230,31 @@ def render_invoice_html(invoice: InvoiceView) -> str:
                             )
                             for tx in out.transactions:
                                 span(f" {tx.hash}", cls="mono")
-                            if out.error:
-                                span(f" {out.error}", style="color:var(--danger)")
+
+        # --- Custody: where every unit of the funds is now ---
+        if invoice.holdings:
+            h2("Custody")
+            with div(cls="card"), table():
+                with thead(), tr():
+                    th("Custody")
+                    th("Where")
+                    th("Amount")
+                with tbody():
+                    for position in invoice.holdings:
+                        tok = position.amount.token
+                        with tr():
+                            td(position.place.custody.value.replace("_", " "))
+                            td(position.place.address.value, cls="mono")
+                            td(_fmt_amount(position.amount.amount, tok.symbol, tok.decimals))
 
         # --- Work log ---
         if invoice.actions:
             h2("Work Log")
             for action in invoice.actions:
-                proto_name = action.protocol or "direct"
                 chain_label = action.source_chain.caip2
                 if action.destination_chain:
                     chain_label += f" → {action.destination_chain.caip2}"
-                h3(f"{action.description} ({proto_name}) — {chain_label}")
+                h3(f"{action.description} — {chain_label}")
 
                 with div(cls="timeline"):
                     for step in action.steps:
@@ -292,13 +305,6 @@ def render_invoice_html(invoice: InvoiceView) -> str:
                 span("Gas estimate", cls="kv-label")
                 span(
                     _fmt_amount(gas.amount, gas.token.symbol, gas.token.decimals),
-                    cls="kv-value",
-                )
-
-                fee = invoice.fee
-                span("Fee", cls="kv-label")
-                span(
-                    _fmt_amount(fee.amount, fee.token.symbol, fee.token.decimals),
                     cls="kv-value",
                 )
 

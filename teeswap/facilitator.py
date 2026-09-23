@@ -18,12 +18,21 @@ from typing import Any
 
 import httpx
 
+from .common import TeeSwapError
 from .config import FacilitatorConfig
+from .http import BaseHttpClient
+from .wire import WireError, decode_object, encode, parse_json
+from .x402 import X402_VERSION, PaymentPayload, PaymentRequirements, SettleResponse, VerifyResponse
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 REQUEST_TIMEOUT = 10.0
+SETTLE_TIMEOUT = 60.0
+
+
+class FacilitatorError(TeeSwapError):
+    """The facilitator couldn't be reached or answered with something we can't read."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +158,7 @@ STAGGER_INTERVAL = 2.0
 
 class FacilitatorMonitor:
     def __init__(self, configs: tuple[FacilitatorConfig, ...]) -> None:
+        self._configs = configs
         self._snapshot = FacilitatorSnapshot()
         self._pollers = [
             _FacilitatorPoller(c, self._snapshot, initial_delay=i * STAGGER_INTERVAL)
@@ -159,6 +169,11 @@ class FacilitatorMonitor:
     def snapshot(self) -> FacilitatorSnapshot:
         return self._snapshot
 
+    def candidates(self, scheme: str, network: str, excluded: set[str]) -> tuple[str, ...]:
+        """Healthy facilitators that support (scheme, network), in config order."""
+        capable = {f.url for f in self._snapshot.facilitators_for(scheme, network)}
+        return tuple(c.url for c in self._configs if c.url in capable and c.url not in excluded)
+
     def start(self) -> None:
         for p in self._pollers:
             p.start()
@@ -166,3 +181,40 @@ class FacilitatorMonitor:
     def stop(self) -> None:
         for p in self._pollers:
             p.stop()
+
+
+# --- Verify and settle (x402 facilitator API) ---
+
+
+async def verify(
+    client: BaseHttpClient, url: str, payload: PaymentPayload, requirements: PaymentRequirements
+) -> VerifyResponse:
+    body = await _post(client, f"{url}/verify", payload, requirements, REQUEST_TIMEOUT)
+    return VerifyResponse.from_dict(body)
+
+
+async def settle(
+    client: BaseHttpClient, url: str, payload: PaymentPayload, requirements: PaymentRequirements
+) -> SettleResponse:
+    body = await _post(client, f"{url}/settle", payload, requirements, SETTLE_TIMEOUT)
+    return SettleResponse.from_dict(body)
+
+
+async def _post(
+    client: BaseHttpClient,
+    url: str,
+    payload: PaymentPayload,
+    requirements: PaymentRequirements,
+    timeout: float,
+) -> dict[str, Any]:
+    request = {
+        "x402Version": X402_VERSION,
+        "paymentPayload": payload,
+        "paymentRequirements": requirements,
+    }
+    try:
+        # our encoder decides the wire form (amounts as strings); httpx only carries it
+        resp = await client.post(url, json=parse_json(encode(request)), timeout=timeout)
+        return decode_object(resp.content)
+    except (httpx.HTTPError, WireError) as e:
+        raise FacilitatorError(f"{url}: {e}") from e
