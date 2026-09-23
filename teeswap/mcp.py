@@ -21,6 +21,7 @@ from .crypto.hpke import HpkeKeypair
 from .response import ToolResponse
 from .schema import schema_for_type
 from .wire import HasFromDict, WireError, encode, parse_json
+from .x402 import MCP_PAYMENT_META_KEY, PaymentPayload, PaymentTerms, ResourceInfo
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +30,6 @@ SUPPORTED_VERSIONS = ("2025-11-25", "2026-07-28")
 PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion"
 
 SESSION_TTL_SECONDS = 3600
-
-
-@dataclass(frozen=True, slots=True)
-class PaymentRequirement:
-    scheme: str
-    network: str
-    amount: str
-    currency: str
-    pay_to: str
-    description: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +96,7 @@ class McpParams(HasFromDict):
         if version is not None and not isinstance(version, str):
             raise TypeError(f"{PROTOCOL_VERSION_META} must be a string")
         self._verifiable_tools()
+        self._payment()
 
     @property
     def protocol_version(self) -> str | None:
@@ -114,6 +106,18 @@ class McpParams(HasFromDict):
     def client_nonce(self) -> str | None:
         vt = self._verifiable_tools()
         return vt.nonce if vt is not None else None
+
+    @property
+    def payment(self) -> PaymentPayload | None:
+        return self._payment()
+
+    def _payment(self) -> PaymentPayload | None:
+        raw = self._meta.get(MCP_PAYMENT_META_KEY)
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise TypeError(f"{MCP_PAYMENT_META_KEY} must be an object")
+        return PaymentPayload.from_dict(raw)
 
     def _verifiable_tools(self) -> VerifiableToolsMeta | None:
         raw = self._meta.get(VERIFIABLE_TOOLS_NS)
@@ -201,7 +205,9 @@ class ToolDefinition:
         return "POST"
 
 
-class Tool(abc.ABC):
+class ToolBase(abc.ABC):
+    """What every tool has: its definition and where it may be called from."""
+
     @property
     @abc.abstractmethod
     def definition(self) -> ToolDefinition: ...
@@ -214,11 +220,26 @@ class Tool(abc.ABC):
     def mcp_visible(self) -> bool:
         return True
 
-    async def price(self, args: Any) -> PaymentRequirement | None:  # noqa: ARG002
-        return None
 
+class Tool(ToolBase):
     @abc.abstractmethod
     async def execute(self, args: Any) -> ToolResponse: ...
+
+
+class PaidTool(ToolBase):
+    """A tool that may require an x402 payment.
+
+    Not a Tool subclass: its execute takes the payment (None when the client sent
+    none) and may return PaymentTerms, which a Tool never does.
+    """
+
+    @abc.abstractmethod
+    async def execute(
+        self, args: Any, payment: PaymentPayload | None
+    ) -> ToolResponse | PaymentTerms: ...
+
+
+type AnyTool = Tool | PaidTool
 
 
 class ToolNotAvailableError(Exception):
@@ -231,7 +252,7 @@ class Dispatcher:
         signer: Signer | None = None,
         hpke_keypair: HpkeKeypair | None = None,
     ) -> None:
-        self._tools: dict[str, Tool] = {}
+        self._tools: dict[str, AnyTool] = {}
         self._signer = signer
         self._hpke_keypair = hpke_keypair
         self._blind_executor: BlindExecutor | None = (
@@ -240,11 +261,11 @@ class Dispatcher:
             else None
         )
 
-    def register(self, tool: Tool) -> None:
+    def register(self, tool: AnyTool) -> None:
         self._tools[tool.definition.name] = tool
 
     @property
-    def tools(self) -> dict[str, Tool]:
+    def tools(self) -> dict[str, AnyTool]:
         return self._tools
 
     def tools_list(self, has_session: bool = True) -> list[dict[str, Any]]:
@@ -260,8 +281,12 @@ class Dispatcher:
         ]
 
     async def call(
-        self, name: str, arguments: dict[str, Any], has_session: bool = True
-    ) -> ToolResponse:
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        payment: PaymentPayload | None,
+        has_session: bool = True,
+    ) -> ToolResponse | PaymentTerms:
         tool = self._tools.get(name)
         if tool is None:
             raise ToolNotFoundError(f"unknown tool: {name}")
@@ -274,7 +299,12 @@ class Dispatcher:
             args = tool.definition.input_type.from_dict(arguments)
         except (DaciteError, ValueError, TypeError) as e:
             raise InvalidToolArgumentsError(f"invalid arguments for {name}: {e}") from e
-        return await tool.execute(args)
+        match tool:
+            case PaidTool():
+                return await tool.execute(args, payment)
+            case Tool():
+                # a payment sent to a free tool is ignored: never settled, never charged
+                return await tool.execute(args)
 
     @property
     def signer(self) -> Signer | None:
@@ -288,7 +318,7 @@ class Dispatcher:
     def blind_executor(self) -> BlindExecutor | None:
         return self._blind_executor
 
-    def get(self, name: str) -> Tool | None:
+    def get(self, name: str) -> AnyTool | None:
         return self._tools.get(name)
 
 
@@ -497,22 +527,44 @@ async def _handle_tools_call(
     has_session: bool = True,
 ) -> McpResult:
     try:
-        tool_result = await dispatcher.call(params.name, params.arguments, has_session=has_session)
+        outcome = await dispatcher.call(
+            params.name, params.arguments, params.payment, has_session=has_session
+        )
     except (ToolNotFoundError, ToolNotAvailableError) as e:
         return McpResult(body=_error(req_id, -32601, str(e)))
     except InvalidToolArgumentsError as e:
         return McpResult(body=_error(req_id, -32602, str(e)))
     except TeeSwapError as e:
         # a domain failure is a tool result the model can see and act on, not a protocol error
-        return _attested_result(dispatcher, req_id, params, _error_content(e), is_error=True)
+        return _attested_result(dispatcher, req_id, params, _error_content(e), {"isError": True})
 
-    return _attested_result(
-        dispatcher, req_id, params, tool_result.to_mcp_content(), is_error=False
-    )
+    content, fields = _render_outcome(dispatcher, params.name, outcome)
+    return _attested_result(dispatcher, req_id, params, content, fields)
 
 
 def _error_content(error: TeeSwapError) -> list[dict[str, Any]]:
     return [{"type": "text", "text": str(error)}]
+
+
+def _render_outcome(
+    dispatcher: Dispatcher, name: str, outcome: ToolResponse | PaymentTerms
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The result's content, plus any other result fields (isError, structuredContent)."""
+    match outcome:
+        case PaymentTerms():
+            # x402 MCP transport: the PaymentRequired goes in structuredContent and,
+            # as JSON, in the first text content item
+            required = outcome.required(
+                ResourceInfo(
+                    url=f"mcp://tool/{name}",
+                    description=dispatcher.tools[name].definition.description,
+                    mimeType="application/json",
+                )
+            )
+            content = [{"type": "text", "text": encode(required).decode()}]
+            return content, {"isError": True, "structuredContent": required}
+        case ToolResponse():
+            return outcome.to_mcp_content(), {}
 
 
 def _attested_result(
@@ -520,11 +572,9 @@ def _attested_result(
     req_id: str | int | None,
     params: ToolsCallParams,
     content: list[dict[str, Any]],
-    is_error: bool,
+    fields: dict[str, Any],
 ) -> McpResult:
-    result_body: dict[str, Any] = {"content": content}
-    if is_error:
-        result_body["isError"] = True
+    result_body: dict[str, Any] = {"content": content, **fields}
 
     if dispatcher.signer is not None:
         verifiable = dispatcher.signer.attest_result(
@@ -562,17 +612,15 @@ async def _handle_blind_call(
     except AttestationError as e:
         return McpResult(body=_error(req_id, -32602, str(e)))
 
-    is_error = False
     try:
-        tool_result = await dispatcher.call(params.name, decrypted.arguments)
-        content = tool_result.to_mcp_content()
+        outcome = await dispatcher.call(params.name, decrypted.arguments, params.payment)
+        content, fields = _render_outcome(dispatcher, params.name, outcome)
     except ToolNotFoundError as e:
         return McpResult(body=_error(req_id, -32601, str(e)))
     except InvalidToolArgumentsError as e:
         return McpResult(body=_error(req_id, -32602, str(e)))
     except TeeSwapError as e:
-        content = _error_content(e)
-        is_error = True
+        content, fields = _error_content(e), {"isError": True}
 
     content, meta = blind.attest_and_encrypt(
         decrypted=decrypted,
@@ -583,9 +631,9 @@ async def _handle_blind_call(
         reply_public_key_b64=params.replyPublicKey,
     )
 
-    result_body: dict[str, Any] = {"content": content, "_meta": meta}
-    if is_error:
-        result_body["isError"] = True
+    # SEP-2133 blind replies encrypt `content` only; other result fields
+    # (isError, x402's structuredContent) are sent as they are
+    result_body: dict[str, Any] = {"content": content, **fields, "_meta": meta}
     return McpResult(body=_ok(req_id, result_body))
 
 

@@ -6,6 +6,7 @@ HasFromDict.from_dict, the same path MCP uses, never by Litestar's decoder.
 
 from __future__ import annotations
 
+import base64
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from litestar.status_codes import (
     HTTP_200_OK,
     HTTP_202_ACCEPTED,
     HTTP_400_BAD_REQUEST,
+    HTTP_402_PAYMENT_REQUIRED,
     HTTP_404_NOT_FOUND,
     HTTP_422_UNPROCESSABLE_ENTITY,
     HTTP_500_INTERNAL_SERVER_ERROR,
@@ -30,14 +32,24 @@ from .common import PKG_NAME, PKG_VERSION, TeeSwapError
 from .dashboard import create_dashboard_router, create_invoice_router
 from .invoice import InvoiceNotFoundError
 from .mcp import (
+    AnyTool,
     JsonRpcNotification,
-    Tool,
+    PaidTool,
+    ToolDefinition,
     handle_mcp_notification,
     handle_mcp_request,
     parse_message,
 )
+from .response import ToolResponse
 from .schema import SCHEMA_PLUGINS, schema_object_for_type
 from .wire import HasFromDict, WireError, decode_object, encode
+from .x402 import (
+    HTTP_PAYMENT_REQUIRED_HEADER,
+    HTTP_PAYMENT_SIGNATURE_HEADER,
+    PaymentPayload,
+    PaymentTerms,
+    ResourceInfo,
+)
 
 if TYPE_CHECKING:
     from .instance import TeeSwap
@@ -95,13 +107,53 @@ def _operation_with_request_body(input_type: type[HasFromDict]) -> type[Operatio
     return ToolOperation
 
 
-def _make_rest_handler(tool: Tool) -> Any:
+# --- x402 HTTP transport (see docs/X402.md) ---
+
+
+def _payment_from_headers(request: Request[Any, Any, Any]) -> PaymentPayload | None:
+    header = request.headers.get(HTTP_PAYMENT_SIGNATURE_HEADER)
+    if header is None:
+        return None
+    try:
+        return PaymentPayload.from_dict(decode_object(base64.b64decode(header, validate=True)))
+    except (WireError, DaciteError, ValueError, TypeError) as e:
+        raise RequestError(f"invalid {HTTP_PAYMENT_SIGNATURE_HEADER} header: {e}") from e
+
+
+def _payment_required_response(
+    terms: PaymentTerms, request: Request[Any, Any, Any], defn: ToolDefinition
+) -> Response[bytes]:
+    required = terms.required(
+        ResourceInfo(
+            url=str(request.url), description=defn.description, mimeType="application/json"
+        )
+    )
+    return Response(
+        content=encode({"error": required.error}),
+        status_code=HTTP_402_PAYMENT_REQUIRED,
+        media_type=MediaType.JSON,
+        headers={HTTP_PAYMENT_REQUIRED_HEADER: base64.b64encode(encode(required)).decode("ascii")},
+    )
+
+
+async def _execute(
+    tool: AnyTool, args: Any, request: Request[Any, Any, Any]
+) -> ToolResponse | PaymentTerms:
+    if isinstance(tool, PaidTool):
+        return await tool.execute(args, _payment_from_headers(request))
+    # a payment sent to a free tool is ignored: never settled, never charged
+    return await tool.execute(args)
+
+
+def _make_rest_handler(tool: AnyTool) -> Any:
     defn = tool.definition
 
     async def handler(request: Request[Any, Any, Any]) -> Response[Any]:
         args = _hydrate(defn.input_type.from_dict, await request.body())
-        result = await tool.execute(args)
-        body, media_type = result.to_rest()
+        outcome = await _execute(tool, args, request)
+        if isinstance(outcome, PaymentTerms):
+            return _payment_required_response(outcome, request, defn)
+        body, media_type = outcome.to_rest()
         return Response(content=body, status_code=HTTP_200_OK, media_type=media_type)
 
     short_name = defn.name.removeprefix(f"{PKG_NAME}_")
