@@ -7,6 +7,8 @@ the local facilitator.
 
 import asyncio
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import pytest
 from eth_typing import HexStr
@@ -285,3 +287,73 @@ async def test_handed_over_keys_become_inputs(
     (output,) = quote.outputs
     assert chain.eth_balance(recipient) == output.amount.amount
     await invoice_page(quote.quote_id)
+
+
+@dataclass(frozen=True, slots=True)
+class _Accepted:
+    quote: QuoteResponse
+    deposit_to: Balance
+
+
+async def _accept_eth(api: Api, recipient: str) -> _Accepted:
+    """A quote for 0.01 ETH to `recipient`, accepted: nothing deposited yet."""
+    amount = TokenAmount(token=ETH, amount=Amount(ONE_ETH // 100))
+    quote = await api.quote(QuoteRequest(inputs=(amount,), outputs=(_to(recipient, amount),)))
+    (deposit_to,) = (await api.accept(InvoiceRequest(quote_id=quote.quote_id))).deposits
+    return _Accepted(quote=quote, deposit_to=deposit_to)
+
+
+@pytest.mark.asyncio
+async def test_undeliverable_output_puts_tools_down(api: Api, chain: LocalChain) -> None:
+    """The recipient stops accepting payments after the quote: once the funds are in, Mai
+    finds the rest can't be done and hands the money back untouched."""
+    recipient = new_address()
+    accepted = await _accept_eth(api, recipient)
+    quote, deposit_to = accepted.quote, accepted.deposit_to
+    chain.refuse_payments(recipient)
+    (paid,) = quote.inputs
+    chain.transfer_eth(deposit_to.address.value, paid.amount)
+
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "tools_down", f"invoice ended {status.status}"
+    assert status.reason is not None and status.reason.startswith("the rest can't be done")
+    by_custody = _by_custody(await api.invoice(InvoiceRequest(quote_id=quote.quote_id)))
+    assert by_custody == {Custody.HELD: paid.amount}  # nothing was spent trying
+
+
+@pytest.mark.asyncio
+async def test_gas_spike_beyond_the_reserve_puts_tools_down(
+    api: Api, chain: LocalChain, gas_spike: Callable[[], None]
+) -> None:
+    """Paid exactly the quote, then gas gets far dearer: finishing would eat into the
+    outputs, so Mai stops instead."""
+    accepted = await _accept_eth(api, new_address())
+    quote, deposit_to = accepted.quote, accepted.deposit_to
+    gas_spike()
+    (paid,) = quote.inputs
+    chain.transfer_eth(deposit_to.address.value, paid.amount)
+
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "tools_down", f"invoice ended {status.status}"
+    assert status.reason is not None and status.reason.startswith("finishing needs")
+    by_custody = _by_custody(await api.invoice(InvoiceRequest(quote_id=quote.quote_id)))
+    assert by_custody == {Custody.HELD: paid.amount}
+
+
+@pytest.mark.asyncio
+async def test_overpayment_pays_for_a_gas_spike(
+    api: Api, chain: LocalChain, gas_spike: Callable[[], None]
+) -> None:
+    """The same spike, with the user having sent more than the quote: the surplus is leave
+    to spend on finishing, so Mai delivers."""
+    recipient = new_address()
+    accepted = await _accept_eth(api, recipient)
+    quote, deposit_to = accepted.quote, accepted.deposit_to
+    gas_spike()
+    (paid,) = quote.inputs
+    chain.transfer_eth(deposit_to.address.value, paid.amount + ONE_ETH // 100)
+
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "delivered", f"invoice ended {status.status}: {status.reason}"
+    (output,) = quote.outputs
+    assert chain.eth_balance(recipient) == output.amount.amount

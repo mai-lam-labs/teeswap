@@ -14,6 +14,7 @@ The reaper runs alongside and expires stale quotes.
 import asyncio
 import logging
 
+import httpx
 from eth_utils.address import to_checksum_address
 
 from ..blockchain.chains import Chain
@@ -53,7 +54,7 @@ from .invoice import (
     ReleasedAccount,
 )
 from .operations import Operation, OperationContext, ReceivePayment
-from .planner import FacilitatorsFor, Finished, NoRouteError, decide
+from .planner import Decision, FacilitatorsFor, Finished, NoRouteError, decide
 from .quote import QuoteError, compute_quote
 from .worklog import Step, StepReport, StepStatus
 
@@ -313,7 +314,16 @@ class Engine:
         halts it when something is truly broken (see GuardrailError)."""
         stalled = 0
         while True:
-            decision = decide(invoice, self._facilitators_for_job(invoice))
+            try:
+                decision = await self._decide(invoice)
+            except httpx.HTTPError as e:
+                # no answer from the chain: not a reason to stop, but not progress either
+                logger.warning("invoice %s: can't plan yet: %s", invoice.id.ref, e)
+                stalled += 1
+                if stalled >= MAX_STALLED_PASSES:
+                    raise GuardrailError(f"no progress in {stalled} passes") from e
+                await asyncio.sleep(STALL_BACKOFF_SECONDS * stalled)
+                continue
             if isinstance(decision, Finished):
                 invoice.finish(decision.status, decision.reason)
                 return
@@ -331,6 +341,14 @@ class Engine:
             if stalled >= MAX_STALLED_PASSES:
                 raise GuardrailError(f"no progress in {stalled} passes")
             await asyncio.sleep(STALL_BACKOFF_SECONDS * stalled)
+
+    async def _decide(self, invoice: Invoice) -> Decision:
+        async with HttpClient() as client:
+
+            def evm_for(chain: Chain) -> EvmChain:
+                return EvmChain(chain, client, self.rpc_url_for_chain(chain))
+
+            return await decide(invoice, self._facilitators_for_job(invoice), evm_for)
 
     async def _run(self, invoice: Invoice, operation: Operation) -> Step:
         """Run one operation on a new work-log step; the step, as the operation left it."""

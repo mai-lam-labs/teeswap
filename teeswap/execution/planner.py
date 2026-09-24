@@ -16,12 +16,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..blockchain.chains import Chain, ChainFamily
+from ..blockchain.rpc import JsonRpcError
 from ..common import TeeSwapError
-from ..types import Balance, Timestamp, TokenAmount
+from ..types import Balance, Timestamp, Token, TokenAmount
 from .accounts import Accounts
-from .invoice import Funding, InputStatus, Invoice, InvoiceStatus, OutputStatus
+from .invoice import Funding, InputStatus, Invoice, InvoiceOutput, InvoiceStatus, OutputStatus
 from .ledger import Custody, Place
-from .operations import AwaitDeposit, FacilitatedTransfer, NativeTransfer, Operation
+from .operations import AwaitDeposit, EvmFor, FacilitatedTransfer, NativeTransfer, Operation
 
 # the facilitators Mai may use on a chain, best first
 type FacilitatorsFor = Callable[[Chain], tuple[str, ...]]
@@ -78,8 +79,10 @@ def provisional_plan(
     return operations
 
 
-# transfers that came back (void or reverted) before an output is given up on
-MAX_ATTEMPTS = 3
+# attempts at an output that came back before it's given up on. Costs are what normally
+# stop retrying (see _unaffordable); this stops attempts that cost nothing, like a
+# transfer a node keeps refusing, from repeating forever
+MAX_ATTEMPTS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,11 +99,12 @@ class Finished:
 type Decision = Plan | Finished
 
 
-def decide(invoice: Invoice, facilitators_for: FacilitatorsFor) -> Decision:
+async def decide(invoice: Invoice, facilitators_for: FacilitatorsFor, evm_for: EvmFor) -> Decision:
     """What happens next for a running job, from its holdings: more work, or the end.
 
     A job ends one of two ways: delivered, or tools down, where Mai stops and the job's
-    result is the money itself, handed to the owner (see Invoice.TOOLS_DOWN).
+    result is the money itself, handed to the owner (see Invoice.TOOLS_DOWN). She puts
+    them down when finishing is impossible, or would cost more than the job can spare.
     """
     inputs = invoice.input_states()
     outputs = invoice.output_states()
@@ -109,8 +113,11 @@ def decide(invoice: Invoice, facilitators_for: FacilitatorsFor) -> Decision:
     if all(out.status == OutputStatus.DELIVERED for out in outputs):
         return Finished(InvoiceStatus.DELIVERED, "every output was delivered")
     awaited = [inp for inp in inputs if inp.status != InputStatus.RECEIVED]
-    if awaited and Timestamp.now() > invoice.expires_at:
-        return Finished(InvoiceStatus.TOOLS_DOWN, "the inputs didn't arrive in time")
+    if awaited:
+        if Timestamp.now() > invoice.expires_at:
+            return Finished(InvoiceStatus.TOOLS_DOWN, "the inputs didn't arrive in time")
+        # nothing else until the funds are held: then what finishing costs can be weighed
+        return Plan(tuple(AwaitDeposit(inp.deposit) for inp in awaited))
     for out in outputs:
         if out.status == OutputStatus.PENDING and out.attempts >= MAX_ATTEMPTS:
             return Finished(
@@ -118,15 +125,52 @@ def decide(invoice: Invoice, facilitators_for: FacilitatorsFor) -> Decision:
                 f"{out.attempts} transfers to {out.balance.address.value} came back",
             )
     try:
-        operations: list[Operation] = [AwaitDeposit(inp.deposit) for inp in awaited]
-        operations += [
+        operations = [
             _transfer(out.balance, _source(invoice.deposits, out.balance), facilitators_for)
             for out in outputs
             if out.status == OutputStatus.PENDING
         ]
     except NoRouteError as e:
         return Finished(InvoiceStatus.TOOLS_DOWN, f"no way to finish: {e}")
+    try:
+        costs = [cost for op in operations for cost in await op.estimate_costs(evm_for)]
+    except JsonRpcError as e:
+        # the chain answered: simulating the rest of the job fails
+        return Finished(InvoiceStatus.TOOLS_DOWN, f"the rest can't be done: {e.rpc_message}")
+    shortfall = _unaffordable(invoice, outputs, costs)
+    if shortfall is not None:
+        return Finished(InvoiceStatus.TOOLS_DOWN, shortfall)
     return Plan(tuple(operations))
+
+
+def _unaffordable(
+    invoice: Invoice, outputs: tuple[InvoiceOutput, ...], costs: list[TokenAmount]
+) -> str | None:
+    """Why the next plan can't be paid for, if it can't.
+
+    What the job can spend on costs is what it holds beyond what it still owes the
+    outputs: the quote's reserve, less what's been consumed, plus anything paid over the
+    quote (an overpayment is taken as leave to spend it on finishing). The outputs
+    themselves are never spent on costs.
+    """
+    totals: dict[Token, int] = {}
+    for cost in costs:
+        totals[cost.token] = totals.get(cost.token, 0) + cost.amount
+    for token, needed in totals.items():
+        held = sum(
+            p.amount.amount
+            for p in invoice.holdings.positions
+            if p.place.custody == Custody.HELD and p.amount.token == token
+        )
+        owed = sum(
+            out.balance.amount.amount
+            for out in outputs
+            if out.status == OutputStatus.PENDING and out.balance.amount.token == token
+        )
+        spare = max(held - owed, 0)
+        if needed > spare:
+            return f"finishing needs {needed} {token.symbol} for costs, and {spare} is spare"
+    return None
 
 
 def _source(deposits: tuple[Balance, ...], output: Balance) -> Place:

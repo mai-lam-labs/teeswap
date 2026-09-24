@@ -126,8 +126,17 @@ account the job controls is handed to the invoice's owner, with its key and
 what the chain shows it holding. The funds don't move; control of them does.
 
 The tools go down when the planner finds no way to finish (no route, the
-inputs didn't arrive in time, transfers keep coming back), when the engine's
-guardrails trip, or when the owner asks. Whatever was in flight is normally
+inputs didn't arrive in time, the rest of the job fails when simulated), when
+finishing would cost more than the job can spare, when the engine's guardrails
+trip, or when the owner asks.
+
+**What the job can spare** is what it holds beyond what it still owes the
+outputs: the quote's reserve for costs, less what has been spent, plus anything
+paid over the quote. Before each plan, the planner has every operation estimate
+its cost at today's prices, and only goes ahead if the job can pay for it. So
+retrying goes on while it's affordable, a gas spike stops the job before it
+overspends, and the outputs are never spent on costs. The quote's reserve is
+priced at the fee a transaction commits to, not the typical fee. Whatever was in flight is normally
 watched to its end first; when a guardrail stops a broken action partway, it
 may not be, which is why the handover reads balances from the chain rather than
 from the record. The invoice records why, keeps
@@ -159,8 +168,10 @@ it's the client's choice to make.
 
 Mai is generous about what arrives. If the goal is still reachable, she
 carries on: 1.001 ETH against a 1 ETH quote runs the plan as quoted, and the
-surplus stays as a visible held position, which the owner can take with the
-tools down. Anything the record missed is counted when the tools go down: the
+surplus stays as a visible held position. An overpayment is taken as leave to
+spend it on finishing, much as the slippage tolerance is: if costs rise, the
+surplus pays for them before the tools go down. Whatever is left, the owner
+can take with the tools down. Anything the record missed is counted when the tools go down: the
 handover reads the chain, and funds beyond what the record accounts for are
 recorded as arrivals before they are released.
 

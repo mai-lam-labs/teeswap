@@ -9,7 +9,7 @@ the production way, in its app, with its background tasks running.
 
 import os
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -125,3 +125,19 @@ def payer(chain: LocalChain) -> EvmPayer:
 
 def new_address() -> ChecksumAddress:
     return EthSigner(os.urandom(32)).address
+
+
+GAS_SPIKE = 100  # times the base fee a quote was made at
+
+
+@pytest.fixture
+def gas_spike(chain: LocalChain) -> Iterator[Callable[[], None]]:
+    """Makes gas cost GAS_SPIKE times more from the next block; puts it back afterwards,
+    since every test shares the chain."""
+    before = chain.base_fee()
+
+    def spike() -> None:
+        chain.set_base_fee(before * GAS_SPIKE)
+
+    yield spike
+    chain.set_base_fee(before)

@@ -32,6 +32,8 @@ RECEIPT_POLL_SECONDS = 0.1
 RECEIPT_ATTEMPTS = 50
 # anvil's dev accounts: #0 pays the facilitator's gas, #1 owns USDC, #2 plays a user's wallet
 DEPOSITOR_ACCOUNT = 2
+# PUSH1 0 PUSH1 0 REVERT: code that refuses every call and every payment
+REVERT_ALWAYS = "0x60006000fd"
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +146,18 @@ class LocalChain:
             "eth_sendTransaction", [{"from": sender, "to": to, "value": hex(amount)}]
         )
         self._wait(tx_hash, "ETH transfer")
+
+    def refuse_payments(self, account: str) -> None:
+        """Make `account` a contract that reverts whatever is sent to it."""
+        self._rpc("anvil_setCode", [account, REVERT_ALWAYS])
+
+    def base_fee(self) -> int:
+        return int(self._rpc("eth_getBlockByNumber", ["latest", False])["baseFeePerGas"], 16)
+
+    def set_base_fee(self, wei: int) -> None:
+        """Set the base fee from the next block on (EIP-1559 then moves it block by block)."""
+        self._rpc("anvil_setNextBlockBaseFeePerGas", [hex(wei)])
+        self._rpc("evm_mine", [])
 
     def eth_balance(self, account: str) -> int:
         return int(self._rpc("eth_getBalance", [account, "latest"]), 16)
