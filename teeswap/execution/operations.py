@@ -1,41 +1,61 @@
 """Operations: the things Mai does for a job (see docs/EXECUTION.md).
 
 Each operation does one thing and reports what actually happened as Movements,
-from its own evidence (balances it observed, receipts). It reads the job, but
-changes it only by reporting: the engine applies movements to the holdings.
+from its own evidence (balances it observed, the chain's answer about its side
+effects). It reads the job, but changes it only by reporting: the engine applies
+movements to the holdings.
 
-An operation records its intent before any side effect: NativeTransfer reports the
-in-flight movement, with its transaction hash, before submitting. Interrupted, it
-can be resumed by checking that hash instead of sending again.
+An operation that reaches the outside world does so through side effects
+(effects.py), recorded on its work-log step before they are performed, with the
+funds they commit reported in flight against that step. Its run() performs
+them, then watches until whoever enforces their key says whether they took
+effect, reports where the funds ended up, and reports how its step ended. It
+doesn't return before that: a question the chain didn't answer is asked again,
+never taken as an answer.
 
 Every operation can also estimate its own costs, which is how the quote prices
 Mai's provisional plan without running it.
-
-Operations are named apart from the work-log Action/Step records: operations are
-what runs, Action/Step are the record of what ran.
 """
 
 import abc
 import asyncio
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import override
 
-from eth_typing import ChecksumAddress, HexStr
+import httpx
+from eth_typing import HexStr
 from eth_utils.address import to_checksum_address
 
 from .. import facilitator
 from ..blockchain.chains import Chain
-from ..blockchain.evm import EncodedCall, EthSigner, EvmChain, TransferAuthorization
+from ..blockchain.evm import EncodedCall, EthSigner, EvmChain
+from ..blockchain.rpc import JsonRpcError
 from ..common import TeeSwapError
 from ..http import BaseHttpClient
 from ..types import Amount, Balance, Hex32, Timestamp, Token, TokenAmount, TxHash, Url
-from ..x402 import X402_VERSION, PaymentPayload, PaymentRequirements, ResourceInfo
-from .invoice import Invoice, InvoiceExpiredError, InvoiceStatus, Step
+from ..x402 import PaymentPayload, PaymentRequirements, ResourceInfo, sign_exact_evm
+from .accounts import Accounts
+from .effects import (
+    AuthorizationSubmission,
+    Outcome,
+    Pending,
+    SideEffect,
+    TransactionBroadcast,
+    Void,
+)
+from .invoice import Invoice, InvoiceStatus
 from .ledger import Custody, Movement, MovementKind, Place
+from .worklog import StepReport
+
+logger = logging.getLogger(__name__)
 
 DEPOSIT_POLL_INTERVAL = 5.0
+TRANSACTION_POLL_INTERVAL = 0.5
+REBROADCAST_EVERY = 60  # polls
+AUTHORIZATION_POLL_INTERVAL = 1.0
 
 type EvmFor = Callable[[Chain], EvmChain]
 
@@ -46,11 +66,11 @@ class OperationError(TeeSwapError):
 
 @dataclass(frozen=True, slots=True)
 class OperationContext:
-    """What an operation may use: the job (read-only), its key, chain access, and report."""
+    """What an operation may use: the job (read-only), its accounts, chain access, and report."""
 
     invoice: Invoice
-    signer: EthSigner
-    step: Step
+    accounts: Accounts
+    step: StepReport  # the operation reports its own step: side effects, outcome, how it ended
     client: BaseHttpClient  # records RPC traffic on the operation's work-log step
     rpc_url_for: Callable[[Chain], Url]
     report: Callable[[Movement], None]
@@ -76,13 +96,13 @@ class Operation(abc.ABC):
         """The job's status while this operation runs."""
 
     @abc.abstractmethod
-    async def estimate_costs(
-        self, evm_for: EvmFor, job_address: ChecksumAddress
-    ) -> tuple[TokenAmount, ...]:
+    async def estimate_costs(self, evm_for: EvmFor) -> tuple[TokenAmount, ...]:
         """What running this is expected to consume, without running it."""
 
     @abc.abstractmethod
-    async def run(self, ctx: OperationContext) -> None: ...
+    async def run(self, ctx: OperationContext) -> None:
+        """Do it, and report how the step ended (completed, or failed with a reason).
+        Returns only once every side effect it performed has resolved."""
 
 
 class AwaitDeposit(Operation):
@@ -108,9 +128,7 @@ class AwaitDeposit(Operation):
         return InvoiceStatus.AWAITING_DEPOSIT
 
     @override
-    async def estimate_costs(
-        self, evm_for: EvmFor, job_address: ChecksumAddress
-    ) -> tuple[TokenAmount, ...]:
+    async def estimate_costs(self, evm_for: EvmFor) -> tuple[TokenAmount, ...]:
         return ()
 
     @override
@@ -121,8 +139,13 @@ class AwaitDeposit(Operation):
         evm = ctx.evm(self.chain)
         while True:
             # arrivals are whatever the chain shows beyond what's already recorded as held
-            observed = await evm.token_balance(token, ctx.signer.address)
-            arrived = observed - ctx.invoice.holdings.amount_at(held, token)
+            try:
+                observed = await evm.token_balance(token, to_checksum_address(address.value))
+            except _UNANSWERED as e:
+                logger.warning("%s: balance unavailable, retrying: %s", ctx.step.id, e)
+                await asyncio.sleep(DEPOSIT_POLL_INTERVAL)
+                continue
+            arrived = observed - ctx.invoice.holdings.amount_at(held, token).amount.amount
             if arrived > 0:
                 ctx.report(
                     Movement(
@@ -133,10 +156,13 @@ class AwaitDeposit(Operation):
                         timestamp=Timestamp.now(),
                     )
                 )
-            if ctx.invoice.holdings.received(token, address) >= self._deposit.amount.amount:
+            received = ctx.invoice.holdings.received(token, address)
+            if received.amount.amount >= self._deposit.amount.amount:
+                ctx.step.completed()
                 return
-            if ctx.invoice.is_expired:
-                raise InvoiceExpiredError(f"invoice {ctx.invoice.id} expired awaiting deposit")
+            if Timestamp.now() > ctx.invoice.expires_at:
+                ctx.step.failed("expired awaiting deposit")
+                return
             await asyncio.sleep(DEPOSIT_POLL_INTERVAL)
 
 
@@ -171,36 +197,66 @@ class NativeTransfer(Operation):
         )
 
     @override
-    async def estimate_costs(
-        self, evm_for: EvmFor, job_address: ChecksumAddress
-    ) -> tuple[TokenAmount, ...]:
+    async def estimate_costs(self, evm_for: EvmFor) -> tuple[TokenAmount, ...]:
         evm = evm_for(self.chain)
-        units = await evm.estimate_gas_as_funded(job_address, self._call())
+        source = to_checksum_address(self._source.address.value)
+        units = await evm.estimate_gas_as_funded(source, self._call())
         gas = units * await evm.gas_price()
         return (TokenAmount(token=Token.native(self.chain), amount=Amount(gas)),)
 
     @override
     async def run(self, ctx: OperationContext) -> None:
-        amount = self._output.amount
         evm = ctx.evm(self.chain)
-        tx = await evm.prepare(ctx.signer, self._call())
-        ref = TxHash.from_bytes(tx.tx_hash)
-        in_flight = Place(address=self._output.address, custody=Custody.IN_FLIGHT, reference=ref)
+        try:
+            signer = ctx.accounts.key(self._source.address, EthSigner)
+            tx = await evm.prepare(signer, self._call())
+        except _UNANSWERED as e:
+            ctx.step.failed(f"could not prepare the transfer: {e}")  # nothing was sent
+            return
+        broadcast = TransactionBroadcast(self.chain, tx, ctx.rpc_url_for(self.chain))
+        ctx.step.record(broadcast)
+        in_flight = _in_flight(self._output, ctx.step)
+        amount = self._output.amount
+        ctx.report(_movement(MovementKind.TRANSIT, amount, self._source, in_flight))
+        await _broadcast(evm, broadcast)
+        ctx.step.waiting()
 
-        # intent first: once this is recorded, the funds are accounted for by the tx hash
-        ctx.report(_movement(MovementKind.TRANSIT, amount, self._source, in_flight, ref))
-        await evm.submit(tx)
-        receipt = await evm.wait_receipt(tx.tx_hash)
+        polls = 0
+        while isinstance(outcome := await _check(broadcast, ctx), Pending):
+            polls += 1
+            if polls % REBROADCAST_EVERY == 0:
+                # the node may have dropped it: send the same bytes again, never a new transaction
+                broadcast = TransactionBroadcast(self.chain, tx, ctx.rpc_url_for(self.chain))
+                ctx.step.record(broadcast)
+                await _broadcast(evm, broadcast)
+            await asyncio.sleep(TRANSACTION_POLL_INTERVAL)
+        ctx.step.resolved(broadcast.key, outcome)
 
-        gas = TokenAmount(token=Token.native(self.chain), amount=Amount(receipt.gas_cost))
-        consumed = Place(address=self._source.address, custody=Custody.CONSUMED)
-        ctx.report(_movement(MovementKind.GAS, gas, self._source, consumed, ref))
-        if not receipt.success:
+        if isinstance(outcome, Void):
+            ctx.report(_movement(MovementKind.TRANSIT, amount, in_flight, self._source))
+            ctx.step.failed(f"transfer not sent: {outcome.reason}")
+            return
+        if outcome.gas is not None:
+            consumed = Place(address=self._source.address, custody=Custody.CONSUMED)
+            ctx.report(
+                _movement(
+                    MovementKind.GAS, outcome.gas, self._source, consumed, outcome.transaction
+                )
+            )
+        if not outcome.success:
             # the value never left: back to where it was held
-            ctx.report(_movement(MovementKind.TRANSIT, amount, in_flight, self._source, ref))
-            raise OperationError(f"transfer {ref} reverted")
-        delivered = Place(address=self._output.address, custody=Custody.DELIVERED, reference=ref)
-        ctx.report(_movement(MovementKind.OUTPUT, amount, in_flight, delivered, ref))
+            ctx.report(
+                _movement(
+                    MovementKind.TRANSIT, amount, in_flight, self._source, outcome.transaction
+                )
+            )
+            ctx.step.failed(f"transfer {outcome.transaction} reverted")
+            return
+        delivered = Place(address=self._output.address, custody=Custody.DELIVERED)
+        ctx.report(
+            _movement(MovementKind.OUTPUT, amount, in_flight, delivered, outcome.transaction)
+        )
+        ctx.step.completed()
 
 
 AUTHORIZATION_TTL_SECONDS = 300
@@ -209,17 +265,20 @@ AUTHORIZATION_TTL_SECONDS = 300
 class FacilitatedTransfer(Operation):
     """Send a token output by EIP-3009 authorization, settled (and paid for) by a facilitator.
 
-    Mai signs transferWithAuthorization from the job's address to the recipient; the
-    facilitator verifies and settles it. The in-flight reference is the authorization's
-    nonce, which the token contract can be asked about if the outcome is unclear.
+    Mai signs one transferWithAuthorization from the source account to the recipient
+    and hands it to the facilitators in turn until one accepts it. They all hold the
+    same authorization, so at most one transfer can happen; the token contract says
+    which, if any.
     """
 
-    def __init__(self, output: Balance, source: Place, facilitator: str) -> None:
+    def __init__(self, output: Balance, source: Place, facilitators: tuple[str, ...]) -> None:
         if output.amount.token.contract is None:
             raise OperationError(f"{output.amount.token.symbol} is native: no EIP-3009")
+        if not facilitators:
+            raise OperationError("no facilitator to settle the transfer")
         self._output = output
         self._source = source
-        self._facilitator = facilitator
+        self._facilitators = facilitators
 
     @property
     @override
@@ -227,7 +286,7 @@ class FacilitatedTransfer(Operation):
         amount = self._output.amount
         return (
             f"send {amount.amount} {amount.token.symbol} to {self._output.address.value}"
-            f" via {self._facilitator}"
+            " via an x402 facilitator"
         )
 
     @property
@@ -241,9 +300,7 @@ class FacilitatedTransfer(Operation):
         return InvoiceStatus.EXECUTING
 
     @override
-    async def estimate_costs(
-        self, evm_for: EvmFor, job_address: ChecksumAddress
-    ) -> tuple[TokenAmount, ...]:
+    async def estimate_costs(self, evm_for: EvmFor) -> tuple[TokenAmount, ...]:
         return ()  # the facilitator pays the gas, and facilitators are free
 
     @override
@@ -252,71 +309,117 @@ class FacilitatedTransfer(Operation):
         token = amount.token
         contract = to_checksum_address(str(token.contract))
         evm = ctx.evm(self.chain)
-        name, version = await evm.eip712_domain(token)
+        signer = ctx.accounts.key(self._source.address, EthSigner)
+        try:
+            name, version = await evm.eip712_domain(token)
+            block = await evm.latest_block()
+        except _UNANSWERED as e:
+            ctx.step.failed(f"could not prepare the authorization: {e}")  # nothing was sent
+            return
 
-        now = int(Timestamp.now().dt.timestamp())
-        nonce = Hex32.from_bytes(os.urandom(32))
-        authorization = TransferAuthorization(
-            sender=ctx.signer.address,
-            recipient=to_checksum_address(self._output.address.value),
-            value=amount.amount,
-            valid_after=now - 60,
-            valid_before=now + AUTHORIZATION_TTL_SECONDS,
-            nonce=nonce,
-        )
-        signature = authorization.sign(ctx.signer, (name, version), evm.chain_id, contract)
         requirements = PaymentRequirements(
             scheme="exact",
             network=self.chain.caip2,
             amount=amount.amount,
             asset=contract,
-            payTo=authorization.recipient,
+            payTo=to_checksum_address(self._output.address.value),
             maxTimeoutSeconds=AUTHORIZATION_TTL_SECONDS,
             extra={"name": name, "version": version},
         )
-        payload = PaymentPayload(
-            x402Version=X402_VERSION,
-            resource=ResourceInfo(
-                url=f"teeswap:invoice/{ctx.invoice.id}",
-                description=self.description,
-                mimeType="application/json",
-            ),
-            accepted=requirements,
-            payload={"signature": "0x" + signature.hex(), "authorization": authorization.wire()},
+        resource = ResourceInfo(
+            url=f"teeswap:invoice/{ctx.invoice.id}",
+            description=self.description,
+            mimeType="application/json",
         )
-        in_flight = Place(address=self._output.address, custody=Custody.IN_FLIGHT, reference=nonce)
+        signed = sign_exact_evm(
+            signer,
+            resource,
+            requirements,
+            valid_after=block.timestamp - 60,
+            valid_before=block.timestamp + AUTHORIZATION_TTL_SECONDS,
+            nonce=Hex32.from_bytes(os.urandom(32)),
+        )
+        payload = signed.payload
 
-        # intent first: once recorded, the funds are accounted for by the authorization nonce
-        ctx.report(_movement(MovementKind.TRANSIT, amount, self._source, in_flight, None))
-        try:
-            tx = await self._facilitate(ctx.client, payload, requirements)
-        except (OperationError, facilitator.FacilitatorError) as e:
-            # the outcome is unclear: the token knows whether the authorization was used
-            if await evm.authorization_used(contract, ctx.signer.address, nonce):
-                delivered = Place(
-                    address=self._output.address, custody=Custody.DELIVERED, reference=nonce
-                )
-                ctx.report(_movement(MovementKind.OUTPUT, amount, in_flight, delivered, None))
-                return
-            ctx.report(_movement(MovementKind.TRANSIT, amount, in_flight, self._source, None))
-            ctx.exclude_facilitator(self._facilitator)
-            raise OperationError(str(e)) from e
-        delivered = Place(address=self._output.address, custody=Custody.DELIVERED, reference=tx)
-        ctx.report(_movement(MovementKind.OUTPUT, amount, in_flight, delivered, tx))
-
-    async def _facilitate(
-        self, client: BaseHttpClient, payload: PaymentPayload, requirements: PaymentRequirements
-    ) -> TxHash:
-        verified = await facilitator.verify(client, self._facilitator, payload, requirements)
-        if not verified.isValid:
-            raise OperationError(
-                f"{self._facilitator} rejected the transfer: {verified.invalidReason}"
+        in_flight = _in_flight(self._output, ctx.step)
+        for i, url in enumerate(self._facilitators):
+            submission = AuthorizationSubmission(
+                self.chain,
+                token,
+                signed.authorization,
+                signed.signature,
+                url,
+                from_block=block.number,
             )
-        settled = await facilitator.settle(client, self._facilitator, payload, requirements)
-        if not settled.success:
-            reason = settled.errorReason or settled.errorMessage
-            raise OperationError(f"{self._facilitator} failed to settle: {reason}")
-        return TxHash(settled.transaction)
+            ctx.step.record(submission)
+            if i == 0:
+                # committed from the first submission on: any of them may settle it
+                ctx.report(_movement(MovementKind.TRANSIT, amount, self._source, in_flight))
+            submission.sending()
+            try:
+                await _facilitate(ctx.client, url, payload, requirements)
+                break
+            except (OperationError, facilitator.FacilitatorError) as e:
+                submission.failed(str(e))
+                ctx.exclude_facilitator(url)
+            # the facilitator may have settled it anyway: don't offer it again if so
+            if not isinstance(await _check(submission, ctx), Pending):
+                break
+        ctx.step.waiting()
+
+        latest = submission
+        while isinstance(outcome := await _check(latest, ctx), Pending):
+            await asyncio.sleep(AUTHORIZATION_POLL_INTERVAL)
+        ctx.step.resolved(latest.key, outcome)
+
+        if isinstance(outcome, Void):
+            ctx.report(_movement(MovementKind.TRANSIT, amount, in_flight, self._source))
+            ctx.step.failed(f"transfer not settled: {outcome.reason}")
+            return
+        delivered = Place(address=self._output.address, custody=Custody.DELIVERED)
+        ctx.report(
+            _movement(MovementKind.OUTPUT, amount, in_flight, delivered, outcome.transaction)
+        )
+        ctx.step.completed()
+
+
+# a request that errored or timed out: no answer, so never taken as one
+_UNANSWERED = (JsonRpcError, httpx.HTTPError)
+
+
+async def _check(effect: SideEffect, ctx: OperationContext) -> Outcome:
+    """Ask whether the side effect took effect. Not getting an answer is not an answer."""
+    try:
+        return await effect.check(ctx.client, ctx.rpc_url_for)
+    except _UNANSWERED as e:
+        logger.warning("%s: outcome unavailable, still pending: %s", ctx.step.id, e)
+        return Pending()
+
+
+async def _broadcast(evm: EvmChain, broadcast: TransactionBroadcast) -> None:
+    broadcast.sending()
+    try:
+        await evm.submit(broadcast.tx)
+    except _UNANSWERED as e:
+        # not proof it wasn't received: the chain is asked
+        broadcast.failed(str(e))
+
+
+async def _facilitate(
+    client: BaseHttpClient, url: str, payload: PaymentPayload, requirements: PaymentRequirements
+) -> None:
+    verified = await facilitator.verify(client, url, payload, requirements)
+    if not verified.isValid:
+        raise OperationError(f"{url} rejected the transfer: {verified.invalidReason}")
+    settled = await facilitator.settle(client, url, payload, requirements)
+    if not settled.success:
+        raise OperationError(
+            f"{url} failed to settle: {settled.errorReason or settled.errorMessage}"
+        )
+
+
+def _in_flight(output: Balance, step: StepReport) -> Place:
+    return Place(address=output.address, custody=Custody.IN_FLIGHT, step=step.id)
 
 
 def _movement(
@@ -324,7 +427,7 @@ def _movement(
     amount: TokenAmount,
     source: Place,
     destination: Place,
-    transaction: TxHash | None,
+    transaction: TxHash | None = None,
 ) -> Movement:
     return Movement(
         kind=kind,

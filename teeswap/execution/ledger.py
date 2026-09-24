@@ -9,8 +9,9 @@ import enum
 from dataclasses import dataclass
 
 from ..common import TeeSwapError
-from ..types import Address, Amount, Hex32, Timestamp, Token, TokenAmount, TxHash
+from ..types import Address, Amount, Balance, Timestamp, Token, TokenAmount, TxHash
 from ..wire import WireStruct
+from .worklog import StepId
 
 
 class LedgerError(TeeSwapError):
@@ -35,9 +36,8 @@ class MovementKind(enum.StrEnum):
 class Place(WireStruct):
     address: Address
     custody: Custody
-    # while in flight: the handle that identifies what has the funds and can be checked
-    # on-chain (a transaction hash, or an EIP-3009 authorization nonce)
-    reference: Hex32 | None = None
+    # while in flight: the work-log step whose side effects hold the funds
+    step: StepId | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,18 +88,20 @@ class Holdings:
         self._amounts[key] = self._amounts.get(key, 0) + amount
         self._movements.append(movement)
 
-    def amount_at(self, place: Place, token: Token) -> int:
-        return self._amounts.get((place, token), 0)
+    def amount_at(self, place: Place, token: Token) -> Position:
+        amount = self._amounts.get((place, token), 0)
+        return Position(place=place, amount=TokenAmount(token=token, amount=Amount(amount)))
 
-    def received(self, token: Token, address: Address) -> int:
+    def received(self, token: Token, address: Address) -> Balance:
         """Total that has arrived at `address` from outside, whatever happened to it since."""
-        return sum(
+        total = sum(
             m.amount.amount
             for m in self._movements
             if m.kind == MovementKind.INPUT
             and m.amount.token == token
             and m.destination.address == address
         )
+        return Balance(amount=TokenAmount(token=token, amount=Amount(total)), address=address)
 
     @property
     def positions(self) -> tuple[Position, ...]:

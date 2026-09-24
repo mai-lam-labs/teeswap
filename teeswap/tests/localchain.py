@@ -30,6 +30,8 @@ from eth_utils.abi import function_signature_to_4byte_selector
 FIXTURES = Path(__file__).parent / "fixtures" / "evm"
 RECEIPT_POLL_SECONDS = 0.1
 RECEIPT_ATTEMPTS = 50
+# anvil's dev accounts: #0 pays the facilitator's gas, #1 owns USDC, #2 plays a user's wallet
+DEPOSITOR_ACCOUNT = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,14 +80,20 @@ class LocalChain:
         """Send from an unlocked anvil account and wait for a successful receipt."""
         data = self._calldata(signature, types, args)
         tx_hash = self._rpc("eth_sendTransaction", [{"from": sender, "to": to, "data": data}])
+        self._wait(tx_hash, signature)
+
+    def _wait(self, tx_hash: str, what: str) -> None:
         for _ in range(RECEIPT_ATTEMPTS):
             receipt = self._rpc("eth_getTransactionReceipt", [tx_hash])
             if receipt is not None:
                 if receipt["status"] != "0x1":
-                    raise LocalChainError(f"{signature} reverted")
+                    raise LocalChainError(f"{what} reverted")
                 return
             time.sleep(RECEIPT_POLL_SECONDS)
-        raise LocalChainError(f"{signature}: no receipt for {tx_hash}")
+        raise LocalChainError(f"{what}: no receipt for {tx_hash}")
+
+    def chain_id(self) -> int:
+        return int(self._rpc("eth_chainId", []), 16)
 
     @property
     def usdc_owner(self) -> str:
@@ -128,6 +136,17 @@ class LocalChain:
             ["address", "uint256"],
             [to, amount],
         )
+
+    def transfer_eth(self, to: str, amount: int) -> None:
+        """Send ETH as a user's wallet would: a mined transfer from a funded dev account."""
+        sender = self._rpc("eth_accounts", [])[DEPOSITOR_ACCOUNT]
+        tx_hash = self._rpc(
+            "eth_sendTransaction", [{"from": sender, "to": to, "value": hex(amount)}]
+        )
+        self._wait(tx_hash, "ETH transfer")
+
+    def eth_balance(self, account: str) -> int:
+        return int(self._rpc("eth_getBalance", [account, "latest"]), 16)
 
     def usdc_balance(self, account: str) -> int:
         return int.from_bytes(self.call(USDC.address, "balanceOf(address)", ["address"], [account]))

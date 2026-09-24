@@ -8,13 +8,14 @@ are separate — they receive an instance and expose it.
 import os
 from dataclasses import dataclass
 
+from .api import LocalApi
 from .blockchain import ChainRegistry
 from .blockchain.rpc import RpcMonitor
 from .config import TeeSwapConfig
 from .crypto.attestation import Signer
 from .crypto.hpke import HpkeKeypair
 from .execution.engine import Engine
-from .execution.invoice import InvoiceRegistry, InvoiceView
+from .execution.invoice import InvoiceRegistry
 from .facilitator import FacilitatorMonitor
 from .mcp import Dispatcher, SessionManager
 from .tools import (
@@ -23,10 +24,8 @@ from .tools import (
     InvoiceTool,
     QuoteTool,
     QuoteX402Tool,
-    StatusResponse,
     StatusTool,
 )
-from .types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
 
 
 @dataclass
@@ -34,32 +33,6 @@ class KeyMaterial:
     signer: Signer
     hpke_keypair: HpkeKeypair
     evm_root_key: bytes
-
-
-class Api:
-    def __init__(
-        self,
-        quote_tool: QuoteTool,
-        accept_tool: AcceptTool,
-        status_tool: StatusTool,
-        invoice_tool: InvoiceTool,
-    ) -> None:
-        self._quote = quote_tool
-        self._accept = accept_tool
-        self._status = status_tool
-        self._invoice = invoice_tool
-
-    async def quote(self, request: QuoteRequest) -> QuoteResponse:
-        return await self._quote.execute(request)
-
-    async def accept(self, request: InvoiceRequest) -> AcceptResponse:
-        return await self._accept.execute(request)
-
-    async def status(self, request: InvoiceRequest) -> StatusResponse:
-        return await self._status.execute(request)
-
-    async def invoice(self, request: InvoiceRequest) -> InvoiceView:
-        return await self._invoice.execute(request)
 
 
 class TeeSwap:
@@ -103,10 +76,19 @@ class TeeSwap:
         self.dispatcher.register(quote_tool)
         self.dispatcher.register(accept_tool)
         self.dispatcher.register(status_tool)
+        quote_x402_tool = QuoteX402Tool(self.engine)
+        accept_x402_tool = AcceptX402Tool(self.engine)
         self.dispatcher.register(invoice_tool)
-        self.dispatcher.register(QuoteX402Tool(self.engine))
-        self.dispatcher.register(AcceptX402Tool(self.engine))
-        self.api = Api(quote_tool, accept_tool, status_tool, invoice_tool)
+        self.dispatcher.register(quote_x402_tool)
+        self.dispatcher.register(accept_x402_tool)
+        self.api = LocalApi(
+            quote_tool,
+            accept_tool,
+            quote_x402_tool,
+            accept_x402_tool,
+            status_tool,
+            invoice_tool,
+        )
 
     def start_background_tasks(self) -> None:
         self.facilitator_monitor.start()

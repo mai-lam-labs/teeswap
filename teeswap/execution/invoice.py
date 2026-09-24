@@ -17,17 +17,11 @@ import secrets
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from ..blockchain.chains import Chain
-from ..blockchain.evm import EthSigner
 from ..common import TeeSwapError
 from ..config import Operator
 from ..response import DataclassResponse
 from ..types import (
-    Address,
-    Amount,
     Balance,
-    Hex32,
-    HttpExchange,
     QuoteRequest,
     QuoteResponse,
     Timestamp,
@@ -36,7 +30,9 @@ from ..types import (
     TxHash,
 )
 from ..wire import WireStruct
-from .ledger import Custody, Holdings, Movement, MovementKind, Place, Position
+from .accounts import Accounts
+from .ledger import Custody, Holdings, Movement, MovementKind, Position
+from .worklog import Action, ActionView, StepId, WorkLog
 
 
 class InvoiceError(TeeSwapError):
@@ -65,110 +61,6 @@ class InvoiceId(str):
         return cls("inv_" + secrets.token_hex(12))
 
 
-# --- Work log ---
-
-
-class StepStatus(enum.StrEnum):
-    PENDING = "pending"
-    EXECUTING = "executing"
-    WAITING = "waiting"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-@dataclass(frozen=True, slots=True)
-class StepView(WireStruct):
-    operation: str
-    status: StepStatus
-    chain: Chain | None
-    started_at: Timestamp | None
-    completed_at: Timestamp | None
-    error: str | None
-    transactions: tuple[Transaction, ...]
-
-
-@dataclass(slots=True)
-class Step:
-    operation: str
-    chain: Chain | None
-    status: StepStatus = StepStatus.PENDING
-    started_at: Timestamp | None = None
-    completed_at: Timestamp | None = None
-    transactions: list[Transaction] = field(default_factory=list)
-    http_exchanges: list[HttpExchange] = field(default_factory=list)
-    error: str | None = None
-
-    def start(self) -> None:
-        self.status = StepStatus.EXECUTING
-        self.started_at = Timestamp.now()
-
-    def wait(self) -> None:
-        self.status = StepStatus.WAITING
-
-    def complete(self) -> None:
-        self.status = StepStatus.COMPLETED
-        self.completed_at = Timestamp.now()
-
-    def fail(self, error: str) -> None:
-        self.status = StepStatus.FAILED
-        self.completed_at = Timestamp.now()
-        self.error = error
-
-    def view(self) -> StepView:
-        return StepView(
-            operation=self.operation,
-            status=self.status,
-            chain=self.chain,
-            started_at=self.started_at,
-            completed_at=self.completed_at,
-            error=self.error,
-            transactions=tuple(self.transactions),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ActionView(WireStruct):
-    description: str
-    source_chain: Chain
-    destination_chain: Chain | None
-    steps: tuple[StepView, ...]
-
-
-@dataclass(slots=True)
-class Action:
-    description: str
-    source_chain: Chain
-    destination_chain: Chain | None
-    started_at: Timestamp = field(default_factory=Timestamp.now)
-    steps: list[Step] = field(default_factory=list)
-
-    def add_step(self, operation: str, chain: Chain | None = None) -> Step:
-        step = Step(operation=operation, chain=chain or self.source_chain)
-        self.steps.append(step)
-        return step
-
-    @property
-    def current_step(self) -> Step | None:
-        for step in reversed(self.steps):
-            if step.status in (StepStatus.EXECUTING, StepStatus.WAITING):
-                return step
-        return None
-
-    @property
-    def is_complete(self) -> bool:
-        return bool(self.steps) and all(
-            s.status in (StepStatus.COMPLETED, StepStatus.FAILED) for s in self.steps
-        )
-
-    def view(self) -> ActionView:
-        return ActionView(
-            description=self.description,
-            source_chain=self.source_chain,
-            destination_chain=self.destination_chain,
-            steps=tuple(step.view() for step in self.steps),
-        )
-
-
 # --- Invoice ---
 
 
@@ -177,8 +69,9 @@ class InvoiceStatus(enum.StrEnum):
     AWAITING_DEPOSIT = "awaiting_deposit"
     EXECUTING = "executing"
     DELIVERED = "delivered"
-    FAILED = "failed"
+    FAILED = "failed"  # the planner found no way to finish the job
     EXPIRED = "expired"
+    HALTED = "halted"  # stopped by the engine's guardrails: needs a human
 
 
 class Funding(enum.StrEnum):
@@ -216,6 +109,7 @@ class InvoiceOutput(WireStruct):
     balance: Balance
     status: OutputStatus
     transactions: tuple[Transaction, ...]
+    attempts: int  # transfers sent for it, including those that came back
 
 
 @dataclass(frozen=True)
@@ -226,6 +120,7 @@ class InvoiceView(DataclassResponse):
     operator: Operator
     funding: Funding
     status: InvoiceStatus
+    reason: str | None  # why the job ended, once it has
     created_at: Timestamp
     expires_at: Timestamp
     inputs: tuple[InvoiceInput, ...]
@@ -248,15 +143,16 @@ class Invoice:
     request: QuoteRequest
     quote: QuoteResponse
     operator: Operator
-    signer: EthSigner
+    accounts: Accounts
     funding: Funding
 
     status: InvoiceStatus = InvoiceStatus.QUOTED
+    reason: str | None = None
     # facilitators that failed an operation for this job; the planner won't pick them again
     excluded_facilitators: set[str] = field(default_factory=set)
 
     holdings: Holdings = field(default_factory=Holdings)
-    actions: list[Action] = field(default_factory=list)
+    worklog: WorkLog = field(default_factory=WorkLog)
     task: asyncio.Task[None] | None = field(default=None, repr=False)
     # held while an x402 payment settles, so one quote is never paid for twice
     payment_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -283,12 +179,17 @@ class Invoice:
         self.status = InvoiceStatus.AWAITING_DEPOSIT
         self.expires_at = Timestamp.now() + DEPOSIT_TTL
 
+    def finish(self, status: InvoiceStatus, reason: str) -> None:
+        self.status = status
+        self.reason = reason
+
     def view(self) -> InvoiceView:
         return InvoiceView(
             quote_id=str(self.id),
             operator=self.operator,
             funding=self.funding,
             status=self.status,
+            reason=self.reason,
             created_at=self.created_at,
             expires_at=self.expires_at,
             inputs=self.input_states(),
@@ -296,23 +197,17 @@ class Invoice:
             gas=self.quote.gas,
             holdings=self.holdings.positions,
             movements=self.holdings.movements,
-            actions=tuple(action.view() for action in self.actions),
+            actions=tuple(action.view() for action in self.worklog.actions),
         )
 
     # --- Goal and progress: the goal is the quote; progress is read from the holdings ---
 
-    def job_address(self, chain: Chain) -> Address:
-        """The address the job's key controls on `chain`."""
-        return Address(chain, self.signer.address)
-
-    def held(self, chain: Chain) -> Place:
-        return Place(address=self.job_address(chain), custody=Custody.HELD)
-
     @property
     def deposits(self) -> tuple[Balance, ...]:
+        """Each input, at the account it's deposited to."""
         return tuple(
-            Balance(amount=inp, address=self.job_address(inp.token.chain))
-            for inp in self.quote.inputs
+            Balance(amount=inp, address=self.accounts.input(i, inp.token.chain).address)
+            for i, inp in enumerate(self.quote.inputs)
         )
 
     def input_states(self) -> tuple[InvoiceInput, ...]:
@@ -320,7 +215,7 @@ class Invoice:
         for deposit in self.deposits:
             token = deposit.amount.token
             received = self.holdings.received(token, deposit.address)
-            if received >= deposit.amount.amount:
+            if received.amount.amount >= deposit.amount.amount:
                 status = InputStatus.RECEIVED
             elif self.status == InvoiceStatus.EXPIRED:
                 status = InputStatus.EXPIRED
@@ -329,7 +224,7 @@ class Invoice:
             states.append(
                 InvoiceInput(
                     deposit=deposit,
-                    received=TokenAmount(token=token, amount=Amount(received)),
+                    received=received.amount,
                     status=status,
                 )
             )
@@ -347,10 +242,12 @@ class Invoice:
         for goal in self.quote.outputs:
             status = OutputStatus.PENDING
             transactions: list[Transaction] = []
+            tries = 0
             for i, attempt in enumerate(attempts):
                 if i in claimed or attempt.balance != goal:
                     continue
                 claimed.add(i)
+                tries += 1
                 transactions.extend(attempt.transactions)
                 if attempt.outcome == Custody.DELIVERED:
                     status = OutputStatus.DELIVERED
@@ -359,7 +256,12 @@ class Invoice:
                     status = OutputStatus.SUBMITTED
                     break
             states.append(
-                InvoiceOutput(balance=goal, status=status, transactions=tuple(transactions))
+                InvoiceOutput(
+                    balance=goal,
+                    status=status,
+                    transactions=tuple(transactions),
+                    attempts=tries,
+                )
             )
         return tuple(states)
 
@@ -371,8 +273,12 @@ class Invoice:
         )
 
     @property
+    def is_delivered(self) -> bool:
+        return all(out.status == OutputStatus.DELIVERED for out in self.output_states())
+
+    @property
     def current_action(self) -> Action | None:
-        for action in reversed(self.actions):
+        for action in reversed(self.worklog.actions):
             if not action.is_complete:
                 return action
         return None
@@ -390,24 +296,24 @@ class _TransferAttempt:
 
 
 def _transfer_attempts(movements: tuple[Movement, ...]) -> list[_TransferAttempt]:
-    """Every transfer sent (held -> in flight), with where its funds ended up and the
-    on-chain transactions involved."""
-    outcomes: dict[Hex32, Custody] = {}
-    transactions: dict[Hex32, dict[TxHash, Transaction]] = {}
+    """Every transfer sent (held -> in flight, by a work-log step), with where its funds
+    ended up and the on-chain transactions involved."""
+    outcomes: dict[StepId, Custody] = {}
+    transactions: dict[StepId, dict[TxHash, Transaction]] = {}
     for m in movements:
         for place in (m.source, m.destination):
-            if place is None or place.custody != Custody.IN_FLIGHT or place.reference is None:
+            if place is None or place.custody != Custody.IN_FLIGHT or place.step is None:
                 continue
             if m.transaction is not None:
                 tx = Transaction(
                     chain=place.address.chain, hash=m.transaction, timestamp=m.timestamp
                 )
-                transactions.setdefault(place.reference, {}).setdefault(m.transaction, tx)
-        if m.source is not None and m.source.custody == Custody.IN_FLIGHT and m.source.reference:
-            outcomes[m.source.reference] = m.destination.custody
+                transactions.setdefault(place.step, {}).setdefault(m.transaction, tx)
+        if m.source is not None and m.source.custody == Custody.IN_FLIGHT and m.source.step:
+            outcomes[m.source.step] = m.destination.custody
     attempts: list[_TransferAttempt] = []
     for m in movements:
-        ref = m.destination.reference
+        ref = m.destination.step
         if m.kind != MovementKind.TRANSIT or m.destination.custody != Custody.IN_FLIGHT or not ref:
             continue
         attempts.append(
@@ -429,7 +335,7 @@ class InvoiceRegistry:
         self._invoices: dict[InvoiceId, Invoice] = {}
 
     def create_quote(
-        self, request: QuoteRequest, quote: QuoteResponse, signer: EthSigner, funding: Funding
+        self, request: QuoteRequest, quote: QuoteResponse, accounts: Accounts, funding: Funding
     ) -> Invoice:
         inv_id = InvoiceId(quote.quote_id)
         now = Timestamp.now()
@@ -440,7 +346,7 @@ class InvoiceRegistry:
             request=request,
             quote=quote,
             operator=self._operator,
-            signer=signer,
+            accounts=accounts,
             funding=funding,
         )
         self._invoices[inv_id] = invoice

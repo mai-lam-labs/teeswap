@@ -41,7 +41,7 @@ from .mcp import (
     handle_mcp_request,
     parse_message,
 )
-from .response import ToolResponse
+from .response import ErrorResponse, ToolResponse
 from .schema import SCHEMA_PLUGINS, schema_object_for_type
 from .wire import HasFromDict, WireError, decode_object, encode
 from .x402 import (
@@ -74,25 +74,24 @@ def _hydrate[T](parse: Callable[[dict[str, Any]], T], raw: bytes) -> T:
 # --- Error bodies: ours, not Litestar's ---
 
 
-def _error_response(status_code: int, message: str) -> Response[bytes]:
-    return Response(
-        content=encode({"error": message}), status_code=status_code, media_type=MediaType.JSON
-    )
+def _error_response(status_code: int, error: ErrorResponse) -> Response[bytes]:
+    return Response(content=encode(error), status_code=status_code, media_type=MediaType.JSON)
 
 
 def _on_error(_: Request[Any, Any, Any], exc: Exception) -> Response[bytes]:
     match exc:
         case RequestError():
-            return _error_response(HTTP_400_BAD_REQUEST, str(exc))
+            return _error_response(HTTP_400_BAD_REQUEST, ErrorResponse.of(exc))
         case InvoiceNotFoundError():
-            return _error_response(HTTP_404_NOT_FOUND, str(exc))
+            return _error_response(HTTP_404_NOT_FOUND, ErrorResponse.of(exc))
         case TeeSwapError():
-            return _error_response(HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+            return _error_response(HTTP_422_UNPROCESSABLE_ENTITY, ErrorResponse.of(exc))
         case HTTPException():
-            return _error_response(exc.status_code, exc.detail)
+            return _error_response(exc.status_code, ErrorResponse(code=None, message=exc.detail))
         case _:
             logger.error("unhandled error", exc_info=exc)
-            return _error_response(HTTP_500_INTERNAL_SERVER_ERROR, "internal error")
+            internal = ErrorResponse(code=None, message="internal error")
+            return _error_response(HTTP_500_INTERNAL_SERVER_ERROR, internal)
 
 
 def _operation_with_request_body(input_type: type[HasFromDict]) -> type[Operation]:

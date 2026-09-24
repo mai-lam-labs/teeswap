@@ -78,16 +78,18 @@ crypto/attestation.py    AttestationError
 crypto/vaportpm.py         VaportpmError / VaportpmParseError
 blockchain/evm.py        EvmError
                            SigningError
+blockchain/derivation.py UnsupportedChainError
 facilitator.py           FacilitatorError
 execution/invoice.py     InvoiceError
                            InvoiceNotFoundError / InvoiceExpiredError / InvoiceStateError
                              InvoiceFundingError
+execution/accounts.py    AccountError
 execution/ledger.py      LedgerError
 execution/planner.py     RouteError
                            NoRouteError
 execution/quote.py       QuoteError
 execution/operations.py  OperationError
-execution/engine.py      X402SettlementError
+execution/engine.py      GuardrailError / X402SettlementError
 mcp.py                   ToolNotFoundError / ToolNotAvailableError / InvalidToolArgumentsError
 app.py                   RequestError
 ```

@@ -14,6 +14,7 @@ from litestar import MediaType, Response, Router, get
 from litestar.params import Parameter
 from litestar.status_codes import HTTP_200_OK, HTTP_404_NOT_FOUND
 
+from ..execution.effects import SideEffectView
 from ..execution.invoice import InvoiceId, InvoiceNotFoundError, InvoiceRegistry, InvoiceView
 from ..types import Timestamp
 from .html import (
@@ -127,6 +128,8 @@ _STATUS_BADGE: dict[str, str] = {
     "delivered": "badge-success",
     "failed": "badge-danger",
     "expired": "badge-muted",
+    "halted": "badge-danger",
+    "waiting": "badge-warning",
 }
 
 
@@ -143,6 +146,16 @@ def _fmt_token(symbol: str, contract: str | None, chain_caip2: str) -> str:
     if contract:
         return f"{symbol} ({contract}) on {chain_caip2}"
     return f"{symbol} (native) on {chain_caip2}"
+
+
+def _effect_outcome(effect: SideEffectView) -> str:
+    if effect.landed is not None:
+        return effect.landed
+    if effect.void is not None:
+        return f"void: {effect.void}"
+    if effect.error is not None:
+        return f"unknown (send failed: {effect.error})"
+    return "pending"
 
 
 def _fmt_time(ts: Timestamp | None) -> str:
@@ -251,10 +264,7 @@ def render_invoice_html(invoice: InvoiceView) -> str:
         if invoice.actions:
             h2("Work Log")
             for action in invoice.actions:
-                chain_label = action.source_chain.caip2
-                if action.destination_chain:
-                    chain_label += f" → {action.destination_chain.caip2}"
-                h3(f"{action.description} — {chain_label}")
+                h3(f"{action.description} — {action.source_chain.caip2}")
 
                 with div(cls="timeline"):
                     for step in action.steps:
@@ -284,18 +294,24 @@ def render_invoice_html(invoice: InvoiceView) -> str:
                                     style="color:var(--danger);font-size:0.75rem;margin:4px 0 0",
                                 )
 
-                            if step.transactions:
+                            if step.side_effects:
                                 with table():
                                     with thead(), tr():
-                                        th("Chain")
-                                        th("Transaction")
-                                        th("Time")
+                                        th("Side effect")
+                                        th("Sent to")
+                                        th("Sent")
+                                        th("Outcome")
                                     with tbody():
-                                        for tx in step.transactions:
+                                        for effect in step.side_effects:
                                             with tr():
-                                                td(f"{tx.chain.name} ({tx.chain.caip2})")
-                                                td(tx.hash, cls="mono")
-                                                td(_fmt_time(tx.timestamp))
+                                                td(effect.kind.value)
+                                                td(effect.target, cls="mono")
+                                                td(
+                                                    _fmt_time(effect.sent_at)
+                                                    if effect.sent_at
+                                                    else "not sent"
+                                                )
+                                                td(_effect_outcome(effect), cls="mono")
 
         # --- Quote estimates ---
         h2("Quote Estimates")

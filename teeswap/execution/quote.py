@@ -10,14 +10,13 @@ The quote carries the grouped form, so each invoice input is a distinct token.
 
 from collections.abc import Callable
 
-from eth_typing import ChecksumAddress
-
 from ..blockchain.chains import Chain
 from ..blockchain.evm import EvmChain
 from ..blockchain.rpc import JsonRpcError
 from ..common import TeeSwapError
 from ..http import BaseHttpClient
 from ..types import Amount, Balance, QuoteRequest, QuoteResponse, Timestamp, Token, TokenAmount, Url
+from .accounts import Accounts
 from .invoice import QUOTE_TTL, Funding, InvoiceId
 from .planner import FacilitatorsFor, provisional_plan
 
@@ -31,22 +30,20 @@ async def compute_quote(
     rpc_url_for: Callable[[Chain], Url],
     request: QuoteRequest,
     quote_id: InvoiceId,
-    job_address: ChecksumAddress,
+    accounts: Accounts,
     funding: Funding,
     facilitators_for: FacilitatorsFor,
 ) -> QuoteResponse:
-    """Quote a job whose funds will be held at `job_address` (not yet funded)."""
+    """Quote a job whose funds will be held in `accounts` (not yet funded)."""
     inputs = _group_by_token(request.inputs)
 
     def evm_for(chain: Chain) -> EvmChain:
         return EvmChain(chain, client, rpc_url_for(chain))
 
     costs: list[TokenAmount] = []
-    for operation in provisional_plan(
-        inputs, request.outputs, job_address, funding, facilitators_for
-    ):
+    for operation in provisional_plan(inputs, request.outputs, accounts, funding, facilitators_for):
         try:
-            costs += await operation.estimate_costs(evm_for, job_address)
+            costs += await operation.estimate_costs(evm_for)
         except JsonRpcError as e:
             raise QuoteError(f"cannot {operation.description}: {e.rpc_message}") from e
 
@@ -77,7 +74,7 @@ async def compute_quote(
         gas=TokenAmount(token=supplied.token, amount=Amount(spent)),
         plan=tuple(
             op.description
-            for op in provisional_plan(inputs, outputs, job_address, funding, facilitators_for)
+            for op in provisional_plan(inputs, outputs, accounts, funding, facilitators_for)
         ),
         expires_at=Timestamp.now() + QUOTE_TTL,
     )

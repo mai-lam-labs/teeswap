@@ -221,7 +221,7 @@ def render_invoices(registry: InvoiceRegistry) -> str:
                         css = (
                             "up"
                             if inv.is_active
-                            else ("down" if inv.status.value == "failed" else "warn")
+                            else ("down" if inv.status.value in ("failed", "halted") else "warn")
                         )
                         current = inv.current_action
                         with tr():
@@ -233,7 +233,7 @@ def render_invoices(registry: InvoiceRegistry) -> str:
                             td(f"{len(inv.request.outputs)} output(s)")
                             deposits = [d.address.value[:10] + "…" for d in inv.deposits]
                             td(", ".join(deposits) or "—", cls="mono")
-                            td(str(len(inv.actions)))
+                            td(str(len(inv.worklog.actions)))
                             td(current.description if current else "—")
                             td(inv.created_at.dt.strftime("%Y-%m-%d %H:%M"), cls="age")
     return str(doc)

@@ -15,8 +15,15 @@ A job (the invoice) has:
 - **In-flight actions**: started and not yet finished.
 - **Work log**: the record of every action and what it moved.
 
-Each job has its own key material (a signer derived inside the TEE). The
-addresses it controls are where funds are held while Mai works on them.
+- **Accounts**: the addresses the job controls, where funds are held while
+  Mai works on them.
+
+A job has no single address. Each account is a key on one chain, of that
+chain's own key type, derived inside the TEE from the job's seed for a
+purpose (each input gets its own deposit account). Two chains with different
+key types give accounts with nothing in common, not even their format. An
+action asks for the account it needs; asking again returns the same one. A
+chain whose key type Mai can't make has no accounts, so it can't be routed.
 
 ## Holdings and custody
 
@@ -25,7 +32,7 @@ custody state that answers "who can move this right now?":
 
 | Custody | Meaning |
 |---|---|
-| held | at the job's own address; the job's key controls it |
+| held | at one of the job's accounts; the job controls it |
 | in flight | committed to something not yet final (a sent transaction, an order, a bridge deposit), with its reference so it can be checked and resumed |
 | delivered | at a recipient; it has left custody |
 | consumed | spent: gas, protocol fees |
@@ -41,10 +48,26 @@ reports what actually happened as movements, from its own evidence: what
 arrived at the address, a transaction receipt, a settlement result. Actions
 own the truth about their effects; nothing else second-guesses them.
 
-Before any side effect an action records its intent (e.g. the transaction it is
-about to send). An action interrupted mid-flight can then resume by checking
-its recorded reference instead of acting again. No side effect is ever
-repeated blindly.
+An action is made of **steps**, and a step may perform **side effects**: each
+act of reaching the outside world (a transaction broadcast to a node, an
+authorization handed to a facilitator, later an order posted or a file
+uploaded). A side effect is recorded on its step before it is performed, with
+what is needed to perform it again or check it. Funds it commits are in flight
+against that step, and the ledger points at the step.
+
+Side effects that repeat the same act share an **idempotency key** that the
+outside world enforces: a transaction's account and nonce, an EIP-3009
+authorization's nonce, an order's id. However many times it was sent, at most
+one takes effect. Retrying means sending the same thing again under the same
+key (the same signed bytes to another node, the same authorization to another
+facilitator), never a new act while the old one could still land.
+
+"Did it take effect?" is asked per key, of whoever enforces it, and only it can
+answer: it **landed** (with the evidence), it is **void** (it never can: the
+nonce went to another transaction, the authorization expired unused), or it is
+still **pending**. A request that failed or timed out is not an answer: the
+other side may have carried it out anyway. A step whose side effects haven't
+resolved is waiting; it is resolved by watching, never by acting again.
 
 Funds arriving unasked for (dust, a second deposit) are noticed by the next
 action that reads that address, and anything left at the end by the final
@@ -52,10 +75,22 @@ action; they are recorded as movements like everything else.
 
 ## The engine
 
-The engine is only the process machine. It starts planned actions that are
-ready (possibly several at once), applies the movements each one reports, and
-handles re-evaluation. It knows nothing about chains, tokens or gas; actions
-and the planner do.
+The engine runs whatever the planner scheduled and applies what it reports.
+When the scheduled work is done, or a step of it fails, it asks the planner
+again. It knows nothing about chains, tokens or gas, and it decides nothing
+about the job: each action reports how its own steps ended, and the planner
+decides what happens next, including that the job is finished (delivered,
+expired, or failed for lack of a route or after repeated attempts).
+
+The engine's own role is a guardrail for what is truly broken rather than
+merely unsuccessful: an error escaping an action or the planner, books that
+don't add up, an action that ends without reporting how, a planner with
+nothing to do for an unfinished job, passes that make no progress. Then it
+**halts** the job: it stops moving money, leaves everything where the holdings
+say it is, and records why, for a human to look at.
+
+The invoice and its work log are the record of all this, for introspection.
+Actions report into them; nothing reads them back to decide what to do.
 
 ## Plans and re-evaluation
 
@@ -68,9 +103,12 @@ an outcome is off-plan (a short fill, a gas spike, a price move), or re-planning
 is asked for. Then she:
 
 1. stops starting new actions;
-2. lets in-flight actions finish, since a sent transaction can't be unsent and
+2. resolves every waiting step, since a side effect can't be taken back and
    its outcome must land in the holdings first;
 3. plans afresh from the holdings; the new plan replaces what remained.
+
+The job is delivered when every output is, not merely when nothing is left to
+plan.
 
 **Recovery is the same thing.** After a restart, in-flight actions resume from
 their records and report their movements, then Mai re-plans from the holdings.
@@ -89,10 +127,10 @@ together with fees and refunds.
 
 | Input | Output | How |
 |---|---|---|
-| ETH, by deposit | ETH, same chain | Mai sends transfers from the job's address, paying gas from the held ETH; gas is estimated by simulating each transfer |
-| USDC, by x402 or deposit | USDC, same chain | an x402 payment is settled into the job's address by a facilitator; for outputs Mai signs EIP-3009 authorizations from that address and a facilitator settles them, paying gas |
+| ETH, by deposit | ETH, same chain | Mai sends transfers from the input's account, paying gas from the held ETH; gas is estimated by simulating each transfer |
+| USDC, by x402 or deposit | USDC, same chain | an x402 payment is settled into the input's account by a facilitator; for outputs Mai signs EIP-3009 authorizations from that account and a facilitator settles them, paying gas |
 
-The USDC path never needs ETH at the job's address. Facilitators are free
+The USDC path never needs ETH in the job's accounts. Facilitators are free
 (x402 defines no facilitator fees), so a facilitated transfer costs the job
 nothing. One that fails a job's transfer is excluded from that job, and Mai
 re-plans with the next (see X402.md, "Selection"). When the outcome of a

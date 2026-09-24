@@ -5,11 +5,17 @@ the MCP and HTTP layers add the resource (they know where the call was made)
 and render the PaymentRequired in their own transport.
 """
 
+import abc
+import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, override
 
+from eth_utils.address import to_checksum_address
+
+from .blockchain.evm import EthSigner, TransferAuthorization
+from .common import TeeSwapError
 from .response import ToolResponse
-from .types import Amount
+from .types import Amount, Hex32, Timestamp
 from .wire import WireStruct
 
 X402_VERSION = 2
@@ -102,3 +108,96 @@ class X402PaymentResult:
 
     response: ToolResponse
     settlement: SettleResponse
+
+
+class PaymentError(TeeSwapError):
+    pass
+
+
+class PaymentNotSettledError(PaymentError):
+    """A payment was sent and not settled; the resource asks to be paid again."""
+
+
+# --- Paying (the client side) ---
+
+
+class Payer(abc.ABC):
+    """What pays for a resource: picks a requirement it can fund, and signs it."""
+
+    @abc.abstractmethod
+    async def pay(self, required: PaymentRequired) -> PaymentPayload: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SignedPayment:
+    """An `exact` EVM payment: the payload to send, and the EIP-3009 authorization in it."""
+
+    payload: PaymentPayload
+    authorization: TransferAuthorization
+    signature: bytes
+
+
+def sign_exact_evm(
+    signer: EthSigner,
+    resource: ResourceInfo,
+    requirements: PaymentRequirements,
+    valid_after: int,
+    valid_before: int,
+    nonce: Hex32,
+) -> SignedPayment:
+    """Sign `requirements` (scheme `exact`, an eip155 network) as an EIP-3009 transfer.
+
+    The token's signing domain comes with the requirements, in `extra`.
+    """
+    family, _, reference = requirements.network.partition(":")
+    name = requirements.extra.get("name")
+    version = requirements.extra.get("version")
+    if requirements.scheme != "exact" or family != "eip155":
+        raise PaymentError(
+            f"not an exact EVM payment: {requirements.scheme} on {requirements.network}"
+        )
+    if not isinstance(name, str) or not isinstance(version, str):
+        raise PaymentError("exact EVM requirements need the token's name and version in extra")
+    authorization = TransferAuthorization(
+        sender=signer.address,
+        recipient=to_checksum_address(requirements.payTo),
+        value=requirements.amount,
+        valid_after=valid_after,
+        valid_before=valid_before,
+        nonce=nonce,
+    )
+    token = to_checksum_address(requirements.asset)
+    signature = authorization.sign(signer, (name, version), int(reference), token)
+    payload = PaymentPayload(
+        x402Version=X402_VERSION,
+        resource=resource,
+        accepted=requirements,
+        payload={"signature": "0x" + signature.hex(), "authorization": authorization.wire()},
+    )
+    return SignedPayment(payload=payload, authorization=authorization, signature=signature)
+
+
+class EvmPayer(Payer):
+    """Pays `exact` requirements on EVM networks (EIP-3009) from one key."""
+
+    def __init__(self, signer: EthSigner) -> None:
+        self._signer = signer
+
+    @property
+    def address(self) -> str:
+        return self._signer.address
+
+    @override
+    async def pay(self, required: PaymentRequired) -> PaymentPayload:
+        for requirements in required.accepts:
+            if requirements.scheme == "exact" and requirements.network.startswith("eip155:"):
+                now = int(Timestamp.now().dt.timestamp())
+                return sign_exact_evm(
+                    self._signer,
+                    required.resource,
+                    requirements,
+                    valid_after=now - 60,
+                    valid_before=now + requirements.maxTimeoutSeconds,
+                    nonce=Hex32.from_bytes(os.urandom(32)),
+                ).payload
+        raise PaymentError("none of the payment requirements can be paid from an EVM key")

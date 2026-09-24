@@ -61,7 +61,7 @@ KVM_GID   := $(shell stat -c %g /dev/kvm 2>/dev/null || echo "")
 KVM_MOUNT := $(shell test -e /dev/kvm && echo "-v /dev/kvm:/dev/kvm")
 DOCKER_OPT_KVM := $(if $(KVM_GID),--group-add $(KVM_GID)) $(KVM_MOUNT)
 
-.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage check ci build anvil-fetch anvil-run anvil-start anvil-stop facilitator-start facilitator-stop clean distclean
+.PHONY: help install uv-bootstrap lint format format-check typecheck test coverage coverage-run check ci build anvil-fetch anvil-run anvil-start anvil-stop facilitator-start facilitator-stop clean distclean
 
 help:
 	@echo "targets: install | check | bundle-<arch> | payload-<arch> | boot-<arch> | clean | distclean"
@@ -94,7 +94,12 @@ typecheck:
 test:
 	"$(PY)" -m pytest $(SRC)/tests -q --tb=short --no-header --durations=0 -vv
 
-coverage:
+# the tests need anvil and the facilitator: started here, stopped after, as for check
+coverage: anvil-start
+	$(MAKE) facilitator-start && $(MAKE) coverage-run; rc=$$?; \
+	  $(MAKE) facilitator-stop anvil-stop; exit $$rc
+
+coverage-run:
 	"$(PY)" -m coverage run --source=$(SRC) -m pytest $(SRC)/tests -q --tb=short --no-header
 	"$(PY)" -m coverage report -m --fail-under=70
 

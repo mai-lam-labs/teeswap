@@ -4,10 +4,9 @@ Uses eth-abi for ABI encoding and eth-account for signing. No external
 binaries — everything runs in-process. RPC calls use the shared jsonrpc helper.
 """
 
-import asyncio
 import hmac
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, override
 
 from eth_abi.abi import decode, encode
 from eth_account import Account
@@ -15,11 +14,13 @@ from eth_account.signers.local import LocalAccount
 from eth_typing import BlockNumber, ChainId, ChecksumAddress, Hash32, HexStr
 from eth_utils.abi import function_signature_to_4byte_selector
 from eth_utils.address import to_checksum_address
+from eth_utils.crypto import keccak
 
 from ..common import TeeSwapError
 from ..http import BaseHttpClient
 from ..types import Hex32, Token, Url
 from .chains import Chain, ChainFamily
+from .keys import ChainKey
 from .rpc import jsonrpc
 
 
@@ -58,6 +59,14 @@ class Receipt:
 class SignedTransaction:
     raw_tx: bytes
     tx_hash: Hash32
+    sender: ChecksumAddress
+    nonce: int
+
+
+@dataclass(frozen=True, slots=True)
+class Block:
+    number: int
+    timestamp: int  # seconds since the epoch, as the chain records it
 
 
 # --- ABI encoding ---
@@ -78,7 +87,7 @@ def _selector(signature: str) -> bytes:
 # --- Signer ---
 
 
-class EthSigner:
+class EthSigner(ChainKey):
     __slots__ = ("_account", "_private_key")
 
     def __init__(self, private_key: bytes) -> None:
@@ -91,6 +100,7 @@ class EthSigner:
         return cls(child_key)
 
     @property
+    @override
     def address(self) -> ChecksumAddress:
         return self._account.address
 
@@ -119,6 +129,8 @@ class EthSigner:
         return SignedTransaction(
             raw_tx=bytes(signed.raw_transaction),
             tx_hash=Hash32(bytes(signed.hash)),
+            sender=self.address,
+            nonce=int(tx["nonce"]),
         )
 
 
@@ -201,11 +213,15 @@ class EvmRpcClient:
             timeout=30,
         )
 
-    async def get_nonce(self, address: ChecksumAddress) -> int:
-        result = await jsonrpc(
-            self._client, self._url, "eth_getTransactionCount", [address, "pending"]
-        )
+    async def get_nonce(self, address: ChecksumAddress, block: str = "pending") -> int:
+        result = await jsonrpc(self._client, self._url, "eth_getTransactionCount", [address, block])
         return int(result, 16)
+
+    async def get_latest_block(self) -> dict[str, Any]:
+        return await jsonrpc(self._client, self._url, "eth_getBlockByNumber", ["latest", False])
+
+    async def get_logs(self, log_filter: dict[str, Any]) -> list[dict[str, Any]]:
+        return await jsonrpc(self._client, self._url, "eth_getLogs", [log_filter])
 
     async def get_balance(self, address: ChecksumAddress) -> int:
         result = await jsonrpc(self._client, self._url, "eth_getBalance", [address, "latest"])
@@ -225,8 +241,8 @@ class EvmRpcClient:
         return BlockNumber(int(result, 16))
 
 
-RECEIPT_POLL_SECONDS = 0.5
-RECEIPT_ATTEMPTS = 120
+# EIP-3009 event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce)
+_AUTHORIZATION_USED = keccak(text="AuthorizationUsed(address,bytes32)")
 
 # enough to cover value + gas for any simulated call, when the sender isn't funded yet
 _SIMULATED_BALANCE = hex(2**200)
@@ -331,14 +347,41 @@ class EvmChain:
     async def submit(self, tx: SignedTransaction) -> None:
         await self._rpc.submit_tx(tx.raw_tx)
 
-    async def wait_receipt(self, tx_hash: Hash32) -> Receipt:
-        for _ in range(RECEIPT_ATTEMPTS):
-            raw = await self._rpc.get_receipt(tx_hash)
-            if raw is not None:
-                return Receipt(
-                    success=raw["status"] == "0x1",
-                    gas_used=int(raw["gasUsed"], 16),
-                    effective_gas_price=int(raw["effectiveGasPrice"], 16),
-                )
-            await asyncio.sleep(RECEIPT_POLL_SECONDS)
-        raise EvmError(f"no receipt for 0x{tx_hash.hex()}")
+    async def receipt(self, tx_hash: Hash32) -> Receipt | None:
+        """The receipt, once the transaction is mined; None until then."""
+        raw = await self._rpc.get_receipt(tx_hash)
+        if raw is None:
+            return None
+        return Receipt(
+            success=raw["status"] == "0x1",
+            gas_used=int(raw["gasUsed"], 16),
+            effective_gas_price=int(raw["effectiveGasPrice"], 16),
+        )
+
+    async def confirmed_nonce(self, address: ChecksumAddress) -> int:
+        """How many of the address's transactions are mined: its next nonce as of the latest block."""
+        return await self._rpc.get_nonce(address, "latest")
+
+    async def latest_block(self) -> Block:
+        raw = await self._rpc.get_latest_block()
+        return Block(number=int(raw["number"], 16), timestamp=int(raw["timestamp"], 16))
+
+    async def authorization_transaction(
+        self, contract: ChecksumAddress, authorizer: ChecksumAddress, nonce: Hex32, from_block: int
+    ) -> Hash32 | None:
+        """EIP-3009: the transaction that used `authorizer`'s authorization `nonce`, if any."""
+        logs = await self._rpc.get_logs(
+            {
+                "address": contract,
+                "fromBlock": hex(from_block),
+                "toBlock": "latest",
+                "topics": [
+                    "0x" + _AUTHORIZATION_USED.hex(),
+                    "0x" + encode(["address"], [authorizer]).hex(),
+                    nonce,
+                ],
+            }
+        )
+        if not logs:
+            return None
+        return Hash32(bytes.fromhex(logs[0]["transactionHash"].removeprefix("0x")))

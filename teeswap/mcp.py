@@ -18,7 +18,7 @@ from .crypto.attestation import (
     Signer,
 )
 from .crypto.hpke import HpkeKeypair
-from .response import ToolResponse
+from .response import ErrorResponse, ToolResponse
 from .schema import schema_for_type
 from .wire import HasFromDict, WireError, encode, parse_json
 from .x402 import (
@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_VERSIONS = ("2025-11-25", "2026-07-28")
 PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion"
+# a domain error's ErrorResponse in an isError result's _meta, so clients can raise its type
+ERROR_META_KEY = f"{PKG_NAME}/error"
 
 SESSION_TTL_SECONDS = 3600
 
@@ -396,7 +398,7 @@ def _error(
     req_id: str | int | None,
     code: int,
     message: str,
-    data: dict[str, Any] | None = None,
+    data: ErrorResponse | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     err: dict[str, Any] = {"code": code, "message": message}
     if data is not None:
@@ -538,9 +540,9 @@ async def _handle_tools_call(
             params.name, params.arguments, params.payment, has_session=has_session
         )
     except (ToolNotFoundError, ToolNotAvailableError) as e:
-        return McpResult(body=_error(req_id, -32601, str(e)))
+        return McpResult(body=_error(req_id, -32601, str(e), ErrorResponse.of(e)))
     except InvalidToolArgumentsError as e:
-        return McpResult(body=_error(req_id, -32602, str(e)))
+        return McpResult(body=_error(req_id, -32602, str(e), ErrorResponse.of(e)))
     except TeeSwapError as e:
         # a domain failure is a tool result the model can see and act on, not a protocol error
         return _attested_result(dispatcher, req_id, params, _error_content(e))
@@ -551,7 +553,12 @@ async def _handle_tools_call(
 
 
 def _error_content(error: TeeSwapError) -> RenderedOutcome:
-    return RenderedOutcome(content=[{"type": "text", "text": str(error)}], fields={"isError": True})
+    """A domain error as a tool result: its message for the model, its code in _meta."""
+    return RenderedOutcome(
+        content=[{"type": "text", "text": str(error)}],
+        fields={"isError": True},
+        meta={ERROR_META_KEY: ErrorResponse.of(error)},
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -634,15 +641,15 @@ async def _handle_blind_call(
     except (DaciteError, ValueError, TypeError, cryptography.exceptions.InvalidTag) as e:
         return McpResult(body=_error(req_id, -32602, f"decryption failed: {e}"))
     except AttestationError as e:
-        return McpResult(body=_error(req_id, -32602, str(e)))
+        return McpResult(body=_error(req_id, -32602, str(e), ErrorResponse.of(e)))
 
     try:
         outcome = await dispatcher.call(params.name, decrypted.arguments, params.payment)
         rendered = _render_outcome(dispatcher, params.name, outcome)
     except ToolNotFoundError as e:
-        return McpResult(body=_error(req_id, -32601, str(e)))
+        return McpResult(body=_error(req_id, -32601, str(e), ErrorResponse.of(e)))
     except InvalidToolArgumentsError as e:
-        return McpResult(body=_error(req_id, -32602, str(e)))
+        return McpResult(body=_error(req_id, -32602, str(e), ErrorResponse.of(e)))
     except TeeSwapError as e:
         rendered = _error_content(e)
 

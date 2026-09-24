@@ -14,12 +14,11 @@ The reaper runs alongside and expires stale quotes.
 import asyncio
 import logging
 
-from eth_typing import ChecksumAddress
 from eth_utils.address import to_checksum_address
 
 from .. import facilitator
 from ..blockchain.chains import Chain
-from ..blockchain.evm import EthSigner, EvmChain
+from ..blockchain.evm import EvmChain
 from ..common import TeeSwapError
 from ..facilitator import FacilitatorError, FacilitatorMonitor
 from ..http import BaseHttpClient, HttpClient, RecordingClient
@@ -31,27 +30,33 @@ from ..x402 import (
     X402PaymentResult,
     X402PaymentSpec,
 )
+from .accounts import Accounts
 from .invoice import (
-    Action,
     Funding,
     Invoice,
-    InvoiceExpiredError,
     InvoiceId,
     InvoiceRegistry,
     InvoiceStatus,
 )
-from .ledger import Movement, MovementKind
+from .ledger import Custody, Movement, MovementKind, Place
 from .operations import Operation, OperationContext
-from .planner import FacilitatorsFor, NoRouteError, plan
+from .planner import FacilitatorsFor, Finished, NoRouteError, decide
 from .quote import compute_quote
+from .worklog import StepReport, StepStatus
 
 logger = logging.getLogger(__name__)
 
 REAPER_INTERVAL = 60.0
-MAX_REPLANS = 3
+# passes that ran operations but moved nothing, before the engine halts the job
+MAX_STALLED_PASSES = 3
+STALL_BACKOFF_SECONDS = 5.0
 X402_SCHEME = "exact"
 # how long a client's payment authorization must stay valid for Mai to settle it
 PAYMENT_TIMEOUT_SECONDS = 300
+
+
+class GuardrailError(TeeSwapError):
+    """Something is truly broken (not merely unsuccessful): the engine halts the job."""
 
 
 class X402SettlementError(TeeSwapError):
@@ -84,26 +89,21 @@ class Engine:
     def _facilitators_for_job(self, invoice: Invoice) -> FacilitatorsFor:
         return lambda chain: self.facilitators_for(chain, invoice.excluded_facilitators)
 
-    def _signer(self, invoice_id: InvoiceId) -> EthSigner:
-        return EthSigner.derive(self._root_key, invoice_id.encode())
-
-    def deposit_address(self, invoice_id: InvoiceId) -> ChecksumAddress:
-        return self._signer(invoice_id).address
-
     async def quote(self, request: QuoteRequest, funding: Funding) -> QuoteResponse:
         """Quote the request and hold it as an invoice, ready to accept."""
         quote_id = InvoiceId.generate()
+        accounts = Accounts.for_job(self._root_key, quote_id)
         async with HttpClient() as client:
             quote = await compute_quote(
                 client,
                 self.rpc_url_for_chain,
                 request,
                 quote_id,
-                self.deposit_address(quote_id),
+                accounts,
                 funding,
                 lambda chain: self.facilitators_for(chain, set()),
             )
-        self._registry.create_quote(request, quote, self._signer(quote_id), funding)
+        self._registry.create_quote(request, quote, accounts, funding)
         return quote
 
     def accept(self, invoice_id: InvoiceId) -> AcceptResponse:
@@ -151,7 +151,7 @@ class Engine:
                     kind=MovementKind.INPUT,
                     amount=deposit.amount,
                     source=None,
-                    destination=invoice.held(deposit.address.chain),
+                    destination=Place(address=deposit.address, custody=Custody.HELD),
                     timestamp=Timestamp.now(),
                     transaction=TxHash(settlement.transaction),
                 )
@@ -219,59 +219,58 @@ class Engine:
         invoice.task = asyncio.create_task(self._run_invoice(invoice))
 
     async def _run_invoice(self, invoice: Invoice) -> None:
-        """The process loop: plan, run operations, apply what they report; re-plan on failure."""
-        replans = 0
-        while True:
-            try:
-                operations = plan(invoice, self._facilitators_for_job(invoice))
-            except NoRouteError:
-                logger.exception("invoice %s: no route left", invoice.id)
-                invoice.status = InvoiceStatus.FAILED
-                return
-            if not operations:
-                invoice.status = InvoiceStatus.DELIVERED
-                return
-            try:
-                for operation in operations:
-                    await self._run_operation(invoice, operation)
-            except InvoiceExpiredError:
-                logger.info("invoice %s expired awaiting deposit", invoice.id)
-                invoice.status = InvoiceStatus.EXPIRED
-                return
-            except Exception:
-                # re-evaluate: operations run one at a time, so nothing is still in flight here
-                replans += 1
-                logger.exception("invoice %s: operation failed (re-plan %d)", invoice.id, replans)
-                if replans > MAX_REPLANS:
-                    invoice.status = InvoiceStatus.FAILED
-                    return
+        try:
+            await self._drive(invoice)
+        except Exception as e:
+            # a bug, or books that don't add up: stop moving money, leave everything where
+            # the holdings say it is, and say why
+            logger.exception("invoice %s: halted", invoice.id)
+            invoice.finish(InvoiceStatus.HALTED, f"{type(e).__name__}: {e}")
 
-    async def _run_operation(self, invoice: Invoice, operation: Operation) -> None:
+    async def _drive(self, invoice: Invoice) -> None:
+        """Run what the planner schedules; when it's done, or a step of it fails, ask the
+        planner again. The planner decides when the job is finished. The engine only
+        halts it when something is truly broken (see GuardrailError)."""
+        stalled = 0
+        while True:
+            decision = decide(invoice, self._facilitators_for_job(invoice))
+            if isinstance(decision, Finished):
+                invoice.finish(decision.status, decision.reason)
+                return
+            if not decision.operations:
+                raise GuardrailError("the job isn't finished, but there is nothing to do")
+            moved = len(invoice.holdings.movements)
+            for operation in decision.operations:
+                if not await self._run(invoice, operation):
+                    break  # the rest of the plan may depend on it: ask the planner again
+            if len(invoice.holdings.movements) > moved:
+                stalled = 0
+                continue
+            stalled += 1
+            if stalled >= MAX_STALLED_PASSES:
+                raise GuardrailError(f"no progress in {stalled} passes")
+            await asyncio.sleep(STALL_BACKOFF_SECONDS * stalled)
+
+    async def _run(self, invoice: Invoice, operation: Operation) -> bool:
+        """Run one operation on a new work-log step; whether its step completed."""
         invoice.status = operation.phase
-        action = Action(
-            description=operation.description,
-            source_chain=operation.chain,
-            destination_chain=None,
-        )
-        invoice.actions.append(action)
+        action = invoice.worklog.start(operation.description, operation.chain)
         step = action.add_step(type(operation).__name__)
         step.start()
-        try:
-            async with RecordingClient(step.http_exchanges) as client:
-                ctx = OperationContext(
-                    invoice=invoice,
-                    signer=invoice.signer,
-                    step=step,
-                    client=client,
-                    rpc_url_for=self.rpc_url_for_chain,
-                    report=invoice.holdings.apply,
-                    exclude_facilitator=invoice.excluded_facilitators.add,
-                )
-                await operation.run(ctx)
-        except Exception as e:
-            step.fail(str(e))
-            raise
-        step.complete()
+        async with RecordingClient(step.http_exchanges) as client:
+            ctx = OperationContext(
+                invoice=invoice,
+                accounts=invoice.accounts,
+                step=StepReport(step),
+                client=client,
+                rpc_url_for=self.rpc_url_for_chain,
+                report=invoice.holdings.apply,
+                exclude_facilitator=invoice.excluded_facilitators.add,
+            )
+            await operation.run(ctx)
+        if not step.finished:
+            raise GuardrailError(f"{step.id}: {step.operation} returned without reporting its end")
+        return step.status == StepStatus.COMPLETED
 
     # --- Reaper ---
 
