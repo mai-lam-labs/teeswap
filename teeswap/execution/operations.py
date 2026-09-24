@@ -36,10 +36,19 @@ from ..blockchain.rpc import JsonRpcError
 from ..common import TeeSwapError
 from ..http import BaseHttpClient
 from ..types import Amount, Balance, Hex32, Timestamp, Token, TokenAmount, TxHash, Url
-from ..x402 import PaymentPayload, PaymentRequirements, ResourceInfo, sign_exact_evm
+from ..x402 import (
+    PaymentError,
+    PaymentPayload,
+    PaymentRequirements,
+    ResourceInfo,
+    SettleResponse,
+    SignedPayment,
+    sign_exact_evm,
+)
 from .accounts import Accounts
 from .effects import (
     AuthorizationSubmission,
+    Landed,
     Outcome,
     Pending,
     SideEffect,
@@ -56,6 +65,8 @@ DEPOSIT_POLL_INTERVAL = 5.0
 TRANSACTION_POLL_INTERVAL = 0.5
 REBROADCAST_EVERY = 60  # polls
 AUTHORIZATION_POLL_INTERVAL = 1.0
+# how far a payer's clock-based validity may run past what was asked, for clock skew
+CLOCK_SLACK_SECONDS = 60
 
 type EvmFor = Callable[[Chain], EvmChain]
 
@@ -259,7 +270,8 @@ class NativeTransfer(Operation):
         ctx.step.completed()
 
 
-AUTHORIZATION_TTL_SECONDS = 300
+# how long Mai's own authorizations stay usable: the longest an unanswered one is watched
+AUTHORIZATION_TTL_SECONDS = 60
 
 
 class FacilitatedTransfer(Operation):
@@ -339,37 +351,24 @@ class FacilitatedTransfer(Operation):
             valid_before=block.timestamp + AUTHORIZATION_TTL_SECONDS,
             nonce=Hex32.from_bytes(os.urandom(32)),
         )
-        payload = signed.payload
 
         in_flight = _in_flight(self._output, ctx.step)
-        for i, url in enumerate(self._facilitators):
-            submission = AuthorizationSubmission(
-                self.chain,
-                token,
-                signed.authorization,
-                signed.signature,
-                url,
-                from_block=block.number,
-            )
-            ctx.step.record(submission)
-            if i == 0:
-                # committed from the first submission on: any of them may settle it
-                ctx.report(_movement(MovementKind.TRANSIT, amount, self._source, in_flight))
-            submission.sending()
-            try:
-                await _facilitate(ctx.client, url, payload, requirements)
-                break
-            except (OperationError, facilitator.FacilitatorError) as e:
-                submission.failed(str(e))
-                ctx.exclude_facilitator(url)
-            # the facilitator may have settled it anyway: don't offer it again if so
-            if not isinstance(await _check(submission, ctx), Pending):
-                break
-        ctx.step.waiting()
 
-        latest = submission
-        while isinstance(outcome := await _check(latest, ctx), Pending):
-            await asyncio.sleep(AUTHORIZATION_POLL_INTERVAL)
+        def commit() -> None:
+            # committed from the first submission on: any of them may settle it
+            ctx.report(_movement(MovementKind.TRANSIT, amount, self._source, in_flight))
+
+        submitted = await _submit_in_turn(
+            ctx, token, signed, requirements, self._facilitators, commit
+        )
+        latest = submitted.submission
+        if submitted.settle_attempted:
+            ctx.step.waiting()
+            while isinstance(outcome := await _check(latest, ctx), Pending):
+                await asyncio.sleep(AUTHORIZATION_POLL_INTERVAL)
+        else:
+            # only facilitators hold the authorization, and none was asked to settle it
+            outcome = Void(f"no facilitator accepted it: {submitted.why}")
         ctx.step.resolved(latest.key, outcome)
 
         if isinstance(outcome, Void):
@@ -381,6 +380,200 @@ class FacilitatedTransfer(Operation):
             _movement(MovementKind.OUTPUT, amount, in_flight, delivered, outcome.transaction)
         )
         ctx.step.completed()
+
+
+class ReceivePayment(Operation):
+    """Receive an input by x402 payment: hand the payer's signed authorization to the
+    facilitators in turn, then watch until the funds are in the input's account or the
+    authorization can no longer be used. Nothing is reported as failed that could still
+    succeed, so a payer is never asked to pay twice for the same thing.
+
+    The funds arriving is what counts: if they're there, the payment succeeded, whether
+    or not a facilitator said so.
+    """
+
+    def __init__(
+        self,
+        deposit: Balance,
+        payment: PaymentPayload,
+        requirements: PaymentRequirements,
+        facilitators: tuple[str, ...],
+    ) -> None:
+        self._deposit = deposit
+        self._payment = payment
+        self._requirements = requirements
+        self._facilitators = facilitators
+        self.settlement: SettleResponse | None = None  # once received: how it settled
+
+    @property
+    @override
+    def description(self) -> str:
+        amount = self._deposit.amount
+        return (
+            f"receive {amount.amount} {amount.token.symbol} at {self._deposit.address.value}"
+            " by x402 payment"
+        )
+
+    @property
+    @override
+    def chain(self) -> Chain:
+        return self._deposit.address.chain
+
+    @property
+    @override
+    def phase(self) -> InvoiceStatus:
+        return InvoiceStatus.QUOTED  # not accepted until it's paid
+
+    @override
+    async def estimate_costs(self, evm_for: EvmFor) -> tuple[TokenAmount, ...]:
+        return ()  # the facilitator pays the gas
+
+    @override
+    async def run(self, ctx: OperationContext) -> None:
+        token = self._deposit.amount.token
+        evm = ctx.evm(self.chain)
+        try:
+            signed = SignedPayment.from_payload(self._payment)
+            block = await evm.latest_block()
+        except PaymentError as e:
+            ctx.step.failed(str(e))
+            return
+        except _UNANSWERED as e:
+            ctx.step.failed(f"could not check the payment: {e}")  # nothing was sent
+            return
+        # it's watched until it lands or expires: that must not be longer than was asked
+        latest_valid = block.timestamp + self._requirements.maxTimeoutSeconds + CLOCK_SLACK_SECONDS
+        if signed.authorization.valid_before > latest_valid:
+            ctx.step.failed("the payment stays valid for longer than maxTimeoutSeconds")
+            return
+        if not self._facilitators:
+            ctx.step.failed("no facilitator available")
+            return
+
+        submitted = await _submit_in_turn(
+            ctx, token, signed, self._requirements, self._facilitators, lambda: None
+        )
+        latest = submitted.submission
+        if not submitted.settle_attempted:
+            reason = f"no facilitator accepted the payment: {submitted.why}"
+            ctx.step.resolved(latest.key, Void(reason))
+            ctx.step.failed(reason)
+            return
+        ctx.step.waiting()
+
+        address = self._deposit.address
+        held = Place(address=address, custody=Custody.HELD)
+        while True:
+            try:
+                observed = await evm.token_balance(token, to_checksum_address(address.value))
+            except _UNANSWERED as e:
+                logger.warning("%s: balance unavailable, retrying: %s", ctx.step.id, e)
+                observed = None
+            if observed is not None:
+                arrived = observed - ctx.invoice.holdings.amount_at(held, token).amount.amount
+                if arrived >= self._deposit.amount.amount:
+                    self._received(ctx, signed, latest, arrived)
+                    return
+            outcome = await _check(latest, ctx)
+            if isinstance(outcome, Void):
+                ctx.step.resolved(latest.key, outcome)
+                ctx.step.failed(f"payment not settled: {outcome.reason}")
+                return
+            if isinstance(outcome, Landed) and observed is not None:
+                # used, yet the funds aren't here: we don't have them, and never will
+                reason = "the payment was used, but the funds didn't arrive"
+                ctx.step.resolved(latest.key, Void(reason))
+                ctx.step.failed(reason)
+                return
+            await asyncio.sleep(AUTHORIZATION_POLL_INTERVAL)
+
+    def _received(
+        self,
+        ctx: OperationContext,
+        signed: SignedPayment,
+        latest: AuthorizationSubmission,
+        arrived: int,
+    ) -> None:
+        token = self._deposit.amount.token
+        ctx.step.resolved(latest.key, Landed(transaction=latest.settled))
+        ctx.report(
+            Movement(
+                kind=MovementKind.INPUT,
+                amount=TokenAmount(token=token, amount=Amount(arrived)),
+                source=None,
+                destination=Place(address=self._deposit.address, custody=Custody.HELD),
+                timestamp=Timestamp.now(),
+                transaction=latest.settled,
+            )
+        )
+        # we have the funds: that is success, even if no facilitator said which
+        # transaction carried them
+        self.settlement = SettleResponse(
+            success=True,
+            payer=signed.authorization.sender,
+            transaction=latest.settled or "",
+            network=self.chain.caip2,
+        )
+        ctx.step.completed()
+
+
+@dataclass(frozen=True, slots=True)
+class _Submitted:
+    """How handing an authorization to the facilitators went."""
+
+    submission: AuthorizationSubmission  # the latest: all of them share one key
+    settle_attempted: bool  # a facilitator was asked to settle it, so it may land
+    why: str  # what the facilitators said, when none settled it
+
+
+async def _submit_in_turn(
+    ctx: OperationContext,
+    token: Token,
+    signed: SignedPayment,
+    requirements: PaymentRequirements,
+    facilitators: tuple[str, ...],
+    before_first: Callable[[], None],
+) -> _Submitted:
+    """Hand the same signed authorization to each facilitator until one settles it, or it
+    turns out to have settled anyway. A facilitator that errors or fails to settle is
+    excluded from the job; one that finds the payment invalid is not (it's the payment)."""
+    settle_attempted = False
+    said: list[str] = []
+    submission: AuthorizationSubmission | None = None
+    for i, url in enumerate(facilitators):
+        submission = AuthorizationSubmission(
+            token.chain, token, signed.authorization, signed.signature, url
+        )
+        ctx.step.record(submission)
+        if i == 0:
+            before_first()
+        submission.sending()
+        try:
+            verified = await facilitator.verify(ctx.client, url, signed.payload, requirements)
+            if not verified.isValid:
+                submission.failed(f"invalid: {verified.invalidReason}")
+                said.append(f"{url}: invalid: {verified.invalidReason}")
+                continue
+            settle_attempted = True
+            settled = await facilitator.settle(ctx.client, url, signed.payload, requirements)
+        except facilitator.FacilitatorError as e:
+            submission.failed(str(e))
+            said.append(str(e))
+            ctx.exclude_facilitator(url)
+        else:
+            if settled.success:
+                submission.settled_by(TxHash(settled.transaction))
+                return _Submitted(submission, settle_attempted=True, why="")
+            reason = settled.errorReason or settled.errorMessage
+            submission.failed(f"not settled: {reason}")
+            said.append(f"{url}: not settled: {reason}")
+            ctx.exclude_facilitator(url)
+        # the facilitator may have settled it anyway: don't offer it again if so
+        if settle_attempted and not isinstance(await _check(submission, ctx), Pending):
+            break
+    if submission is None:
+        raise OperationError("no facilitator to submit to")
+    return _Submitted(submission, settle_attempted=settle_attempted, why="; ".join(said))
 
 
 # a request that errored or timed out: no answer, so never taken as one
@@ -403,19 +596,6 @@ async def _broadcast(evm: EvmChain, broadcast: TransactionBroadcast) -> None:
     except _UNANSWERED as e:
         # not proof it wasn't received: the chain is asked
         broadcast.failed(str(e))
-
-
-async def _facilitate(
-    client: BaseHttpClient, url: str, payload: PaymentPayload, requirements: PaymentRequirements
-) -> None:
-    verified = await facilitator.verify(client, url, payload, requirements)
-    if not verified.isValid:
-        raise OperationError(f"{url} rejected the transfer: {verified.invalidReason}")
-    settled = await facilitator.settle(client, url, payload, requirements)
-    if not settled.success:
-        raise OperationError(
-            f"{url} failed to settle: {settled.errorReason or settled.errorMessage}"
-        )
 
 
 def _in_flight(output: Balance, step: StepReport) -> Place:

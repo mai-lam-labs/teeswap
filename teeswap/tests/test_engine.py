@@ -6,7 +6,6 @@ the local facilitator.
 """
 
 import asyncio
-from pathlib import Path
 
 import pytest
 
@@ -20,6 +19,7 @@ from teeswap.tests.conftest import (
     ONE_USDC,
     OPERATOR_NAME,
     USDC_TOKEN,
+    SaveInvoice,
     Served,
     new_address,
 )
@@ -76,7 +76,9 @@ def _by_custody(view: InvoiceView) -> dict[Custody, int]:
 
 
 @pytest.mark.asyncio
-async def test_eth_split(api: Api, served: Served, chain: LocalChain) -> None:
+async def test_eth_split(
+    api: Api, served: Served, chain: LocalChain, invoice_page: SaveInvoice
+) -> None:
     recipient_a, recipient_b = new_address(), new_address()
     request = QuoteRequest(
         inputs=(
@@ -126,23 +128,20 @@ async def test_eth_split(api: Api, served: Served, chain: LocalChain) -> None:
     assert by_custody[Custody.HELD] >= SURPLUS
 
     # the invoice pages show the same invoice
-    html = await served.client.get(f"/invoice/{quote.quote_id}.html")
-    assert html.status_code == 200
-    assert "DELIVERED" in html.text
-    assert OPERATOR_NAME in html.text
-    assert "MST: 0123456789" in html.text
-    assert deposit_to.address.value in html.text
+    html = await invoice_page(quote.quote_id)
+    assert "DELIVERED" in html
+    assert OPERATOR_NAME in html
+    assert "MST: 0123456789" in html
+    assert deposit_to.address.value in html
     json = await served.client.get(f"/invoice/{quote.quote_id}.json")
     assert json.status_code == 200
     assert InvoiceView.from_dict(decode_object(json.content)) == view
 
-    out = Path("dist/demo_invoice.html")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(html.text)
-
 
 @pytest.mark.asyncio
-async def test_usdc_split_paid_by_x402(api: Api, payer: EvmPayer, chain: LocalChain) -> None:
+async def test_usdc_split_paid_by_x402(
+    api: Api, payer: EvmPayer, chain: LocalChain, invoice_page: SaveInvoice
+) -> None:
     recipient_a, recipient_b = new_address(), new_address()
     request = QuoteRequest(
         inputs=(TokenAmount(token=USDC_TOKEN, amount=Amount(5 * ONE_USDC)),),
@@ -174,6 +173,7 @@ async def test_usdc_split_paid_by_x402(api: Api, payer: EvmPayer, chain: LocalCh
     assert by_custody.get(Custody.DELIVERED) == 5 * ONE_USDC
     assert not by_custody.get(Custody.HELD) and not by_custody.get(Custody.IN_FLIGHT)
     assert chain.usdc_balance(deposit.deposit.address.value) == 0
+    await invoice_page(quote.quote_id)
 
 
 @pytest.mark.asyncio

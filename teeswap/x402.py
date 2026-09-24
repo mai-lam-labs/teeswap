@@ -136,6 +136,21 @@ class SignedPayment:
     authorization: TransferAuthorization
     signature: bytes
 
+    @classmethod
+    def from_payload(cls, payload: PaymentPayload) -> SignedPayment:
+        """A payer's `exact` EVM payment, read back from the payload they sent."""
+        fields = payload.payload.get("authorization")
+        signature = payload.payload.get("signature")
+        if not isinstance(fields, dict) or not isinstance(signature, str):
+            raise PaymentError("an exact EVM payment needs an authorization and a signature")
+        strings = {str(k): v for k, v in fields.items() if isinstance(v, str)}
+        try:
+            authorization = TransferAuthorization.from_wire(strings)
+            raw_signature = bytes.fromhex(signature.removeprefix("0x"))
+        except (KeyError, ValueError) as e:
+            raise PaymentError(f"malformed exact EVM payment: {e}") from e
+        return cls(payload=payload, authorization=authorization, signature=raw_signature)
+
 
 def sign_exact_evm(
     signer: EthSigner,

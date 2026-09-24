@@ -16,13 +16,12 @@ import logging
 
 from eth_utils.address import to_checksum_address
 
-from .. import facilitator
 from ..blockchain.chains import Chain
 from ..blockchain.evm import EvmChain
 from ..common import TeeSwapError
-from ..facilitator import FacilitatorError, FacilitatorMonitor
+from ..facilitator import FacilitatorMonitor
 from ..http import BaseHttpClient, HttpClient, RecordingClient
-from ..types import AcceptResponse, QuoteRequest, QuoteResponse, Timestamp, TxHash, Url
+from ..types import AcceptResponse, QuoteRequest, QuoteResponse, Url
 from ..x402 import (
     PaymentPayload,
     PaymentRequirements,
@@ -38,11 +37,10 @@ from .invoice import (
     InvoiceRegistry,
     InvoiceStatus,
 )
-from .ledger import Custody, Movement, MovementKind, Place
-from .operations import Operation, OperationContext
+from .operations import Operation, OperationContext, ReceivePayment
 from .planner import FacilitatorsFor, Finished, NoRouteError, decide
 from .quote import compute_quote
-from .worklog import StepReport, StepStatus
+from .worklog import Step, StepReport, StepStatus
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +50,7 @@ MAX_STALLED_PASSES = 3
 STALL_BACKOFF_SECONDS = 5.0
 X402_SCHEME = "exact"
 # how long a client's payment authorization must stay valid for Mai to settle it
-PAYMENT_TIMEOUT_SECONDS = 300
+PAYMENT_TIMEOUT_SECONDS = 60
 
 
 class GuardrailError(TeeSwapError):
@@ -135,7 +133,12 @@ class Engine:
     async def accept_x402(
         self, invoice_id: InvoiceId, payment: PaymentPayload
     ) -> X402PaymentResult:
-        """Settle the client's payment, which delivers the job's input, then start the job."""
+        """Receive the client's payment into the input's account, then start the job.
+
+        Returns only once the payment is final: the funds are there, or the payment can
+        never be used. Until then it may still settle, so saying it failed could get
+        the client to pay twice.
+        """
         invoice = self._registry.get(invoice_id)
         invoice.require_funding(Funding.X402)
         async with invoice.payment_lock:
@@ -143,28 +146,27 @@ class Engine:
             (deposit,) = invoice.deposits
             async with HttpClient() as client:
                 requirements = await self._payment_requirements(client, invoice)
-                if payment.accepted != requirements:
-                    raise X402SettlementError("payment does not match the payment requirements")
-                settlement = await self._settle(client, invoice, payment, requirements)
-            invoice.holdings.apply(
-                Movement(
-                    kind=MovementKind.INPUT,
-                    amount=deposit.amount,
-                    source=None,
-                    destination=Place(address=deposit.address, custody=Custody.HELD),
-                    timestamp=Timestamp.now(),
-                    transaction=TxHash(settlement.transaction),
-                )
+            if payment.accepted != requirements:
+                raise X402SettlementError("payment does not match the payment requirements")
+            chain = deposit.address.chain
+            receive = ReceivePayment(
+                deposit,
+                payment,
+                requirements,
+                self.facilitators_for(chain, invoice.excluded_facilitators),
             )
+            step = await self._run(invoice, receive)
+            if receive.settlement is None:
+                raise X402SettlementError(step.error or "payment not received")
             invoice.begin()
             self._start(invoice)
         response = AcceptResponse(
             quote_id=str(invoice.id),
             deposits=invoice.deposits,
             expires_at=invoice.expires_at,
-            instructions=f"Paid by x402 in transaction {settlement.transaction}",
+            instructions=_paid_instructions(receive.settlement),
         )
-        return X402PaymentResult(response=response, settlement=settlement)
+        return X402PaymentResult(response=response, settlement=receive.settlement)
 
     async def _payment_requirements(
         self, client: BaseHttpClient, invoice: Invoice
@@ -186,34 +188,6 @@ class Engine:
             maxTimeoutSeconds=PAYMENT_TIMEOUT_SECONDS,
             extra={"name": name, "version": version},
         )
-
-    async def _settle(
-        self,
-        client: BaseHttpClient,
-        invoice: Invoice,
-        payment: PaymentPayload,
-        requirements: PaymentRequirements,
-    ) -> SettleResponse:
-        """Try the job's facilitators in order. One that errors or fails to settle is
-        excluded from the job; one that finds the payment invalid is not (it's the payment)."""
-        (deposit,) = invoice.deposits
-        failures: list[str] = []
-        for url in self.facilitators_for(deposit.address.chain, invoice.excluded_facilitators):
-            try:
-                verified = await facilitator.verify(client, url, payment, requirements)
-                if not verified.isValid:
-                    failures.append(f"{url}: invalid payment: {verified.invalidReason}")
-                    continue
-                settled = await facilitator.settle(client, url, payment, requirements)
-            except FacilitatorError as e:
-                invoice.excluded_facilitators.add(url)
-                failures.append(str(e))
-                continue
-            if settled.success:
-                return settled
-            invoice.excluded_facilitators.add(url)
-            failures.append(f"{url}: not settled: {settled.errorReason or settled.errorMessage}")
-        raise X402SettlementError("; ".join(failures) or "no facilitator available")
 
     def _start(self, invoice: Invoice) -> None:
         invoice.task = asyncio.create_task(self._run_invoice(invoice))
@@ -241,7 +215,8 @@ class Engine:
                 raise GuardrailError("the job isn't finished, but there is nothing to do")
             moved = len(invoice.holdings.movements)
             for operation in decision.operations:
-                if not await self._run(invoice, operation):
+                step = await self._run(invoice, operation)
+                if step.status != StepStatus.COMPLETED:
                     break  # the rest of the plan may depend on it: ask the planner again
             if len(invoice.holdings.movements) > moved:
                 stalled = 0
@@ -251,8 +226,8 @@ class Engine:
                 raise GuardrailError(f"no progress in {stalled} passes")
             await asyncio.sleep(STALL_BACKOFF_SECONDS * stalled)
 
-    async def _run(self, invoice: Invoice, operation: Operation) -> bool:
-        """Run one operation on a new work-log step; whether its step completed."""
+    async def _run(self, invoice: Invoice, operation: Operation) -> Step:
+        """Run one operation on a new work-log step; the step, as the operation left it."""
         invoice.status = operation.phase
         action = invoice.worklog.start(operation.description, operation.chain)
         step = action.add_step(type(operation).__name__)
@@ -270,7 +245,7 @@ class Engine:
             await operation.run(ctx)
         if not step.finished:
             raise GuardrailError(f"{step.id}: {step.operation} returned without reporting its end")
-        return step.status == StepStatus.COMPLETED
+        return step
 
     # --- Reaper ---
 
@@ -291,3 +266,9 @@ class Engine:
             except Exception:
                 logger.exception("reaper failed")
             await asyncio.sleep(REAPER_INTERVAL)
+
+
+def _paid_instructions(settlement: SettleResponse) -> str:
+    if settlement.transaction:
+        return f"Paid by x402 in transaction {settlement.transaction}"
+    return "Paid by x402 (the funds arrived; no facilitator reported the transaction)"

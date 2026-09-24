@@ -14,7 +14,7 @@ from litestar import MediaType, Response, Router, get
 from litestar.params import Parameter
 from litestar.status_codes import HTTP_200_OK, HTTP_404_NOT_FOUND
 
-from ..execution.effects import SideEffectView
+from ..execution.effects import SideEffectOutcome, SideEffectView
 from ..execution.invoice import InvoiceId, InvoiceNotFoundError, InvoiceRegistry, InvoiceView
 from ..types import Timestamp
 from .html import (
@@ -149,13 +149,15 @@ def _fmt_token(symbol: str, contract: str | None, chain_caip2: str) -> str:
 
 
 def _effect_outcome(effect: SideEffectView) -> str:
-    if effect.landed is not None:
-        return effect.landed
-    if effect.void is not None:
-        return f"void: {effect.void}"
-    if effect.error is not None:
-        return f"unknown (send failed: {effect.error})"
-    return "pending"
+    match effect.outcome:
+        case SideEffectOutcome.LANDED | SideEffectOutcome.REVERTED:
+            return f"{effect.outcome.value} {effect.transaction or '(transaction not reported)'}"
+        case SideEffectOutcome.VOID:
+            return f"void: {effect.reason}"
+        case None if effect.error is not None:
+            return f"pending (send failed: {effect.error})"
+        case None:
+            return "pending"
 
 
 def _fmt_time(ts: Timestamp | None) -> str:

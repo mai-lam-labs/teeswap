@@ -8,8 +8,10 @@ the production way, in its app, with its background tasks running.
 """
 
 import os
-from collections.abc import AsyncIterator
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 import pytest
@@ -89,6 +91,27 @@ def api(request: pytest.FixtureRequest, served: Served) -> Api:
             return RestApi(served.client)
         case _:
             return McpApi(served.client)
+
+
+# each flow's invoice page, as the app serves it, kept for reference after the run
+INVOICE_PAGES = Path("dist/test-invoices")
+
+type SaveInvoice = Callable[[str], Awaitable[str]]
+
+
+@pytest.fixture
+def invoice_page(request: pytest.FixtureRequest, served: Served) -> SaveInvoice:
+    """Fetch an invoice's page from the app and save it as dist/test-invoices/<test>.html."""
+
+    async def save(quote_id: str) -> str:
+        page = await served.client.get(f"/invoice/{quote_id}.html")
+        assert page.status_code == 200, page.text
+        INVOICE_PAGES.mkdir(parents=True, exist_ok=True)
+        name = re.sub(r"[^\w.-]+", "_", request.node.name).strip("_")
+        (INVOICE_PAGES / f"{name}.html").write_text(page.text)
+        return page.text
+
+    return save
 
 
 @pytest.fixture

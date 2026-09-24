@@ -14,7 +14,6 @@ from eth_account.signers.local import LocalAccount
 from eth_typing import BlockNumber, ChainId, ChecksumAddress, Hash32, HexStr
 from eth_utils.abi import function_signature_to_4byte_selector
 from eth_utils.address import to_checksum_address
-from eth_utils.crypto import keccak
 
 from ..common import TeeSwapError
 from ..http import BaseHttpClient
@@ -168,6 +167,18 @@ class TransferAuthorization:
             },
         )
 
+    @classmethod
+    def from_wire(cls, fields: dict[str, str]) -> TransferAuthorization:
+        """The x402 exact-scheme `authorization` object, as wire() writes it."""
+        return cls(
+            sender=to_checksum_address(fields["from"]),
+            recipient=to_checksum_address(fields["to"]),
+            value=int(fields["value"]),
+            valid_after=int(fields["validAfter"]),
+            valid_before=int(fields["validBefore"]),
+            nonce=Hex32(fields["nonce"]),
+        )
+
     def wire(self) -> dict[str, str]:
         """The x402 exact-scheme `authorization` object."""
         return {
@@ -220,9 +231,6 @@ class EvmRpcClient:
     async def get_latest_block(self) -> dict[str, Any]:
         return await jsonrpc(self._client, self._url, "eth_getBlockByNumber", ["latest", False])
 
-    async def get_logs(self, log_filter: dict[str, Any]) -> list[dict[str, Any]]:
-        return await jsonrpc(self._client, self._url, "eth_getLogs", [log_filter])
-
     async def get_balance(self, address: ChecksumAddress) -> int:
         result = await jsonrpc(self._client, self._url, "eth_getBalance", [address, "latest"])
         return int(result, 16)
@@ -240,9 +248,6 @@ class EvmRpcClient:
         result = await jsonrpc(self._client, self._url, "eth_blockNumber")
         return BlockNumber(int(result, 16))
 
-
-# EIP-3009 event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce)
-_AUTHORIZATION_USED = keccak(text="AuthorizationUsed(address,bytes32)")
 
 # enough to cover value + gas for any simulated call, when the sender isn't funded yet
 _SIMULATED_BALANCE = hex(2**200)
@@ -365,23 +370,3 @@ class EvmChain:
     async def latest_block(self) -> Block:
         raw = await self._rpc.get_latest_block()
         return Block(number=int(raw["number"], 16), timestamp=int(raw["timestamp"], 16))
-
-    async def authorization_transaction(
-        self, contract: ChecksumAddress, authorizer: ChecksumAddress, nonce: Hex32, from_block: int
-    ) -> Hash32 | None:
-        """EIP-3009: the transaction that used `authorizer`'s authorization `nonce`, if any."""
-        logs = await self._rpc.get_logs(
-            {
-                "address": contract,
-                "fromBlock": hex(from_block),
-                "toBlock": "latest",
-                "topics": [
-                    "0x" + _AUTHORIZATION_USED.hex(),
-                    "0x" + encode(["address"], [authorizer]).hex(),
-                    nonce,
-                ],
-            }
-        )
-        if not logs:
-            return None
-        return Hash32(bytes.fromhex(logs[0]["transactionHash"].removeprefix("0x")))

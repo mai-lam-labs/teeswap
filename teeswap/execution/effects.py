@@ -69,7 +69,9 @@ type IdempotencyKey = TransactionKey | AuthorizationKey
 
 @dataclass(frozen=True, slots=True)
 class Landed:
-    transaction: TxHash
+    # the transaction that carried it, when known: never searched for, only reported
+    # (by a receipt, or by the facilitator that settled it)
+    transaction: TxHash | None
     success: bool = True  # False: mined but reverted
     gas: TokenAmount | None = None  # what the job paid for it, if it paid
 
@@ -91,14 +93,21 @@ type Outcome = Resolution | Pending
 # --- Side effects ---
 
 
+class SideEffectOutcome(enum.StrEnum):
+    LANDED = "landed"
+    REVERTED = "reverted"  # landed, and failed
+    VOID = "void"
+
+
 @dataclass(frozen=True, slots=True)
 class SideEffectView(WireStruct):
     kind: SideEffectKind
     target: str
     sent_at: Timestamp | None
-    error: str | None
-    landed: TxHash | None
-    void: str | None
+    error: str | None  # the send failed; that alone doesn't mean it didn't happen
+    outcome: SideEffectOutcome | None  # None while pending
+    transaction: TxHash | None
+    reason: str | None  # why it is void
 
 
 class SideEffect(abc.ABC):
@@ -130,14 +139,26 @@ class SideEffect(abc.ABC):
         self.error = error
 
     def view(self) -> SideEffectView:
-        resolution = self.resolution
+        outcome: SideEffectOutcome | None = None
+        transaction: TxHash | None = None
+        reason: str | None = None
+        match self.resolution:
+            case Landed(transaction=tx, success=success):
+                outcome = SideEffectOutcome.LANDED if success else SideEffectOutcome.REVERTED
+                transaction = tx
+            case Void(reason=why):
+                outcome = SideEffectOutcome.VOID
+                reason = why
+            case None:
+                pass
         return SideEffectView(
             kind=self.kind,
             target=self.target,
             sent_at=self.sent_at,
             error=self.error,
-            landed=resolution.transaction if isinstance(resolution, Landed) else None,
-            void=resolution.reason if isinstance(resolution, Void) else None,
+            outcome=outcome,
+            transaction=transaction,
+            reason=reason,
         )
 
 
@@ -175,7 +196,8 @@ class TransactionBroadcast(SideEffect):
 
 
 class AuthorizationSubmission(SideEffect):
-    """A signed EIP-3009 authorization handed to a facilitator to settle.
+    """A signed EIP-3009 authorization handed to a facilitator to settle: Mai's own, or
+    a payer's.
 
     Handing the same authorization to another facilitator is another submission with
     the same key: the token settles it at most once.
@@ -188,14 +210,16 @@ class AuthorizationSubmission(SideEffect):
         authorization: TransferAuthorization,
         signature: bytes,
         facilitator: str,
-        from_block: int,
     ) -> None:
         super().__init__(target=facilitator)
         self.chain = chain
         self.token = token
         self.authorization = authorization
         self.signature = signature
-        self.from_block = from_block  # it can't have been used before it was signed
+        self.settled: TxHash | None = None  # the transaction, if the facilitator reported one
+
+    def settled_by(self, transaction: TxHash) -> None:
+        self.settled = transaction
 
     @property
     @override
@@ -221,10 +245,7 @@ class AuthorizationSubmission(SideEffect):
         # after that, no later block can use it
         block = await evm.latest_block()
         if await evm.authorization_used(contract, sender, nonce):
-            tx = await evm.authorization_transaction(contract, sender, nonce, self.from_block)
-            if tx is None:
-                return Pending()  # used, but the node hasn't indexed the log yet
-            return Landed(transaction=_tx_hash(tx))
+            return Landed(transaction=self.settled)
         if block.timestamp >= self.authorization.valid_before:
             return Void("authorization expired unused")
         return Pending()
