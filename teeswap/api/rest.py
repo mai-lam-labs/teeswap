@@ -7,7 +7,8 @@ import httpx
 from litestar import MediaType
 
 from ..common import PKG_NAME
-from ..execution.invoice import InvoiceView
+from ..execution.invoice import Handover, InvoiceView
+from ..mcp import ToolNotAvailableError
 from ..response import ErrorResponse
 from ..tools import StatusResponse
 from ..types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
@@ -76,6 +77,16 @@ class RestApi(Api):
     @override
     async def invoice(self, request: InvoiceRequest) -> InvoiceView:
         return await self._call("invoice", request, InvoiceView)
+
+    @override
+    async def tools_down(self, request: InvoiceRequest) -> StatusResponse:
+        return await self._call("tools_down", request, StatusResponse)
+
+    @override
+    async def handover(self, request: InvoiceRequest) -> Handover:
+        raise ToolNotAvailableError(
+            "the handover returns secrets: REST replies can be read on the way, use MCP blind calls"
+        )
 
 
 def _raise_for_error(resp: httpx.Response) -> None:

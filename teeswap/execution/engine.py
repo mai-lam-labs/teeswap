@@ -18,10 +18,21 @@ from eth_utils.address import to_checksum_address
 
 from ..blockchain.chains import Chain
 from ..blockchain.evm import EvmChain
+from ..blockchain.keys import ChainKey
 from ..common import TeeSwapError
 from ..facilitator import FacilitatorMonitor
 from ..http import BaseHttpClient, HttpClient, RecordingClient
-from ..types import AcceptResponse, QuoteRequest, QuoteResponse, Url
+from ..types import (
+    AcceptResponse,
+    Amount,
+    Balance,
+    Hex32,
+    QuoteRequest,
+    QuoteResponse,
+    Token,
+    TokenAmount,
+    Url,
+)
 from ..x402 import (
     PaymentPayload,
     PaymentRequirements,
@@ -32,10 +43,13 @@ from ..x402 import (
 from .accounts import Accounts
 from .invoice import (
     Funding,
+    Handover,
     Invoice,
     InvoiceId,
     InvoiceRegistry,
+    InvoiceStateError,
     InvoiceStatus,
+    ReleasedAccount,
 )
 from .operations import Operation, OperationContext, ReceivePayment
 from .planner import FacilitatorsFor, Finished, NoRouteError, decide
@@ -120,6 +134,55 @@ class Engine:
             ),
         )
 
+    # --- Tools down ---
+
+    def tools_down(self, invoice_id: InvoiceId) -> None:
+        """The owner asks Mai to stop. A running job stops once nothing is in flight."""
+        invoice = self._registry.get(invoice_id)
+        if invoice.status == InvoiceStatus.TOOLS_DOWN:
+            return
+        if invoice.is_active:
+            invoice.tools_down_requested = True  # the planner puts them down next
+        else:
+            invoice.finish(InvoiceStatus.TOOLS_DOWN, "the owner put the tools down")
+
+    async def hand_over(self, invoice_id: InvoiceId) -> Handover:
+        """With the tools down: every account the job controls, its key, and what the chain
+        shows it holding now. Only ever returned to the owner over an encrypted reply."""
+        invoice = self._registry.get(invoice_id)
+        if invoice.status != InvoiceStatus.TOOLS_DOWN:
+            raise InvoiceStateError("the tools aren't down: put them down first")
+        released: list[ReleasedAccount] = []
+        async with HttpClient() as client:
+            for account in invoice.accounts.all:
+                chain = account.address.chain
+                evm = EvmChain(chain, client, self.rpc_url_for_chain(chain))
+                owner = to_checksum_address(account.address.value)
+                # the chain's native token (gas), then the job's own tokens on this chain
+                native = Token.native(chain)
+                tokens = [native] + [
+                    t.token
+                    for t in invoice.quote.inputs
+                    if t.token.chain == chain and t.token != native
+                ]
+                balances = [
+                    TokenAmount(token=t, amount=Amount(await evm.token_balance(t, owner)))
+                    for t in tokens
+                ]
+                for amount in balances:
+                    invoice.observed(Balance(amount=amount, address=account.address))
+                key = invoice.accounts.key(account.address, ChainKey)
+                released.append(
+                    ReleasedAccount(
+                        address=account.address,
+                        purpose=account.purpose,
+                        private_key=Hex32.from_bytes(key.private_key),
+                        balances=tuple(balances),
+                    )
+                )
+        invoice.release()
+        return Handover(status=invoice.status, reason=invoice.reason, accounts=tuple(released))
+
     # --- x402 funding ---
 
     async def payment_spec(self, invoice_id: InvoiceId, error: str) -> X402PaymentSpec:
@@ -197,9 +260,9 @@ class Engine:
             await self._drive(invoice)
         except Exception as e:
             # a bug, or books that don't add up: stop moving money, leave everything where
-            # the holdings say it is, and say why
+            # it is, and hand it to the owner
             logger.exception("invoice %s: halted", invoice.id.ref)
-            invoice.finish(InvoiceStatus.HALTED, f"{type(e).__name__}: {e}")
+            invoice.finish(InvoiceStatus.TOOLS_DOWN, f"halted: {type(e).__name__}: {e}")
 
     async def _drive(self, invoice: Invoice) -> None:
         """Run what the planner schedules; when it's done, or a step of it fails, ask the

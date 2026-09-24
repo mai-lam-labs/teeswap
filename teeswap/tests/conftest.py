@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 import pytest
 import pytest_asyncio
+from eth_typing import ChecksumAddress
 from litestar import Litestar
 from litestar.testing import AsyncTestClient
 
@@ -122,5 +123,5 @@ def payer(chain: LocalChain) -> EvmPayer:
     return payer
 
 
-def new_address() -> str:
+def new_address() -> ChecksumAddress:
     return EthSigner(os.urandom(32)).address

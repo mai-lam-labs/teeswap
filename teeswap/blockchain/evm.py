@@ -104,6 +104,7 @@ class EthSigner(ChainKey):
         return self._account.address
 
     @property
+    @override
     def private_key(self) -> bytes:
         return self._private_key
 

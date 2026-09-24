@@ -229,6 +229,12 @@ class ToolBase(abc.ABC):
     def mcp_visible(self) -> bool:
         return True
 
+    @property
+    def blind_only(self) -> bool:
+        """Its result is secret: only a blind call with an encrypted reply may have it,
+        never a plain tools/call or REST, where the operator can read the reply."""
+        return False
+
 
 class Tool(ToolBase):
     @abc.abstractmethod
@@ -295,12 +301,17 @@ class Dispatcher:
         arguments: dict[str, Any],
         payment: PaymentPayload | None,
         has_session: bool = True,
+        encrypted_reply: bool = False,
     ) -> ToolOutcome:
         tool = self._tools.get(name)
         if tool is None:
             raise ToolNotFoundError(f"unknown tool: {name}")
         if not tool.mcp_visible:
             raise ToolNotAvailableError(f"{name} is not available via MCP")
+        if tool.blind_only and not encrypted_reply:
+            raise ToolNotAvailableError(
+                f"{name} returns secrets: call it with verifiable-tools/call and a replyPublicKey"
+            )
         if tool.requires_session and not has_session:
             raise ToolNotAvailableError(f"{name} requires a session (use stdio or stateful HTTP)")
 
@@ -644,7 +655,12 @@ async def _handle_blind_call(
         return McpResult(body=_error(req_id, -32602, str(e), ErrorResponse.of(e)))
 
     try:
-        outcome = await dispatcher.call(params.name, decrypted.arguments, params.payment)
+        outcome = await dispatcher.call(
+            params.name,
+            decrypted.arguments,
+            params.payment,
+            encrypted_reply=params.replyPublicKey is not None,
+        )
         rendered = _render_outcome(dispatcher, params.name, outcome)
     except ToolNotFoundError as e:
         return McpResult(body=_error(req_id, -32601, str(e), ErrorResponse.of(e)))

@@ -174,6 +174,9 @@ class AwaitDeposit(Operation):
             if Timestamp.now() > ctx.invoice.expires_at:
                 ctx.step.failed("expired awaiting deposit")
                 return
+            if ctx.invoice.tools_down_requested:
+                ctx.step.failed("the owner put the tools down")  # nothing in flight: stop now
+                return
             await asyncio.sleep(DEPOSIT_POLL_INTERVAL)
 
 

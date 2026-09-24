@@ -15,6 +15,7 @@ from ..blockchain.derivation import derive_key
 from ..blockchain.keys import ChainKey
 from ..common import TeeSwapError
 from ..types import Address
+from ..wire import WireStruct
 
 
 class AccountError(TeeSwapError):
@@ -22,7 +23,7 @@ class AccountError(TeeSwapError):
 
 
 @dataclass(frozen=True, slots=True)
-class Account:
+class Account(WireStruct):
     address: Address
     purpose: str  # what the job uses it for; part of its derivation
 

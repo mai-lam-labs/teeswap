@@ -2,15 +2,17 @@
 
 from typing import override
 
-from ..execution.invoice import InvoiceView
+from ..execution.invoice import Handover, InvoiceView
 from ..tools import (
     AcceptTool,
     AcceptX402Tool,
+    HandoverTool,
     InvoiceTool,
     QuoteTool,
     QuoteX402Tool,
     StatusResponse,
     StatusTool,
+    ToolsDownTool,
 )
 from ..types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
 from ..x402 import PaymentPayload, PaymentRequired, ResourceInfo, X402PaymentSpec
@@ -26,6 +28,8 @@ class LocalApi(Api):
         accept_x402_tool: AcceptX402Tool,
         status_tool: StatusTool,
         invoice_tool: InvoiceTool,
+        tools_down_tool: ToolsDownTool,
+        handover_tool: HandoverTool,
     ) -> None:
         self._quote = quote_tool
         self._accept = accept_tool
@@ -33,6 +37,8 @@ class LocalApi(Api):
         self._accept_x402 = accept_x402_tool
         self._status = status_tool
         self._invoice = invoice_tool
+        self._tools_down = tools_down_tool
+        self._handover = handover_tool
 
     @override
     async def quote(self, request: QuoteRequest) -> QuoteResponse:
@@ -72,3 +78,12 @@ class LocalApi(Api):
     @override
     async def invoice(self, request: InvoiceRequest) -> InvoiceView:
         return await self._invoice.execute(request)
+
+    @override
+    async def tools_down(self, request: InvoiceRequest) -> StatusResponse:
+        return await self._tools_down.execute(request)
+
+    @override
+    async def handover(self, request: InvoiceRequest) -> Handover:
+        # in process: the reply never leaves the TEE, so no encryption is needed
+        return await self._handover.execute(request)

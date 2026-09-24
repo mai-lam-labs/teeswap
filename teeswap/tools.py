@@ -4,6 +4,8 @@ from typing import override
 from .execution.engine import Engine, X402SettlementError
 from .execution.invoice import (
     Funding,
+    Handover,
+    Invoice,
     InvoiceId,
     InvoiceInput,
     InvoiceOutput,
@@ -21,6 +23,7 @@ from .x402 import PaymentPayload, X402PaymentResult, X402PaymentSpec
 class StatusResponse(DataclassResponse):
     quote_id: str
     status: InvoiceStatus
+    reason: str | None  # why the job ended, once it has
     expires_at: Timestamp
     inputs: tuple[InvoiceInput, ...]
     outputs: tuple[InvoiceOutput, ...]
@@ -142,14 +145,7 @@ class StatusTool(Tool):
 
     @override
     async def execute(self, args: InvoiceRequest) -> StatusResponse:
-        invoice = self._registry.get(InvoiceId(args.quote_id))
-        return StatusResponse(
-            quote_id=str(invoice.id),
-            status=invoice.status,
-            expires_at=invoice.expires_at,
-            inputs=invoice.input_states(),
-            outputs=invoice.output_states(),
-        )
+        return _status(self._registry.get(InvoiceId(args.quote_id)))
 
 
 class InvoiceTool(Tool):
@@ -171,3 +167,71 @@ class InvoiceTool(Tool):
     @override
     async def execute(self, args: InvoiceRequest) -> InvoiceView:
         return self._registry.get(InvoiceId(args.quote_id)).view()
+
+
+class ToolsDownTool(Tool):
+    """The owner asks Mai to stop: once nothing is in flight, the job's result becomes the
+    money itself (teeswap_handover) instead of its outputs."""
+
+    def __init__(self, engine: Engine, registry: InvoiceRegistry) -> None:
+        self._engine = engine
+        self._registry = registry
+
+    @property
+    @override
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="teeswap_tools_down",
+            description="Stop working on an invoice. Once nothing is in flight its status is "
+            "tools_down, and teeswap_handover gives its owner the accounts and their keys.",
+            input_type=InvoiceRequest,
+            output_type=StatusResponse,
+            annotations={"readOnly": False, "idempotent": True, "openWorld": True},
+            tags=("swap",),
+        )
+
+    @override
+    async def execute(self, args: InvoiceRequest) -> StatusResponse:
+        invoice_id = InvoiceId(args.quote_id)
+        self._engine.tools_down(invoice_id)
+        return _status(self._registry.get(invoice_id))
+
+
+class HandoverTool(Tool):
+    """With the tools down: the money itself, as the accounts' keys. Blind calls only."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    @property
+    @override
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="teeswap_handover",
+            description="With an invoice's tools down: every account it controls, with its "
+            "private key and balances. Only as a blind call with an encrypted reply.",
+            input_type=InvoiceRequest,
+            output_type=Handover,
+            annotations={"readOnly": False, "idempotent": True, "openWorld": True},
+            tags=("swap",),
+        )
+
+    @property
+    @override
+    def blind_only(self) -> bool:
+        return True
+
+    @override
+    async def execute(self, args: InvoiceRequest) -> Handover:
+        return await self._engine.hand_over(InvoiceId(args.quote_id))
+
+
+def _status(invoice: Invoice) -> StatusResponse:
+    return StatusResponse(
+        quote_id=str(invoice.id),
+        status=invoice.status,
+        reason=invoice.reason,
+        expires_at=invoice.expires_at,
+        inputs=invoice.input_states(),
+        outputs=invoice.output_states(),
+    )

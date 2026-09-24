@@ -89,7 +89,7 @@ class Plan:
 
 @dataclass(frozen=True, slots=True)
 class Finished:
-    status: InvoiceStatus  # DELIVERED, EXPIRED or FAILED
+    status: InvoiceStatus  # DELIVERED or TOOLS_DOWN
     reason: str
 
 
@@ -97,18 +97,24 @@ type Decision = Plan | Finished
 
 
 def decide(invoice: Invoice, facilitators_for: FacilitatorsFor) -> Decision:
-    """What happens next for a running job, from its holdings: more work, or the end."""
+    """What happens next for a running job, from its holdings: more work, or the end.
+
+    A job ends one of two ways: delivered, or tools down, where Mai stops and the job's
+    result is the money itself, handed to the owner (see Invoice.TOOLS_DOWN).
+    """
     inputs = invoice.input_states()
     outputs = invoice.output_states()
+    if invoice.tools_down_requested:
+        return Finished(InvoiceStatus.TOOLS_DOWN, "the owner put the tools down")
     if all(out.status == OutputStatus.DELIVERED for out in outputs):
         return Finished(InvoiceStatus.DELIVERED, "every output was delivered")
     awaited = [inp for inp in inputs if inp.status != InputStatus.RECEIVED]
     if awaited and Timestamp.now() > invoice.expires_at:
-        return Finished(InvoiceStatus.EXPIRED, "the inputs didn't arrive in time")
+        return Finished(InvoiceStatus.TOOLS_DOWN, "the inputs didn't arrive in time")
     for out in outputs:
         if out.status == OutputStatus.PENDING and out.attempts >= MAX_ATTEMPTS:
             return Finished(
-                InvoiceStatus.FAILED,
+                InvoiceStatus.TOOLS_DOWN,
                 f"{out.attempts} transfers to {out.balance.address.value} came back",
             )
     try:
@@ -119,7 +125,7 @@ def decide(invoice: Invoice, facilitators_for: FacilitatorsFor) -> Decision:
             if out.status == OutputStatus.PENDING
         ]
     except NoRouteError as e:
-        return Finished(InvoiceStatus.FAILED, str(e))
+        return Finished(InvoiceStatus.TOOLS_DOWN, f"no way to finish: {e}")
     return Plan(tuple(operations))
 
 

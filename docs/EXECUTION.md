@@ -36,6 +36,7 @@ custody state that answers "who can move this right now?":
 | in flight | committed to something not yet final (a sent transaction, an order, a bridge deposit), with its reference so it can be checked and resumed |
 | delivered | at a recipient; it has left custody |
 | consumed | spent: gas, protocol fees |
+| released | handed back with the tools down: the owner holds the account's key |
 
 Funds only change position through **movements** reported by actions. The
 movements are the invoice's line items (see `INVOICING.md`): the record of
@@ -79,15 +80,14 @@ The engine runs whatever the planner scheduled and applies what it reports.
 When the scheduled work is done, or a step of it fails, it asks the planner
 again. It knows nothing about chains, tokens or gas, and it decides nothing
 about the job: each action reports how its own steps ended, and the planner
-decides what happens next, including that the job is finished (delivered,
-expired, or failed for lack of a route or after repeated attempts).
+decides what happens next, including that the job is finished: delivered, or
+tools down (below).
 
 The engine's own role is a guardrail for what is truly broken rather than
 merely unsuccessful: an error escaping an action or the planner, books that
 don't add up, an action that ends without reporting how, a planner with
-nothing to do for an unfinished job, passes that make no progress. Then it
-**halts** the job: it stops moving money, leaves everything where the holdings
-say it is, and records why, for a human to look at.
+nothing to do for an unfinished job, passes that make no progress. Then it puts
+the tools down, and records why.
 
 The invoice and its work log are the record of all this, for introspection.
 Actions report into them; nothing reads them back to decide what to do.
@@ -116,12 +116,39 @@ There is no separate recovery path. This needs the job's state to be durable,
 which is a separate piece of work; actions are written to be resumable either
 way.
 
+## Tools down
+
+A job ends one of two ways. Either the outputs are delivered, or Mai puts the
+tools down: she stops, and **the job's result is the money itself**. Every
+account the job controls is handed to the invoice's owner, with its key and
+what the chain shows it holding. The funds don't move; control of them does.
+
+The tools go down when the planner finds no way to finish (no route, the
+inputs didn't arrive in time, transfers keep coming back), when the engine's
+guardrails trip, or when the owner asks. Whatever was in flight is normally
+watched to its end first; when a guardrail stops a broken action partway, it
+may not be, which is why the handover reads balances from the chain rather than
+from the record. The invoice records why, keeps
+anything already delivered, and marks what was held as released once the owner
+has the keys.
+
+This replaces refunds. A refund needs Mai to choose where the money goes and to
+still be able to move it; handing over the keys needs neither. It works when
+she can't act (no gas, no facilitator, a bug), and the keys can be the input to
+whatever the owner asks for next, from Mai or anywhere else.
+
+The owner is whoever holds the invoice id: it is the credential. The keys go
+only to a blind call with an encrypted reply (SEP-2133), never over an
+interface whose replies the operator could read.
+
 ## Arrivals
 
 Mai is generous about what arrives. If the goal is still reachable, she
 carries on: 1.001 ETH against a 1 ETH quote runs the plan as quoted, and the
-surplus stays as a visible held position. What happens to surplus is decided
-together with fees and refunds.
+surplus stays as a visible held position, which the owner can take with the
+tools down. Anything the record missed is counted when the tools go down: the
+handover reads the chain, and funds beyond what the record accounts for are
+recorded as arrivals before they are released.
 
 ## Capabilities
 
@@ -141,6 +168,6 @@ whether the authorization was used.
 
 - **Fees.** Mai runs as a pure execution engine for now; fee-taking is a
   separate part.
-- **Cancellation and refunds.** Deferred: the nuanced part is deciding what
-  can be unwound once funds are in flight.
+- **Keys as inputs.** The other half of tools down: a job whose inputs are
+  accounts the owner holds the keys to.
 - **Durable job state.** Needed for recovery across restarts.

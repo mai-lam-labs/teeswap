@@ -3,7 +3,7 @@
 import abc
 from dataclasses import dataclass
 
-from ..execution.invoice import InvoiceView
+from ..execution.invoice import Handover, InvoiceView
 from ..tools import StatusResponse
 from ..types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
 from ..x402 import (
@@ -45,6 +45,14 @@ class Api(abc.ABC):
 
     @abc.abstractmethod
     async def invoice(self, request: InvoiceRequest) -> InvoiceView: ...
+
+    @abc.abstractmethod
+    async def tools_down(self, request: InvoiceRequest) -> StatusResponse:
+        """Ask Mai to stop; the invoice reaches tools_down once nothing is in flight."""
+
+    @abc.abstractmethod
+    async def handover(self, request: InvoiceRequest) -> Handover:
+        """With the tools down: the accounts and their keys. Secret, so never over REST."""
 
     async def accept_paid(self, request: InvoiceRequest, payer: Payer) -> PaidAccept:
         """Accept an x402-funded quote, paying for it: ask what to pay, pay, call again."""

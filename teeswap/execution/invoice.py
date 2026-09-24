@@ -22,7 +22,10 @@ from ..common import TeeSwapError
 from ..config import Operator
 from ..response import DataclassResponse
 from ..types import (
+    Address,
+    Amount,
     Balance,
+    Hex32,
     QuoteRequest,
     QuoteResponse,
     Timestamp,
@@ -31,8 +34,8 @@ from ..types import (
     TxHash,
 )
 from ..wire import WireStruct
-from .accounts import Accounts
-from .ledger import Custody, Holdings, Movement, MovementKind, Position
+from .accounts import Account, Accounts
+from .ledger import Custody, Holdings, Movement, MovementKind, Place, Position
 from .worklog import Action, ActionView, StepId, WorkLog
 
 
@@ -84,9 +87,10 @@ class InvoiceStatus(enum.StrEnum):
     AWAITING_DEPOSIT = "awaiting_deposit"
     EXECUTING = "executing"
     DELIVERED = "delivered"
-    FAILED = "failed"  # the planner found no way to finish the job
-    EXPIRED = "expired"
-    HALTED = "halted"  # stopped by the engine's guardrails: needs a human
+    # Mai has stopped: instead of the outputs, the job's result is the money itself,
+    # every account it controls, handed to the invoice's owner (see `reason` for why)
+    TOOLS_DOWN = "tools_down"
+    EXPIRED = "expired"  # a quote nobody accepted
 
 
 class Funding(enum.StrEnum):
@@ -99,7 +103,8 @@ class Funding(enum.StrEnum):
 class InputStatus(enum.StrEnum):
     AWAITING = "awaiting"
     RECEIVED = "received"
-    EXPIRED = "expired"
+    EXPIRED = "expired"  # the quote expired before it was accepted
+    NOT_RECEIVED = "not_received"  # the tools went down before it arrived
 
 
 class OutputStatus(enum.StrEnum):
@@ -141,9 +146,28 @@ class InvoiceView(DataclassResponse):
     inputs: tuple[InvoiceInput, ...]
     outputs: tuple[InvoiceOutput, ...]
     gas: TokenAmount
+    accounts: tuple[Account, ...]
     holdings: tuple[Position, ...]
     movements: tuple[Movement, ...]
     actions: tuple[ActionView, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReleasedAccount(WireStruct):
+    address: Address
+    purpose: str
+    private_key: Hex32  # the secret: holding it is holding the money
+    balances: tuple[TokenAmount, ...]  # what the chain shows there as it's handed over
+
+
+@dataclass(frozen=True)
+class Handover(DataclassResponse):
+    """What an invoice's owner gets with the tools down: every account the job controls,
+    with its key and what it holds. The funds don't move: control of them does."""
+
+    status: InvoiceStatus
+    reason: str | None
+    accounts: tuple[ReleasedAccount, ...]
 
 
 QUOTE_TTL = timedelta(minutes=5)
@@ -163,6 +187,8 @@ class Invoice:
 
     status: InvoiceStatus = InvoiceStatus.QUOTED
     reason: str | None = None
+    # the owner asked Mai to stop: the planner puts the tools down once nothing is in flight
+    tools_down_requested: bool = False
     # facilitators that failed an operation for this job; the planner won't pick them again
     excluded_facilitators: set[str] = field(default_factory=set)
 
@@ -196,6 +222,42 @@ class Invoice:
         self.status = status
         self.reason = reason
 
+    def observed(self, balance: Balance) -> None:
+        """The chain shows `balance` at one of the job's accounts: anything beyond what the
+        record accounts for there (held, or already released) arrived from outside."""
+        token = balance.amount.token
+        recorded = sum(
+            self.holdings.amount_at(Place(address=balance.address, custody=c), token).amount.amount
+            for c in (Custody.HELD, Custody.RELEASED)
+        )
+        if balance.amount.amount > recorded:
+            arrived = TokenAmount(token=token, amount=Amount(balance.amount.amount - recorded))
+            self.holdings.apply(
+                Movement(
+                    kind=MovementKind.INPUT,
+                    amount=arrived,
+                    source=None,
+                    destination=Place(address=balance.address, custody=Custody.HELD),
+                    timestamp=Timestamp.now(),
+                )
+            )
+
+    def release(self) -> None:
+        """Record that the owner now holds the keys: whatever is held is released."""
+        for position in self.holdings.positions:
+            if position.place.custody != Custody.HELD:
+                continue
+            released = Place(address=position.place.address, custody=Custody.RELEASED)
+            self.holdings.apply(
+                Movement(
+                    kind=MovementKind.RELEASE,
+                    amount=position.amount,
+                    source=position.place,
+                    destination=released,
+                    timestamp=Timestamp.now(),
+                )
+            )
+
     def view(self) -> InvoiceView:
         return InvoiceView(
             quote_id=str(self.id),
@@ -208,6 +270,7 @@ class Invoice:
             inputs=self.input_states(),
             outputs=self.output_states(),
             gas=self.quote.gas,
+            accounts=self.accounts.all,
             holdings=self.holdings.positions,
             movements=self.holdings.movements,
             actions=tuple(action.view() for action in self.worklog.actions),
@@ -232,6 +295,8 @@ class Invoice:
                 status = InputStatus.RECEIVED
             elif self.status == InvoiceStatus.EXPIRED:
                 status = InputStatus.EXPIRED
+            elif self.status == InvoiceStatus.TOOLS_DOWN:
+                status = InputStatus.NOT_RECEIVED
             else:
                 status = InputStatus.AWAITING
             states.append(

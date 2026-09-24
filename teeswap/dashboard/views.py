@@ -221,7 +221,7 @@ def render_invoices(registry: InvoiceRegistry) -> str:
                         css = (
                             "up"
                             if inv.is_active
-                            else ("down" if inv.status.value in ("failed", "halted") else "warn")
+                            else ("down" if inv.status.value == "tools_down" else "warn")
                         )
                         current = inv.current_action
                         with tr():

@@ -23,6 +23,7 @@ class Custody(enum.StrEnum):
     IN_FLIGHT = "in_flight"  # committed to a transaction not yet final
     DELIVERED = "delivered"  # at a recipient; left custody
     CONSUMED = "consumed"  # spent: gas, fees
+    RELEASED = "released"  # handed back with the tools down: the owner holds the keys
 
 
 class MovementKind(enum.StrEnum):
@@ -30,6 +31,7 @@ class MovementKind(enum.StrEnum):
     TRANSIT = "transit"  # held -> in flight: a transaction was sent
     OUTPUT = "output"  # in flight -> delivered
     GAS = "gas"  # held -> consumed
+    RELEASE = "release"  # held -> released: the account's key went to the owner
 
 
 @dataclass(frozen=True, slots=True)

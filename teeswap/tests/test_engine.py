@@ -8,12 +8,18 @@ the local facilitator.
 import asyncio
 
 import pytest
+from eth_typing import HexStr
 
-from teeswap.api import Api
+from teeswap.api import Api, RestApi
+from teeswap.blockchain.evm import EncodedCall, EthSigner, EvmChain
 from teeswap.execution.invoice import InputStatus, InvoiceNotFoundError, InvoiceView, OutputStatus
 from teeswap.execution.ledger import Custody
 from teeswap.execution.planner import NoRouteError
+from teeswap.http import HttpClient
+from teeswap.mcp import ToolNotAvailableError
 from teeswap.tests.conftest import (
+    ANVIL_CHAIN,
+    ANVIL_URL,
     ETH,
     ONE_ETH,
     ONE_USDC,
@@ -38,7 +44,7 @@ from teeswap.wire import decode_object
 from teeswap.x402 import EvmPayer
 
 SURPLUS = 10**15  # 0.001 ETH
-FINISHED = ("delivered", "failed", "expired", "halted")
+FINISHED = ("delivered", "tools_down", "expired")
 
 
 def _to(address: str, amount: TokenAmount) -> Balance:
@@ -181,3 +187,57 @@ async def test_unknown_invoice(api: Api) -> None:
     """A mistyped quote id is the same error whichever way it's asked."""
     with pytest.raises(InvoiceNotFoundError):
         await api.status(InvoiceRequest(quote_id="inv_bogus"))
+
+
+@pytest.mark.asyncio
+async def test_tools_down_hands_over_the_money(
+    api: Api, chain: LocalChain, invoice_page: SaveInvoice
+) -> None:
+    """A user pays part of a deposit, changes their mind, and gets the money back as the
+    account's key, which they then use themselves."""
+    amount = TokenAmount(token=ETH, amount=Amount(ONE_ETH // 10))
+    quote = await api.quote(QuoteRequest(inputs=(amount,), outputs=(_to(new_address(), amount),)))
+    request = InvoiceRequest(quote_id=quote.quote_id)
+    (deposit_to,) = (await api.accept(request)).deposits
+    sent = amount.amount // 2
+    chain.transfer_eth(deposit_to.address.value, sent)
+
+    await api.tools_down(request)
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "tools_down", f"invoice ended {status.status}"
+    assert status.reason == "the owner put the tools down"
+    (deposit,) = status.inputs
+    assert deposit.status == InputStatus.NOT_RECEIVED
+    assert [o.status for o in status.outputs] == [OutputStatus.PENDING]
+
+    if isinstance(api, RestApi):
+        # REST replies cross the operator's network readable: the keys never go that way
+        with pytest.raises(ToolNotAvailableError):
+            await api.handover(request)
+        return
+
+    handover = await api.handover(request)
+    (account,) = handover.accounts
+    assert account.address == deposit_to.address
+    assert account.balances == (TokenAmount(token=ETH, amount=Amount(sent)),)
+
+    # here's the money: the key moves it, with Mai out of the picture
+    owner = EthSigner(account.private_key.to_bytes())
+    assert owner.address == deposit_to.address.value
+    user = new_address()
+    async with HttpClient() as client:
+        evm = EvmChain(ANVIL_CHAIN, client, ANVIL_URL)
+        tx = await evm.prepare(owner, EncodedCall(to=user, data=HexStr("0x"), value=sent // 2))
+        await evm.submit(tx)
+        while await evm.receipt(tx.tx_hash) is None:
+            await asyncio.sleep(0.1)
+    assert chain.eth_balance(user) == sent // 2
+
+    # the handover brought the record up to what the chain showed: all of it released
+    view = await api.invoice(request)
+    (deposit,) = view.inputs
+    assert deposit.received.amount == sent
+    by_custody = _by_custody(view)
+    assert by_custody.get(Custody.RELEASED) == sent
+    assert not by_custody.get(Custody.HELD)
+    await invoice_page(quote.quote_id)

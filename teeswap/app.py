@@ -218,7 +218,8 @@ def make_http_app(instance: TeeSwap) -> Litestar:
     rest_handlers = [
         _make_rest_handler(tool)
         for tool in instance.dispatcher.tools.values()
-        if not tool.requires_session
+        # REST replies cross the operator's network readable: no secrets there
+        if not tool.requires_session and not tool.blind_only
     ]
 
     api_router = Router(

@@ -21,10 +21,12 @@ from .mcp import Dispatcher, SessionManager
 from .tools import (
     AcceptTool,
     AcceptX402Tool,
+    HandoverTool,
     InvoiceTool,
     QuoteTool,
     QuoteX402Tool,
     StatusTool,
+    ToolsDownTool,
 )
 
 
@@ -81,6 +83,10 @@ class TeeSwap:
         self.dispatcher.register(invoice_tool)
         self.dispatcher.register(quote_x402_tool)
         self.dispatcher.register(accept_x402_tool)
+        tools_down_tool = ToolsDownTool(self.engine, self.invoice_registry)
+        handover_tool = HandoverTool(self.engine)
+        self.dispatcher.register(tools_down_tool)
+        self.dispatcher.register(handover_tool)
         self.api = LocalApi(
             quote_tool,
             accept_tool,
@@ -88,6 +94,8 @@ class TeeSwap:
             accept_x402_tool,
             status_tool,
             invoice_tool,
+            tools_down_tool,
+            handover_tool,
         )
 
     def start_background_tasks(self) -> None:

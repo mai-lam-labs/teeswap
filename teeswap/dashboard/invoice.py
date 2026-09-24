@@ -128,7 +128,9 @@ _STATUS_BADGE: dict[str, str] = {
     "delivered": "badge-success",
     "failed": "badge-danger",
     "expired": "badge-muted",
-    "halted": "badge-danger",
+    "tools_down": "badge-danger",
+    "released": "badge-warning",
+    "not_received": "badge-muted",
     "waiting": "badge-warning",
 }
 
@@ -200,6 +202,10 @@ def render_invoice_html(invoice: InvoiceView) -> str:
             with div(cls="kv-value"):
                 span(invoice.status.value.replace("_", " ").upper(), cls=f"badge {badge_cls}")
 
+            if invoice.reason:
+                span("Why", cls="kv-label")
+                span(invoice.reason, cls="kv-value")
+
             span("Expires", cls="kv-label")
             span(_fmt_time(invoice.expires_at), cls="kv-value")
 
@@ -245,6 +251,27 @@ def render_invoice_html(invoice: InvoiceView) -> str:
                             )
                             for tx in out.transactions:
                                 span(f" {tx.hash}", cls="mono")
+
+        # --- Accounts: the addresses the job controls; with the tools down, the handover ---
+        if invoice.accounts:
+            h2("Accounts")
+            if invoice.status.value == "tools_down":
+                p(
+                    "The tools are down: these accounts, and what they hold, are handed to "
+                    "the invoice's owner with their keys.",
+                    cls="sub",
+                )
+            with div(cls="card"), table():
+                with thead(), tr():
+                    th("Account")
+                    th("Chain")
+                    th("For")
+                with tbody():
+                    for account in invoice.accounts:
+                        with tr():
+                            td(account.address.value, cls="mono")
+                            td(account.address.chain.name)
+                            td(account.purpose)
 
         # --- Custody: where every unit of the funds is now ---
         if invoice.holdings:

@@ -1,6 +1,8 @@
 """McpApi: a client for TeeSwap's MCP interface (JSON-RPC tools/call over HTTP)."""
 
+import base64
 import itertools
+import os
 from dataclasses import dataclass, field
 from typing import Any, override
 
@@ -8,12 +10,22 @@ import httpx
 from litestar import MediaType
 
 from ..common import PKG_NAME, TeeSwapError
-from ..execution.invoice import InvoiceView
+from ..crypto.attestation import (
+    HPKE_INFO_ARGS,
+    HPKE_INFO_REPLY,
+    VERIFIABLE_TOOLS_NS,
+    build_args_aad,
+    build_reply_aad,
+    compute_commitment,
+    jcs,
+)
+from ..crypto.hpke import HpkeKeypair, hpke_seal
+from ..execution.invoice import Handover, InvoiceView
 from ..mcp import ERROR_META_KEY, MCP_PROTOCOL_VERSION, PROTOCOL_VERSION_META
 from ..response import ErrorResponse
 from ..tools import StatusResponse
 from ..types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
-from ..wire import HasFromDict, WireStruct, decode_object, encode
+from ..wire import HasFromDict, WireStruct, decode_object, encode, parse_json
 from ..x402 import (
     MCP_PAYMENT_META_KEY,
     MCP_PAYMENT_RESPONSE_META_KEY,
@@ -59,15 +71,44 @@ class _RpcReply(HasFromDict):
     error: _RpcError | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _BlindCapability(HasFromDict):
+    """The server's SEP-2133 capability: where blind calls are encrypted to."""
+
+    proofFormats: tuple[str, ...]  # noqa: N815  # SEP-2133 wire field name
+    blindExecution: bool = False  # noqa: N815  # SEP-2133 wire field name
+    blindEncryptionSchemes: tuple[str, ...] = ()  # noqa: N815  # SEP-2133 wire field name
+    blindPublicKeys: dict[str, str] = field(default_factory=dict)  # noqa: N815  # SEP-2133 wire field name
+
+
 class McpApi(Api):
-    """Stateless tools/call requests. The SEP-2133 attestation on each result is not
-    verified here yet."""
+    """Stateless tools/call requests, and SEP-2133 blind calls for tools whose results
+    are secret. The attestation on each result is not verified here yet, and neither is
+    the server's blind key: it is taken from server/discover as given."""
 
     def __init__(self, client: httpx.AsyncClient, path: str = "/mcp") -> None:
         """`client` carries the base URL (or is an in-process test client)."""
         self._client = client
         self._path = path
         self._ids = itertools.count(1)
+        self._blind_key: bytes | None = None
+
+    async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        message = {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params}
+        resp = await self._client.post(
+            self._path, content=encode(message), headers={"content-type": MediaType.JSON}
+        )
+        return decode_object(resp.content)
+
+    async def _call_result(self, method: str, params: dict[str, Any]) -> _ToolResult:
+        reply = _RpcReply.from_dict(await self._request(method, params))
+        if reply.error is not None:
+            if reply.error.data is not None:
+                raise reply.error.data.to_exception()
+            raise TeeSwapError(reply.error.message)
+        if reply.result is None:
+            raise TeeSwapError(f"{method}: a JSON-RPC reply with neither result nor error")
+        return reply.result
 
     async def _tools_call(
         self, tool: str, arguments: WireStruct, payment: PaymentPayload | None = None
@@ -75,23 +116,57 @@ class McpApi(Api):
         meta: dict[str, Any] = {PROTOCOL_VERSION_META: MCP_PROTOCOL_VERSION}
         if payment is not None:
             meta[MCP_PAYMENT_META_KEY] = payment
-        message = {
-            "jsonrpc": "2.0",
-            "id": next(self._ids),
-            "method": "tools/call",
-            "params": {"name": f"{PKG_NAME}_{tool}", "arguments": arguments, "_meta": meta},
-        }
-        resp = await self._client.post(
-            self._path, content=encode(message), headers={"content-type": MediaType.JSON}
+        params = {"name": f"{PKG_NAME}_{tool}", "arguments": arguments, "_meta": meta}
+        return await self._call_result("tools/call", params)
+
+    async def _server_blind_key(self) -> bytes:
+        if self._blind_key is None:
+            discovered = await self._request("server/discover", {})
+            capability = _BlindCapability.from_dict(discovered["result"][VERIFIABLE_TOOLS_NS])
+            key = capability.blindPublicKeys.get(BLIND_SCHEME)
+            if key is None:
+                raise TeeSwapError("the server offers no blind execution")
+            self._blind_key = _unb64url(key)
+        return self._blind_key
+
+    async def _blind_call(self, tool: str, arguments: WireStruct) -> _ToolResult:
+        """A verifiable-tools/call: arguments encrypted to the TEE, the reply to a key only
+        this call holds. The operator relays both and can read neither."""
+        name = f"{PKG_NAME}_{tool}"
+        args = decode_object(encode(arguments))
+        salt = os.urandom(32)
+        commitment = compute_commitment(salt, args)
+        sealed = hpke_seal(
+            await self._server_blind_key(),
+            HPKE_INFO_ARGS,
+            build_args_aad(name, commitment, BLIND_SCHEME),
+            jcs({"salt": "0x" + salt.hex(), "arguments": args}),
         )
-        reply = _RpcReply.from_dict(decode_object(resp.content))
-        if reply.error is not None:
-            if reply.error.data is not None:
-                raise reply.error.data.to_exception()
-            raise TeeSwapError(reply.error.message)
-        if reply.result is None:
-            raise TeeSwapError(f"{tool}: a JSON-RPC reply with neither result nor error")
-        return reply.result
+        reply_keys = HpkeKeypair.random()
+        result = await self._call_result(
+            "verifiable-tools/call",
+            {
+                "name": name,
+                "inputCommitment": commitment,
+                "encryptionScheme": BLIND_SCHEME,
+                "encryptedArguments": _b64url(sealed),
+                "replyPublicKey": _b64url(reply_keys.public_key_bytes),
+                "_meta": {PROTOCOL_VERSION_META: MCP_PROTOCOL_VERSION},
+            },
+        )
+        (sealed_reply,) = result.content
+        plaintext = reply_keys.open(
+            HPKE_INFO_REPLY, build_reply_aad(name, commitment, None), _unb64url(sealed_reply.text)
+        )
+        content = parse_json(plaintext)
+        if not isinstance(content, list):
+            raise TeeSwapError(f"{name}: the decrypted reply is not a content list")
+        return _ToolResult(
+            content=tuple(_TextContent.from_dict(item) for item in content),
+            isError=result.isError,
+            structuredContent=result.structuredContent,
+            _meta=result.meta,
+        )
 
     async def _call[R: HasFromDict](self, tool: str, arguments: WireStruct, result: type[R]) -> R:
         return _output(await self._tools_call(tool, arguments), result)
@@ -128,6 +203,14 @@ class McpApi(Api):
     async def invoice(self, request: InvoiceRequest) -> InvoiceView:
         return await self._call("invoice", request, InvoiceView)
 
+    @override
+    async def tools_down(self, request: InvoiceRequest) -> StatusResponse:
+        return await self._call("tools_down", request, StatusResponse)
+
+    @override
+    async def handover(self, request: InvoiceRequest) -> Handover:
+        return _output(await self._blind_call("handover", request), Handover)
+
 
 def _output[R: HasFromDict](result: _ToolResult, output: type[R]) -> R:
     """A tool result's value: its text content, or the error it reports, raised."""
@@ -138,3 +221,14 @@ def _output[R: HasFromDict](result: _ToolResult, output: type[R]) -> R:
         raise ErrorResponse.from_dict(error).to_exception()
     (content,) = result.content
     return output.from_dict(decode_object(content.text))
+
+
+BLIND_SCHEME = "hpke-v1"
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _unb64url(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))

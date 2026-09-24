@@ -13,3 +13,8 @@ class ChainKey(abc.ABC):
     @abc.abstractmethod
     def address(self) -> str:
         """The key's address, in its chain family's format."""
+
+    @property
+    @abc.abstractmethod
+    def private_key(self) -> bytes:
+        """The secret itself: only ever handed to an invoice's owner, with the tools down."""
