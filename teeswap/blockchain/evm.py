@@ -319,6 +319,11 @@ class EvmChain:
     async def gas_price(self) -> int:
         return int(await jsonrpc(self._client, self._url, "eth_gasPrice"), 16)
 
+    async def max_fee_per_gas(self) -> int:
+        """The most a transaction commits to paying per unit of gas. Its sender must hold
+        this much for the gas on top of the value, whatever it ends up paying."""
+        return await self.gas_price() * 2
+
     async def estimate_gas(self, sender: ChecksumAddress, call: EncodedCall) -> int:
         """Gas for this call from this sender, simulated against current state."""
         return await self._estimate(sender, call, [])
@@ -336,6 +341,7 @@ class EvmChain:
         """Simulate and sign `call` from the signer's address, without sending it."""
         gas = await self.estimate_gas(signer.address, call)
         gas_price = await self.gas_price()
+        max_fee = await self.max_fee_per_gas()
         nonce = await self._rpc.get_nonce(signer.address)
         return signer.sign_transaction(
             {
@@ -343,7 +349,7 @@ class EvmChain:
                 "value": call.value,
                 "data": call.data,
                 "gas": gas,
-                "maxFeePerGas": gas_price * 2,
+                "maxFeePerGas": max_fee,
                 "maxPriorityFeePerGas": gas_price // 10,
                 "nonce": nonce,
                 "chainId": self.chain_id,

@@ -6,6 +6,7 @@ the local facilitator.
 """
 
 import asyncio
+import os
 
 import pytest
 from eth_typing import HexStr
@@ -35,7 +36,10 @@ from teeswap.types import (
     Address,
     Amount,
     Balance,
+    HeldInput,
+    Hex32,
     InvoiceRequest,
+    KeysQuoteRequest,
     QuoteRequest,
     QuoteResponse,
     TokenAmount,
@@ -240,4 +244,44 @@ async def test_tools_down_hands_over_the_money(
     by_custody = _by_custody(view)
     assert by_custody.get(Custody.RELEASED) == sent
     assert not by_custody.get(Custody.HELD)
+    await invoice_page(quote.quote_id)
+
+
+@pytest.mark.asyncio
+async def test_handed_over_keys_become_inputs(
+    api: Api, chain: LocalChain, invoice_page: SaveInvoice
+) -> None:
+    """The money handed over with the tools down goes straight back in: the account's key
+    is the input to the next job, with nothing moved in between."""
+    if isinstance(api, RestApi):
+        held = HeldInput(token=ETH, private_key=Hex32.from_bytes(os.urandom(32)))
+        request = KeysQuoteRequest(inputs=(held,), outputs=())
+        with pytest.raises(ToolNotAvailableError):
+            await api.quote_keys(request)  # keys never cross an interface the operator reads
+        return
+
+    # a job that went no further than a partial deposit, with its tools put down
+    amount = TokenAmount(token=ETH, amount=Amount(ONE_ETH // 10))
+    first = await api.quote(QuoteRequest(inputs=(amount,), outputs=(_to(new_address(), amount),)))
+    (deposit_to,) = (await api.accept(InvoiceRequest(quote_id=first.quote_id))).deposits
+    sent = amount.amount // 2
+    chain.transfer_eth(deposit_to.address.value, sent)
+    await api.tools_down(InvoiceRequest(quote_id=first.quote_id))
+    assert (await _until_finished(api, first.quote_id)).status == "tools_down"
+    (account,) = (await api.handover(InvoiceRequest(quote_id=first.quote_id))).accounts
+
+    # the key is the next job's input: what that account holds, sent on
+    recipient = new_address()
+    held = HeldInput(token=ETH, private_key=account.private_key)
+    wanted = _to(recipient, TokenAmount(token=ETH, amount=Amount(sent)))
+    quote = await api.quote_keys(KeysQuoteRequest(inputs=(held,), outputs=(wanted,)))
+    assert quote.inputs == (TokenAmount(token=ETH, amount=Amount(sent)),)
+    accepted = await api.accept(InvoiceRequest(quote_id=quote.quote_id))
+    (input_account,) = accepted.deposits
+    assert input_account.address == deposit_to.address  # the same account, not a new one
+
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "delivered", f"invoice ended {status.status}"
+    (output,) = quote.outputs
+    assert chain.eth_balance(recipient) == output.amount.amount
     await invoice_page(quote.quote_id)

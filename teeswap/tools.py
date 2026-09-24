@@ -15,7 +15,14 @@ from .execution.invoice import (
 )
 from .mcp import PaidTool, Tool, ToolDefinition
 from .response import DataclassResponse
-from .types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse, Timestamp
+from .types import (
+    AcceptResponse,
+    InvoiceRequest,
+    KeysQuoteRequest,
+    QuoteRequest,
+    QuoteResponse,
+    Timestamp,
+)
 from .x402 import PaymentPayload, X402PaymentResult, X402PaymentSpec
 
 
@@ -73,6 +80,38 @@ class QuoteX402Tool(Tool):
         return await self._engine.quote(args, Funding.X402)
 
 
+class QuoteKeysTool(Tool):
+    """Quote a job whose inputs are accounts the client holds the keys to, for example the
+    accounts a job handed over with its tools down. Blind calls only: the keys are secret,
+    and so is the quote id in the reply."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    @property
+    @override
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="teeswap_quote_keys",
+            description="Get a quote for a transfer or swap whose inputs are accounts you hold "
+            "the keys to. Accept with teeswap_accept. Only as a blind call with an encrypted "
+            "reply.",
+            input_type=KeysQuoteRequest,
+            output_type=QuoteResponse,
+            annotations={"readOnly": True, "openWorld": True},
+            tags=("swap",),
+        )
+
+    @property
+    @override
+    def blind_only(self) -> bool:
+        return True
+
+    @override
+    async def execute(self, args: KeysQuoteRequest) -> QuoteResponse:
+        return await self._engine.quote_keys(args)
+
+
 class AcceptTool(Tool):
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -82,8 +121,8 @@ class AcceptTool(Tool):
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="teeswap_accept",
-            description="Accept a deposit-funded quote and start the invoice. "
-            "Returns deposit address and instructions.",
+            description="Accept a quote funded by deposit or by handed-over keys, and start the "
+            "invoice. Returns deposit addresses and instructions.",
             input_type=InvoiceRequest,
             output_type=AcceptResponse,
             annotations={"readOnly": False, "idempotent": False, "openWorld": True},

@@ -8,13 +8,20 @@ from ..tools import (
     AcceptX402Tool,
     HandoverTool,
     InvoiceTool,
+    QuoteKeysTool,
     QuoteTool,
     QuoteX402Tool,
     StatusResponse,
     StatusTool,
     ToolsDownTool,
 )
-from ..types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
+from ..types import (
+    AcceptResponse,
+    InvoiceRequest,
+    KeysQuoteRequest,
+    QuoteRequest,
+    QuoteResponse,
+)
 from ..x402 import PaymentPayload, PaymentRequired, ResourceInfo, X402PaymentSpec
 from .base import Api, PaidAccept
 
@@ -30,6 +37,7 @@ class LocalApi(Api):
         invoice_tool: InvoiceTool,
         tools_down_tool: ToolsDownTool,
         handover_tool: HandoverTool,
+        quote_keys_tool: QuoteKeysTool,
     ) -> None:
         self._quote = quote_tool
         self._accept = accept_tool
@@ -39,6 +47,7 @@ class LocalApi(Api):
         self._invoice = invoice_tool
         self._tools_down = tools_down_tool
         self._handover = handover_tool
+        self._quote_keys = quote_keys_tool
 
     @override
     async def quote(self, request: QuoteRequest) -> QuoteResponse:
@@ -51,6 +60,10 @@ class LocalApi(Api):
     @override
     async def quote_x402(self, request: QuoteRequest) -> QuoteResponse:
         return await self._quote_x402.execute(request)
+
+    @override
+    async def quote_keys(self, request: KeysQuoteRequest) -> QuoteResponse:
+        return await self._quote_keys.execute(request)
 
     @override
     async def accept_x402(

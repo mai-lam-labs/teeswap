@@ -118,6 +118,7 @@ class SideEffect(abc.ABC):
         self.target = target
         self.sent_at: Timestamp | None = None
         self.error: str | None = None  # the send failed; that alone doesn't mean it didn't happen
+        self.refused = False  # the receiver answered that it won't take it
         self.resolution: Resolution | None = None
 
     @property
@@ -137,6 +138,10 @@ class SideEffect(abc.ABC):
 
     def failed(self, error: str) -> None:
         self.error = error
+
+    def refuse(self, error: str) -> None:
+        self.error = error
+        self.refused = True
 
     def view(self) -> SideEffectView:
         outcome: SideEffectOutcome | None = None

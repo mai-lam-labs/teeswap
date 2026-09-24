@@ -5,13 +5,17 @@ that chain's key type, derived from the job's seed for a purpose. An action asks
 for the account it needs by chain and purpose, and gets the existing one or a
 new one. Derivation is deterministic in (seed, chain, purpose), so the same
 request always names the same account.
+
+An account can also be adopted: a key its owner hands over (say, from a job
+whose tools went down) takes the place of a derived one, and its funds become
+the job's inputs.
 """
 
 import hmac
 from dataclasses import dataclass
 
 from ..blockchain.chains import Chain
-from ..blockchain.derivation import derive_key
+from ..blockchain.derivation import derive_key, key_from_secret
 from ..blockchain.keys import ChainKey
 from ..common import TeeSwapError
 from ..types import Address
@@ -44,6 +48,17 @@ class Accounts:
         if existing is not None:
             return existing
         key = derive_key(chain, self._seed, f"{chain.caip2}/{purpose}".encode())
+        account = Account(address=Address(chain, key.address), purpose=purpose)
+        self._accounts[(chain, purpose)] = account
+        self._keys[account.address] = key
+        return account
+
+    def adopt(self, chain: Chain, purpose: str, secret: bytes) -> Account:
+        """Take an account whose key someone handed over (its owner keeps it too) as the
+        job's account on `chain` for `purpose`, in place of a derived one."""
+        if (chain, purpose) in self._accounts:
+            raise AccountError(f"the job already has an account for {purpose} on {chain.name}")
+        key = key_from_secret(chain, secret)
         account = Account(address=Address(chain, key.address), purpose=purpose)
         self._accounts[(chain, purpose)] = account
         self._keys[account.address] = key

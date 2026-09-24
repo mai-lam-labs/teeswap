@@ -5,7 +5,13 @@ from dataclasses import dataclass
 
 from ..execution.invoice import Handover, InvoiceView
 from ..tools import StatusResponse
-from ..types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
+from ..types import (
+    AcceptResponse,
+    InvoiceRequest,
+    KeysQuoteRequest,
+    QuoteRequest,
+    QuoteResponse,
+)
 from ..x402 import (
     Payer,
     PaymentNotSettledError,
@@ -32,6 +38,10 @@ class Api(abc.ABC):
 
     @abc.abstractmethod
     async def quote_x402(self, request: QuoteRequest) -> QuoteResponse: ...
+
+    @abc.abstractmethod
+    async def quote_keys(self, request: KeysQuoteRequest) -> QuoteResponse:
+        """Quote with inputs in accounts whose keys you hand over. Secret, so never over REST."""
 
     @abc.abstractmethod
     async def accept_x402(

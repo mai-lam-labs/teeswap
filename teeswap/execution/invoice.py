@@ -98,6 +98,7 @@ class Funding(enum.StrEnum):
 
     DEPOSIT = "deposit"  # the client transfers them
     X402 = "x402"  # an x402 payment, settled by a facilitator, delivers them
+    KEYS = "keys"  # they're already there: the client handed over the accounts' keys
 
 
 class InputStatus(enum.StrEnum):
@@ -198,9 +199,9 @@ class Invoice:
     # held while an x402 payment settles, so one quote is never paid for twice
     payment_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
-    def require_funding(self, funding: Funding) -> None:
-        if self.funding != funding:
-            raise InvoiceFundingError(f"the invoice is funded by {self.funding}, not {funding}")
+    def require_funding(self, *allowed: Funding) -> None:
+        if self.funding not in allowed:
+            raise InvoiceFundingError(f"the invoice is funded by {self.funding}, not {allowed}")
 
     def check_acceptable(self) -> None:
         if self.status != InvoiceStatus.QUOTED:

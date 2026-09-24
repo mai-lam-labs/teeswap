@@ -67,8 +67,10 @@ facilitator), never a new act while the old one could still land.
 answer: it **landed** (with the evidence), it is **void** (it never can: the
 nonce went to another transaction, the authorization expired unused), or it is
 still **pending**. A request that failed or timed out is not an answer: the
-other side may have carried it out anyway. A step whose side effects haven't
-resolved is waiting; it is resolved by watching, never by acting again.
+other side may have carried it out anyway. A refusal is one, when it covers
+every copy: a transaction every node refused was never held by anyone but Mai,
+so it is void. A step whose side effects haven't resolved is waiting; it is
+resolved by watching, never by acting again.
 
 Funds arriving unasked for (dust, a second deposit) are noticed by the next
 action that reads that address, and anything left at the end by the final
@@ -141,6 +143,18 @@ The owner is whoever holds the invoice id: it is the credential. The keys go
 only to a blind call with an encrypted reply (SEP-2133), never over an
 interface whose replies the operator could read.
 
+## Keys as inputs
+
+The other half of tools down. A job's inputs can be accounts the client
+already holds the keys to, for example the accounts a job handed over: the
+client passes the keys in (again blind-only), the accounts become the new
+job's input accounts, and what each holds is its input. Nothing is deposited
+and nothing moves until the new plan says so.
+
+The client keeps the keys too. If they spend from an account while Mai works,
+the job copes with what the chain then shows, as it does with any surprise;
+it's the client's choice to make.
+
 ## Arrivals
 
 Mai is generous about what arrives. If the goal is still reachable, she
@@ -168,6 +182,4 @@ whether the authorization was used.
 
 - **Fees.** Mai runs as a pure execution engine for now; fee-taking is a
   separate part.
-- **Keys as inputs.** The other half of tools down: a job whose inputs are
-  accounts the owner holds the keys to.
 - **Durable job state.** Needed for recovery across restarts.

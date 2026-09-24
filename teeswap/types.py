@@ -303,6 +303,27 @@ class QuoteRequest(WireStruct):
     ] = DEFAULT_TOLERANCE
 
 
+@dataclass(frozen=True, slots=True)
+class HeldInput(WireStruct):
+    """An input already in an account its owner holds the key to: what the account holds
+    of `token` is the input."""
+
+    token: Token
+    private_key: Annotated[Hex32, Parameter(description="The account's key: a secret")]
+
+
+@dataclass(frozen=True, slots=True)
+class KeysQuoteRequest(WireStruct):
+    inputs: Annotated[
+        tuple[HeldInput, ...],
+        Parameter(description="The accounts holding the inputs, one per token, with their keys"),
+    ]
+    outputs: Annotated[tuple[Balance, ...], Parameter(description="Where to send the results")]
+    tolerance_percent: Annotated[
+        Percent, Parameter(description="Acceptable slippage as a percentage")
+    ] = DEFAULT_TOLERANCE
+
+
 @dataclass(frozen=True)
 class QuoteResponse(DataclassResponse):
     quote_id: Annotated[str, Parameter(description="Use this ID with teeswap_accept")]

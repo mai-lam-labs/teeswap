@@ -27,6 +27,7 @@ from ..types import (
     Amount,
     Balance,
     Hex32,
+    KeysQuoteRequest,
     QuoteRequest,
     QuoteResponse,
     Token,
@@ -53,7 +54,7 @@ from .invoice import (
 )
 from .operations import Operation, OperationContext, ReceivePayment
 from .planner import FacilitatorsFor, Finished, NoRouteError, decide
-from .quote import compute_quote
+from .quote import QuoteError, compute_quote
 from .worklog import Step, StepReport, StepStatus
 
 logger = logging.getLogger(__name__)
@@ -106,32 +107,74 @@ class Engine:
         quote_id = InvoiceId.generate()
         accounts = Accounts.for_job(self._root_key, quote_id)
         async with HttpClient() as client:
-            quote = await compute_quote(
-                client,
-                self.rpc_url_for_chain,
-                request,
-                quote_id,
-                accounts,
-                funding,
-                lambda chain: self.facilitators_for(chain, set()),
+            return await self._quote(client, request, quote_id, accounts, funding)
+
+    async def quote_keys(self, request: KeysQuoteRequest) -> QuoteResponse:
+        """Quote a job whose inputs are already in accounts the client holds the keys to.
+
+        The accounts become the job's input accounts, and what each holds now is its
+        input. The keys stay the client's too: spending from an account while Mai works
+        is theirs to decide, and the job copes with whatever the chain then shows.
+        """
+        tokens = [held.token for held in request.inputs]
+        if len(set(tokens)) != len(tokens):
+            raise QuoteError("one account per input token")
+        quote_id = InvoiceId.generate()
+        accounts = Accounts.for_job(self._root_key, quote_id)
+        async with HttpClient() as client:
+            inputs: list[TokenAmount] = []
+            for i, held in enumerate(request.inputs):
+                chain = held.token.chain
+                account = accounts.adopt(chain, f"input/{i}", held.private_key.to_bytes())
+                evm = EvmChain(chain, client, self.rpc_url_for_chain(chain))
+                owner = to_checksum_address(account.address.value)
+                balance = await evm.token_balance(held.token, owner)
+                inputs.append(TokenAmount(token=held.token, amount=Amount(balance)))
+            quote_request = QuoteRequest(
+                inputs=tuple(inputs),
+                outputs=request.outputs,
+                tolerance_percent=request.tolerance_percent,
             )
+            return await self._quote(client, quote_request, quote_id, accounts, Funding.KEYS)
+
+    async def _quote(
+        self,
+        client: BaseHttpClient,
+        request: QuoteRequest,
+        quote_id: InvoiceId,
+        accounts: Accounts,
+        funding: Funding,
+    ) -> QuoteResponse:
+        quote = await compute_quote(
+            client,
+            self.rpc_url_for_chain,
+            request,
+            quote_id,
+            accounts,
+            funding,
+            lambda chain: self.facilitators_for(chain, set()),
+        )
         self._registry.create_quote(request, quote, accounts, funding)
         return quote
 
     def accept(self, invoice_id: InvoiceId) -> AcceptResponse:
         invoice = self._registry.get(invoice_id)
-        invoice.require_funding(Funding.DEPOSIT)
+        invoice.require_funding(Funding.DEPOSIT, Funding.KEYS)
         invoice.accept()
         self._start(invoice)
+        if invoice.funding == Funding.KEYS:
+            instructions = "Nothing to send: the inputs are in the accounts you handed over"
+        else:
+            instructions = "; ".join(
+                f"Send {d.amount.amount} {d.amount.token.symbol} to {d.address.value} "
+                f"on {d.address.chain.name}"
+                for d in invoice.deposits
+            )
         return AcceptResponse(
             quote_id=str(invoice.id),
             deposits=invoice.deposits,
             expires_at=invoice.expires_at,
-            instructions="; ".join(
-                f"Send {d.amount.amount} {d.amount.token.symbol} to {d.address.value} "
-                f"on {d.address.chain.name}"
-                for d in invoice.deposits
-            ),
+            instructions=instructions,
         )
 
     # --- Tools down ---

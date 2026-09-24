@@ -51,6 +51,7 @@ from .effects import (
     Landed,
     Outcome,
     Pending,
+    Resolution,
     SideEffect,
     TransactionBroadcast,
     Void,
@@ -215,7 +216,9 @@ class NativeTransfer(Operation):
         evm = evm_for(self.chain)
         source = to_checksum_address(self._source.address.value)
         units = await evm.estimate_gas_as_funded(source, self._call())
-        gas = units * await evm.gas_price()
+        # what the transaction commits to, not the typical price: it's what the sender must
+        # hold to send it at all, and what isn't spent stays held
+        gas = units * await evm.max_fee_per_gas()
         return (TokenAmount(token=Token.native(self.chain), amount=Amount(gas)),)
 
     @override
@@ -233,17 +236,12 @@ class NativeTransfer(Operation):
         amount = self._output.amount
         ctx.report(_movement(MovementKind.TRANSIT, amount, self._source, in_flight))
         await _broadcast(evm, broadcast)
-        ctx.step.waiting()
-
-        polls = 0
-        while isinstance(outcome := await _check(broadcast, ctx), Pending):
-            polls += 1
-            if polls % REBROADCAST_EVERY == 0:
-                # the node may have dropped it: send the same bytes again, never a new transaction
-                broadcast = TransactionBroadcast(self.chain, tx, ctx.rpc_url_for(self.chain))
-                ctx.step.record(broadcast)
-                await _broadcast(evm, broadcast)
-            await asyncio.sleep(TRANSACTION_POLL_INTERVAL)
+        if broadcast.refused:
+            # no node ever held it and only Mai has the bytes: it can't be mined
+            outcome: Resolution = Void(f"the node refused it: {broadcast.error}")
+        else:
+            ctx.step.waiting()
+            outcome = await self._watch(ctx, evm, broadcast)
         ctx.step.resolved(broadcast.key, outcome)
 
         if isinstance(outcome, Void):
@@ -271,6 +269,22 @@ class NativeTransfer(Operation):
             _movement(MovementKind.OUTPUT, amount, in_flight, delivered, outcome.transaction)
         )
         ctx.step.completed()
+
+    async def _watch(
+        self, ctx: OperationContext, evm: EvmChain, first: TransactionBroadcast
+    ) -> Resolution:
+        """Until the chain says: rebroadcasting the same bytes now and then, in case a node
+        dropped them, and never signing anything new in their place."""
+        latest = first
+        polls = 0
+        while isinstance(outcome := await _check(latest, ctx), Pending):
+            polls += 1
+            if polls % REBROADCAST_EVERY == 0:
+                latest = TransactionBroadcast(self.chain, first.tx, ctx.rpc_url_for(self.chain))
+                ctx.step.record(latest)
+                await _broadcast(evm, latest)
+            await asyncio.sleep(TRANSACTION_POLL_INTERVAL)
+        return outcome
 
 
 # how long Mai's own authorizations stay usable: the longest an unanswered one is watched
@@ -596,8 +610,10 @@ async def _broadcast(evm: EvmChain, broadcast: TransactionBroadcast) -> None:
     broadcast.sending()
     try:
         await evm.submit(broadcast.tx)
-    except _UNANSWERED as e:
-        # not proof it wasn't received: the chain is asked
+    except JsonRpcError as e:
+        broadcast.refuse(str(e))  # the node answered: it won't take it
+    except httpx.HTTPError as e:
+        # no answer, so not proof it wasn't received: the chain is asked
         broadcast.failed(str(e))
 
 

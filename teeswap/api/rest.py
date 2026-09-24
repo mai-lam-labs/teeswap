@@ -11,7 +11,13 @@ from ..execution.invoice import Handover, InvoiceView
 from ..mcp import ToolNotAvailableError
 from ..response import ErrorResponse
 from ..tools import StatusResponse
-from ..types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
+from ..types import (
+    AcceptResponse,
+    InvoiceRequest,
+    KeysQuoteRequest,
+    QuoteRequest,
+    QuoteResponse,
+)
 from ..wire import HasFromDict, WireStruct, decode_object, encode
 from ..x402 import (
     HTTP_PAYMENT_REQUIRED_HEADER,
@@ -55,6 +61,12 @@ class RestApi(Api):
     @override
     async def quote_x402(self, request: QuoteRequest) -> QuoteResponse:
         return await self._call("quote_x402", request, QuoteResponse)
+
+    @override
+    async def quote_keys(self, request: KeysQuoteRequest) -> QuoteResponse:
+        raise ToolNotAvailableError(
+            "keys are secret: REST requests can be read on the way, use MCP blind calls"
+        )
 
     @override
     async def accept_x402(

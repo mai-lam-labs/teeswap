@@ -24,7 +24,13 @@ from ..execution.invoice import Handover, InvoiceView
 from ..mcp import ERROR_META_KEY, MCP_PROTOCOL_VERSION, PROTOCOL_VERSION_META
 from ..response import ErrorResponse
 from ..tools import StatusResponse
-from ..types import AcceptResponse, InvoiceRequest, QuoteRequest, QuoteResponse
+from ..types import (
+    AcceptResponse,
+    InvoiceRequest,
+    KeysQuoteRequest,
+    QuoteRequest,
+    QuoteResponse,
+)
 from ..wire import HasFromDict, WireStruct, decode_object, encode, parse_json
 from ..x402 import (
     MCP_PAYMENT_META_KEY,
@@ -182,6 +188,10 @@ class McpApi(Api):
     @override
     async def quote_x402(self, request: QuoteRequest) -> QuoteResponse:
         return await self._call("quote_x402", request, QuoteResponse)
+
+    @override
+    async def quote_keys(self, request: KeysQuoteRequest) -> QuoteResponse:
+        return _output(await self._blind_call("quote_keys", request), QuoteResponse)
 
     @override
     async def accept_x402(

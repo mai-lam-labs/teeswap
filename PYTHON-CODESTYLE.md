@@ -78,7 +78,7 @@ crypto/attestation.py    AttestationError
 crypto/vaportpm.py         VaportpmError / VaportpmParseError
 blockchain/evm.py        EvmError
                            SigningError
-blockchain/derivation.py UnsupportedChainError
+blockchain/derivation.py UnsupportedChainError / InvalidKeyError
 facilitator.py           FacilitatorError
 execution/invoice.py     InvoiceError
                            InvoiceNotFoundError / InvoiceExpiredError / InvoiceStateError

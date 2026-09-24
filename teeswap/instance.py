@@ -23,6 +23,7 @@ from .tools import (
     AcceptX402Tool,
     HandoverTool,
     InvoiceTool,
+    QuoteKeysTool,
     QuoteTool,
     QuoteX402Tool,
     StatusTool,
@@ -85,8 +86,10 @@ class TeeSwap:
         self.dispatcher.register(accept_x402_tool)
         tools_down_tool = ToolsDownTool(self.engine, self.invoice_registry)
         handover_tool = HandoverTool(self.engine)
+        quote_keys_tool = QuoteKeysTool(self.engine)
         self.dispatcher.register(tools_down_tool)
         self.dispatcher.register(handover_tool)
+        self.dispatcher.register(quote_keys_tool)
         self.api = LocalApi(
             quote_tool,
             accept_tool,
@@ -96,6 +99,7 @@ class TeeSwap:
             invoice_tool,
             tools_down_tool,
             handover_tool,
+            quote_keys_tool,
         )
 
     def start_background_tasks(self) -> None:
