@@ -4,6 +4,8 @@
 
 The machine operator is an adversary. TEESwap runs inside a TEE where the operator controls the host, the network, and the cloud metadata (user-data JSON). Code and configuration baked into the container image are measured into TPM PCRs and therefore trusted. Anything read at runtime from operator-supplied sources (stdin config, environment, network) is untrusted input.
 
+**The invoice ID is a bearer secret: it is the password.** Whoever holds it owns the invoice and the funds it holds, and can recover them. Never log it, show it on the operator dashboard, put it in a URL, an error message, or anything sent to a third party (facilitators, RPCs), or send it anywhere but back to its owner. Anything that needs to name an invoice without granting access uses its one-way `ref`.
+
 Never let operator-supplied config control security-sensitive behaviour: privilege level, bind addresses, binary paths, key material, or anything that would change the attestation's meaning. Hardcode these. The `ContainerInitConfig` dataclass exists for per-instance operator data (e.g. profit address) that does not affect the trust boundary.
 
 ## Type errors and lint warnings

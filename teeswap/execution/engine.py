@@ -198,7 +198,7 @@ class Engine:
         except Exception as e:
             # a bug, or books that don't add up: stop moving money, leave everything where
             # the holdings say it is, and say why
-            logger.exception("invoice %s: halted", invoice.id)
+            logger.exception("invoice %s: halted", invoice.id.ref)
             invoice.finish(InvoiceStatus.HALTED, f"{type(e).__name__}: {e}")
 
     async def _drive(self, invoice: Invoice) -> None:

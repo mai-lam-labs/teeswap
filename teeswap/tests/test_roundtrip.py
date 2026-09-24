@@ -382,6 +382,7 @@ def test_stdio_session_survives_tool_errors() -> None:
     assert sorted(replies) == [1, 2, 3, 4, 5]
     assert "teeswap_quote" in {t["name"] for t in replies[2]["result"]["tools"]}
     assert replies[3]["result"]["isError"] is True
-    assert "inv_missing" in replies[3]["result"]["content"][0]["text"]
+    # the invoice id is a credential: an error about it never repeats it
+    assert "inv_missing" not in replies[3]["result"]["content"][0]["text"]
     assert replies[4]["error"] == {"code": -32603, "message": "internal error"}
     assert replies[5]["result"]["tools"]

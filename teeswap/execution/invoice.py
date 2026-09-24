@@ -13,6 +13,7 @@ See docs/INVOICING.md for the design principles.
 
 import asyncio
 import enum
+import hashlib
 import secrets
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -56,9 +57,23 @@ class InvoiceFundingError(InvoiceStateError):
 
 
 class InvoiceId(str):
+    """The invoice's id, and the credential for it: whoever holds it owns the invoice and
+    the funds it holds. Never log it, display it, or send it anywhere but back to its
+    owner; anything else names the invoice by its `ref`."""
+
     @classmethod
     def generate(cls) -> InvoiceId:
-        return cls("inv_" + secrets.token_hex(12))
+        return cls("inv_" + secrets.token_hex(32))
+
+    @property
+    def ref(self) -> InvoiceRef:
+        digest = hashlib.sha256(b"teeswap/invoice-ref\x00" + self.encode()).digest()
+        return InvoiceRef("ref_" + digest[:16].hex())
+
+
+class InvoiceRef(str):
+    """An invoice's public name: one-way from its id, so it identifies the invoice to
+    the operator, facilitators and logs without granting anything."""
 
 
 # --- Invoice ---
@@ -137,7 +152,7 @@ DEPOSIT_TTL = timedelta(minutes=30)
 
 @dataclass(slots=True)
 class Invoice:
-    id: InvoiceId
+    id: InvoiceId = field(repr=False)  # the credential: see InvoiceId
     created_at: Timestamp
     expires_at: Timestamp
     request: QuoteRequest
@@ -159,16 +174,14 @@ class Invoice:
 
     def require_funding(self, funding: Funding) -> None:
         if self.funding != funding:
-            raise InvoiceFundingError(
-                f"invoice {self.id} is funded by {self.funding}, not {funding}"
-            )
+            raise InvoiceFundingError(f"the invoice is funded by {self.funding}, not {funding}")
 
     def check_acceptable(self) -> None:
         if self.status != InvoiceStatus.QUOTED:
             raise InvoiceStateError(f"cannot accept invoice in state {self.status}")
         if Timestamp.now() > self.expires_at:
             self.status = InvoiceStatus.EXPIRED
-            raise InvoiceExpiredError(f"quote {self.id} has expired")
+            raise InvoiceExpiredError("the quote has expired")
 
     def accept(self) -> None:
         self.check_acceptable()
@@ -355,7 +368,7 @@ class InvoiceRegistry:
     def get(self, invoice_id: InvoiceId) -> Invoice:
         invoice = self._invoices.get(invoice_id)
         if invoice is None:
-            raise InvoiceNotFoundError(f"no invoice {invoice_id}")
+            raise InvoiceNotFoundError("no such invoice")
         return invoice
 
     def all(self) -> list[Invoice]:

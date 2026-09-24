@@ -339,7 +339,7 @@ class FacilitatedTransfer(Operation):
             extra={"name": name, "version": version},
         )
         resource = ResourceInfo(
-            url=f"teeswap:invoice/{ctx.invoice.id}",
+            url=f"teeswap:invoice/{ctx.invoice.id.ref}",
             description=self.description,
             mimeType="application/json",
         )

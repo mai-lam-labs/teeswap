@@ -227,7 +227,7 @@ def render_invoices(registry: InvoiceRegistry) -> str:
                         with tr():
                             with td():
                                 _badge(inv.status.value.upper(), css)
-                            td(str(inv.id), cls="mono")
+                            td(inv.id.ref, cls="mono")
                             td(", ".join(sorted({i.token.chain.name for i in inv.quote.inputs})))
                             td(", ".join(f"{i.amount} {i.token.symbol}" for i in inv.quote.inputs))
                             td(f"{len(inv.request.outputs)} output(s)")
@@ -261,7 +261,7 @@ def render_processes(registry: InvoiceRegistry) -> str:
                         action = inv.current_action
                         step = action.current_step if action else None
                         with tr():
-                            td(str(inv.id), cls="mono")
+                            td(inv.id.ref, cls="mono")
                             td(action.description if action else "—")
                             td(step.operation if step else "—")
                             with td():
