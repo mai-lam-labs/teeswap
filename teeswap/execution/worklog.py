@@ -21,7 +21,7 @@ from typing import Self, override
 from ..blockchain.chains import Chain
 from ..types import HttpExchange, Timestamp
 from ..wire import Encodable, Validated, WireSchema, WireStruct
-from .effects import IdempotencyKey, Resolution, SideEffect, SideEffectView
+from .effects import IdempotencyKey, Outcome, SideEffect, SideEffectView
 
 
 class StepId(str, Validated):
@@ -98,11 +98,11 @@ class Step:
         """Record a side effect before performing it."""
         self.side_effects.append(effect)
 
-    def resolve(self, key: IdempotencyKey, resolution: Resolution) -> None:
+    def resolve(self, key: IdempotencyKey, outcome: Outcome) -> None:
         """Every side effect with this key resolved the same way: at most one took effect."""
         for effect in self.side_effects:
             if effect.key == key:
-                effect.resolution = resolution
+                effect.resolve(outcome)
 
     @property
     def finished(self) -> bool:
@@ -138,8 +138,8 @@ class StepReport:
         """A side effect, before it is performed."""
         self._step.record(effect)
 
-    def resolved(self, key: IdempotencyKey, resolution: Resolution) -> None:
-        self._step.resolve(key, resolution)
+    def resolved(self, key: IdempotencyKey, outcome: Outcome) -> None:
+        self._step.resolve(key, outcome)
 
     def waiting(self) -> None:
         """Its side effects are performed; the step is watching for their outcome."""

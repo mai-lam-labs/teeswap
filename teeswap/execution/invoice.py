@@ -223,6 +223,11 @@ class Invoice:
         self.status = status
         self.reason = reason
 
+    @property
+    def finished(self) -> bool:
+        """Delivered, or the tools are down: nothing more will be done."""
+        return self.status in (InvoiceStatus.DELIVERED, InvoiceStatus.TOOLS_DOWN)
+
     def observed(self, balance: Balance) -> None:
         """The chain shows `balance` at one of the job's accounts: anything beyond what the
         record accounts for there (held, or already released) arrived from outside."""

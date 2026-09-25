@@ -54,7 +54,7 @@ from .invoice import (
     ReleasedAccount,
 )
 from .operations import Operation, OperationContext, ReceivePayment
-from .planner import Decision, FacilitatorsFor, Finished, NoRouteError, decide
+from .planner import FacilitatorsFor, NoRouteError, decide
 from .quote import QuoteError, compute_quote
 from .worklog import Step, StepReport, StepStatus
 
@@ -315,7 +315,7 @@ class Engine:
         stalled = 0
         while True:
             try:
-                decision = await self._decide(invoice)
+                operations = await self._decide(invoice)
             except httpx.HTTPError as e:
                 # no answer from the chain: not a reason to stop, but not progress either
                 logger.warning("invoice %s: can't plan yet: %s", invoice.id.ref, e)
@@ -324,13 +324,12 @@ class Engine:
                     raise GuardrailError(f"no progress in {stalled} passes") from e
                 await asyncio.sleep(STALL_BACKOFF_SECONDS * stalled)
                 continue
-            if isinstance(decision, Finished):
-                invoice.finish(decision.status, decision.reason)
+            if invoice.finished:
                 return
-            if not decision.operations:
+            if not operations:
                 raise GuardrailError("the job isn't finished, but there is nothing to do")
             moved = len(invoice.holdings.movements)
-            for operation in decision.operations:
+            for operation in operations:
                 step = await self._run(invoice, operation)
                 if step.status != StepStatus.COMPLETED:
                     break  # the rest of the plan may depend on it: ask the planner again
@@ -342,7 +341,7 @@ class Engine:
                 raise GuardrailError(f"no progress in {stalled} passes")
             await asyncio.sleep(STALL_BACKOFF_SECONDS * stalled)
 
-    async def _decide(self, invoice: Invoice) -> Decision:
+    async def _decide(self, invoice: Invoice) -> tuple[Operation, ...]:
         async with HttpClient() as client:
 
             def evm_for(chain: Chain) -> EvmChain:

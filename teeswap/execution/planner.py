@@ -4,7 +4,7 @@ One place decides routing, for both uses:
 
 - provisional_plan(): the quote's dry run, from the goal alone, before any funds exist.
 - decide(): for a running job, from what its holdings show now: either the next
-  operations, or that the job is finished and why (delivered, expired, failed).
+  operations, or none, having finished the job (delivered, or tools down) and why.
   Called when the job starts and again each time the scheduled operations finish.
 
 Today's routes are same-chain transfers on an EVM chain: the native token, sent by
@@ -13,7 +13,6 @@ arrive by deposit or, for a token, by an x402 payment.
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
 
 from ..blockchain.chains import Chain, ChainFamily
 from ..blockchain.rpc import JsonRpcError
@@ -85,22 +84,11 @@ def provisional_plan(
 MAX_ATTEMPTS = 5
 
 
-@dataclass(frozen=True, slots=True)
-class Plan:
-    operations: tuple[Operation, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class Finished:
-    status: InvoiceStatus  # DELIVERED or TOOLS_DOWN
-    reason: str
-
-
-type Decision = Plan | Finished
-
-
-async def decide(invoice: Invoice, facilitators_for: FacilitatorsFor, evm_for: EvmFor) -> Decision:
-    """What happens next for a running job, from its holdings: more work, or the end.
+async def decide(
+    invoice: Invoice, facilitators_for: FacilitatorsFor, evm_for: EvmFor
+) -> tuple[Operation, ...]:
+    """What happens next for a running job, from its holdings: the next operations, or
+    none, having finished the invoice with how it ended and why.
 
     A job ends one of two ways: delivered, or tools down, where Mai stops and the job's
     result is the money itself, handed to the owner (see Invoice.TOOLS_DOWN). She puts
@@ -109,21 +97,25 @@ async def decide(invoice: Invoice, facilitators_for: FacilitatorsFor, evm_for: E
     inputs = invoice.input_states()
     outputs = invoice.output_states()
     if invoice.tools_down_requested:
-        return Finished(InvoiceStatus.TOOLS_DOWN, "the owner put the tools down")
+        invoice.finish(InvoiceStatus.TOOLS_DOWN, "the owner put the tools down")
+        return ()
     if all(out.status == OutputStatus.DELIVERED for out in outputs):
-        return Finished(InvoiceStatus.DELIVERED, "every output was delivered")
+        invoice.finish(InvoiceStatus.DELIVERED, "every output was delivered")
+        return ()
     awaited = [inp for inp in inputs if inp.status != InputStatus.RECEIVED]
     if awaited:
         if Timestamp.now() > invoice.expires_at:
-            return Finished(InvoiceStatus.TOOLS_DOWN, "the inputs didn't arrive in time")
+            invoice.finish(InvoiceStatus.TOOLS_DOWN, "the inputs didn't arrive in time")
+            return ()
         # nothing else until the funds are held: then what finishing costs can be weighed
-        return Plan(tuple(AwaitDeposit(inp.deposit) for inp in awaited))
+        return tuple(AwaitDeposit(inp.deposit) for inp in awaited)
     for out in outputs:
         if out.status == OutputStatus.PENDING and out.attempts >= MAX_ATTEMPTS:
-            return Finished(
+            invoice.finish(
                 InvoiceStatus.TOOLS_DOWN,
                 f"{out.attempts} transfers to {out.balance.address.value} came back",
             )
+            return ()
     try:
         operations = [
             _transfer(out.balance, _source(invoice.deposits, out.balance), facilitators_for)
@@ -131,16 +123,19 @@ async def decide(invoice: Invoice, facilitators_for: FacilitatorsFor, evm_for: E
             if out.status == OutputStatus.PENDING
         ]
     except NoRouteError as e:
-        return Finished(InvoiceStatus.TOOLS_DOWN, f"no way to finish: {e}")
+        invoice.finish(InvoiceStatus.TOOLS_DOWN, f"no way to finish: {e}")
+        return ()
     try:
         costs = [cost for op in operations for cost in await op.estimate_costs(evm_for)]
     except JsonRpcError as e:
         # the chain answered: simulating the rest of the job fails
-        return Finished(InvoiceStatus.TOOLS_DOWN, f"the rest can't be done: {e.rpc_message}")
+        invoice.finish(InvoiceStatus.TOOLS_DOWN, f"the rest can't be done: {e.rpc_message}")
+        return ()
     shortfall = _unaffordable(invoice, outputs, costs)
     if shortfall is not None:
-        return Finished(InvoiceStatus.TOOLS_DOWN, shortfall)
-    return Plan(tuple(operations))
+        invoice.finish(InvoiceStatus.TOOLS_DOWN, shortfall)
+        return ()
+    return tuple(operations)
 
 
 def _unaffordable(

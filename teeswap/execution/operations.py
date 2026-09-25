@@ -48,13 +48,10 @@ from ..x402 import (
 from .accounts import Accounts
 from .effects import (
     AuthorizationSubmission,
-    Landed,
     Outcome,
-    Pending,
-    Resolution,
+    OutcomeStatus,
     SideEffect,
     TransactionBroadcast,
-    Void,
 )
 from .invoice import Invoice, InvoiceStatus
 from .ledger import Custody, Movement, MovementKind, Place
@@ -238,13 +235,13 @@ class NativeTransfer(Operation):
         await _broadcast(evm, broadcast)
         if broadcast.refused:
             # no node ever held it and only Mai has the bytes: it can't be mined
-            outcome: Resolution = Void(f"the node refused it: {broadcast.error}")
+            outcome = Outcome.void(f"the node refused it: {broadcast.error}")
         else:
             ctx.step.waiting()
             outcome = await self._watch(ctx, evm, broadcast)
         ctx.step.resolved(broadcast.key, outcome)
 
-        if isinstance(outcome, Void):
+        if outcome.status is OutcomeStatus.VOID:
             ctx.report(_movement(MovementKind.TRANSIT, amount, in_flight, self._source))
             ctx.step.failed(f"transfer not sent: {outcome.reason}")
             return
@@ -255,7 +252,7 @@ class NativeTransfer(Operation):
                     MovementKind.GAS, outcome.gas, self._source, consumed, outcome.transaction
                 )
             )
-        if not outcome.success:
+        if outcome.status is OutcomeStatus.REVERTED:
             # the value never left: back to where it was held
             ctx.report(
                 _movement(
@@ -272,12 +269,12 @@ class NativeTransfer(Operation):
 
     async def _watch(
         self, ctx: OperationContext, evm: EvmChain, first: TransactionBroadcast
-    ) -> Resolution:
+    ) -> Outcome:
         """Until the chain says: rebroadcasting the same bytes now and then, in case a node
         dropped them, and never signing anything new in their place."""
         latest = first
         polls = 0
-        while isinstance(outcome := await _check(latest, ctx), Pending):
+        while not (outcome := await _check(latest, ctx)).resolved:
             polls += 1
             if polls % REBROADCAST_EVERY == 0:
                 latest = TransactionBroadcast(self.chain, first.tx, ctx.rpc_url_for(self.chain))
@@ -381,14 +378,14 @@ class FacilitatedTransfer(Operation):
         latest = submitted.submission
         if submitted.settle_attempted:
             ctx.step.waiting()
-            while isinstance(outcome := await _check(latest, ctx), Pending):
+            while not (outcome := await _check(latest, ctx)).resolved:
                 await asyncio.sleep(AUTHORIZATION_POLL_INTERVAL)
         else:
             # only facilitators hold the authorization, and none was asked to settle it
-            outcome = Void(f"no facilitator accepted it: {submitted.why}")
+            outcome = Outcome.void(f"no facilitator accepted it: {submitted.why}")
         ctx.step.resolved(latest.key, outcome)
 
-        if isinstance(outcome, Void):
+        if outcome.status is OutcomeStatus.VOID:
             ctx.report(_movement(MovementKind.TRANSIT, amount, in_flight, self._source))
             ctx.step.failed(f"transfer not settled: {outcome.reason}")
             return
@@ -473,7 +470,7 @@ class ReceivePayment(Operation):
         latest = submitted.submission
         if not submitted.settle_attempted:
             reason = f"no facilitator accepted the payment: {submitted.why}"
-            ctx.step.resolved(latest.key, Void(reason))
+            ctx.step.resolved(latest.key, Outcome.void(reason))
             ctx.step.failed(reason)
             return
         ctx.step.waiting()
@@ -492,14 +489,14 @@ class ReceivePayment(Operation):
                     self._received(ctx, signed, latest, arrived)
                     return
             outcome = await _check(latest, ctx)
-            if isinstance(outcome, Void):
+            if outcome.status is OutcomeStatus.VOID:
                 ctx.step.resolved(latest.key, outcome)
                 ctx.step.failed(f"payment not settled: {outcome.reason}")
                 return
-            if isinstance(outcome, Landed) and observed is not None:
+            if outcome.took_effect and observed is not None:
                 # used, yet the funds aren't here: we don't have them, and never will
                 reason = "the payment was used, but the funds didn't arrive"
-                ctx.step.resolved(latest.key, Void(reason))
+                ctx.step.resolved(latest.key, Outcome.void(reason))
                 ctx.step.failed(reason)
                 return
             await asyncio.sleep(AUTHORIZATION_POLL_INTERVAL)
@@ -512,7 +509,7 @@ class ReceivePayment(Operation):
         arrived: int,
     ) -> None:
         token = self._deposit.amount.token
-        ctx.step.resolved(latest.key, Landed(transaction=latest.settled))
+        ctx.step.resolved(latest.key, Outcome.landed(latest.settled))
         ctx.report(
             Movement(
                 kind=MovementKind.INPUT,
@@ -586,7 +583,7 @@ async def _submit_in_turn(
             said.append(f"{url}: not settled: {reason}")
             ctx.exclude_facilitator(url)
         # the facilitator may have settled it anyway: don't offer it again if so
-        if settle_attempted and not isinstance(await _check(submission, ctx), Pending):
+        if settle_attempted and (await _check(submission, ctx)).resolved:
             break
     if submission is None:
         raise OperationError("no facilitator to submit to")
@@ -603,7 +600,7 @@ async def _check(effect: SideEffect, ctx: OperationContext) -> Outcome:
         return await effect.check(ctx.client, ctx.rpc_url_for)
     except _UNANSWERED as e:
         logger.warning("%s: outcome unavailable, still pending: %s", ctx.step.id, e)
-        return Pending()
+        return Outcome.pending()
 
 
 async def _broadcast(evm: EvmChain, broadcast: TransactionBroadcast) -> None:

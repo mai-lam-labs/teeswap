@@ -14,7 +14,7 @@ from litestar import MediaType, Response, Router, get
 from litestar.params import Parameter
 from litestar.status_codes import HTTP_200_OK, HTTP_404_NOT_FOUND
 
-from ..execution.effects import SideEffectOutcome, SideEffectView
+from ..execution.effects import OutcomeStatus, SideEffectView
 from ..execution.invoice import InvoiceId, InvoiceNotFoundError, InvoiceRegistry, InvoiceView
 from ..types import Timestamp
 from .html import (
@@ -151,14 +151,15 @@ def _fmt_token(symbol: str, contract: str | None, chain_caip2: str) -> str:
 
 
 def _effect_outcome(effect: SideEffectView) -> str:
-    match effect.outcome:
-        case SideEffectOutcome.LANDED | SideEffectOutcome.REVERTED:
-            return f"{effect.outcome.value} {effect.transaction or '(transaction not reported)'}"
-        case SideEffectOutcome.VOID:
-            return f"void: {effect.reason}"
-        case None if effect.error is not None:
+    outcome = effect.outcome
+    match outcome.status:
+        case OutcomeStatus.LANDED | OutcomeStatus.REVERTED:
+            return f"{outcome.status} {outcome.transaction or '(transaction not reported)'}"
+        case OutcomeStatus.VOID:
+            return f"void: {outcome.reason}"
+        case OutcomeStatus.PENDING if effect.error is not None:
             return f"pending (send failed: {effect.error})"
-        case None:
+        case OutcomeStatus.PENDING:
             return "pending"
 
 
@@ -327,6 +328,7 @@ def render_invoice_html(invoice: InvoiceView) -> str:
                                 with table():
                                     with thead(), tr():
                                         th("Side effect")
+                                        th("Key")
                                         th("Sent to")
                                         th("Sent")
                                         th("Outcome")
@@ -334,6 +336,7 @@ def render_invoice_html(invoice: InvoiceView) -> str:
                                         for effect in step.side_effects:
                                             with tr():
                                                 td(effect.kind.value)
+                                                td(effect.key, cls="mono")
                                                 td(effect.target, cls="mono")
                                                 td(
                                                     _fmt_time(effect.sent_at)
