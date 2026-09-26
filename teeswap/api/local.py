@@ -22,8 +22,16 @@ from ..types import (
     QuoteRequest,
     QuoteResponse,
 )
-from ..x402 import PaymentPayload, PaymentRequired, ResourceInfo, X402PaymentSpec
-from .base import Api, PaidAccept
+from ..x402 import (
+    PaidResponse,
+    PaymentError,
+    PaymentNotSettledError,
+    PaymentPayload,
+    PaymentRequired,
+    PaymentRequiredError,
+    ResourceInfo,
+)
+from .base import Api
 
 
 class LocalApi(Api):
@@ -66,23 +74,29 @@ class LocalApi(Api):
         return await self._quote_keys.execute(request)
 
     @override
-    async def accept_x402(
-        self, request: InvoiceRequest, payment: PaymentPayload | None
-    ) -> PaymentRequired | PaidAccept:
-        outcome = await self._accept_x402.execute(request, payment)
-        if isinstance(outcome, X402PaymentSpec):
+    async def payment_required(self, request: InvoiceRequest) -> PaymentRequired:
+        try:
+            await self._accept_x402.execute(request)
+        except PaymentRequiredError as e:
             # in process there is no transport to name the resource, so the tool names it
             definition = self._accept_x402.definition
-            return outcome.required(
+            return e.required(
                 ResourceInfo(
                     url=f"teeswap:tool/{definition.name}",
                     description=definition.description,
                     mimeType="application/json",
                 )
             )
-        if not isinstance(outcome.response, AcceptResponse):
-            raise TypeError(f"accept_x402 returned {type(outcome.response).__name__}")
-        return PaidAccept(accepted=outcome.response, settlement=outcome.settlement)
+        raise PaymentError("teeswap_accept_x402 answered without being paid")
+
+    @override
+    async def accept_x402(
+        self, request: InvoiceRequest, payment: PaymentPayload
+    ) -> PaidResponse[AcceptResponse]:
+        try:
+            return await self._accept_x402.execute(request, payment)
+        except PaymentRequiredError as e:
+            raise PaymentNotSettledError(e.error) from e
 
     @override
     async def status(self, request: InvoiceRequest) -> StatusResponse:

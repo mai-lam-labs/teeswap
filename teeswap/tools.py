@@ -13,7 +13,7 @@ from .execution.invoice import (
     InvoiceStatus,
     InvoiceView,
 )
-from .mcp import PaidTool, Tool, ToolDefinition
+from .mcp import Tool, ToolDefinition
 from .response import DataclassResponse
 from .types import (
     AcceptResponse,
@@ -23,7 +23,7 @@ from .types import (
     QuoteResponse,
     Timestamp,
 )
-from .x402 import PaymentPayload, X402PaymentResult, X402PaymentSpec
+from .x402 import PaidResponse, PaymentPayload, PaymentRequiredError
 
 
 @dataclass(frozen=True)
@@ -54,7 +54,9 @@ class QuoteTool(Tool):
         )
 
     @override
-    async def execute(self, args: QuoteRequest) -> QuoteResponse:
+    async def execute(
+        self, args: QuoteRequest, payment: PaymentPayload | None = None
+    ) -> QuoteResponse:
         return await self._engine.quote(args, Funding.DEPOSIT)
 
 
@@ -76,7 +78,9 @@ class QuoteX402Tool(Tool):
         )
 
     @override
-    async def execute(self, args: QuoteRequest) -> QuoteResponse:
+    async def execute(
+        self, args: QuoteRequest, payment: PaymentPayload | None = None
+    ) -> QuoteResponse:
         return await self._engine.quote(args, Funding.X402)
 
 
@@ -108,7 +112,9 @@ class QuoteKeysTool(Tool):
         return True
 
     @override
-    async def execute(self, args: KeysQuoteRequest) -> QuoteResponse:
+    async def execute(
+        self, args: KeysQuoteRequest, payment: PaymentPayload | None = None
+    ) -> QuoteResponse:
         return await self._engine.quote_keys(args)
 
 
@@ -130,11 +136,13 @@ class AcceptTool(Tool):
         )
 
     @override
-    async def execute(self, args: InvoiceRequest) -> AcceptResponse:
+    async def execute(
+        self, args: InvoiceRequest, payment: PaymentPayload | None = None
+    ) -> AcceptResponse:
         return self._engine.accept(InvoiceId(args.quote_id))
 
 
-class AcceptX402Tool(PaidTool):
+class AcceptX402Tool(Tool):
     """Accept an x402-funded quote. Called without payment it says what to pay; paid,
     it settles the payment (which delivers the input) and starts the invoice."""
 
@@ -155,15 +163,18 @@ class AcceptX402Tool(PaidTool):
 
     @override
     async def execute(
-        self, args: InvoiceRequest, payment: PaymentPayload | None
-    ) -> X402PaymentSpec | X402PaymentResult:
+        self, args: InvoiceRequest, payment: PaymentPayload | None = None
+    ) -> PaidResponse[AcceptResponse]:
         invoice_id = InvoiceId(args.quote_id)
         if payment is None:
-            return await self._engine.payment_spec(invoice_id, "payment required")
+            accepts = await self._engine.payment_accepts(invoice_id)
+            raise PaymentRequiredError("payment required", accepts)
         try:
             return await self._engine.accept_x402(invoice_id, payment)
         except X402SettlementError as e:
-            return await self._engine.payment_spec(invoice_id, str(e))
+            raise PaymentRequiredError(
+                str(e), await self._engine.payment_accepts(invoice_id)
+            ) from e
 
 
 class StatusTool(Tool):
@@ -183,7 +194,9 @@ class StatusTool(Tool):
         )
 
     @override
-    async def execute(self, args: InvoiceRequest) -> StatusResponse:
+    async def execute(
+        self, args: InvoiceRequest, payment: PaymentPayload | None = None
+    ) -> StatusResponse:
         return _status(self._registry.get(InvoiceId(args.quote_id)))
 
 
@@ -204,7 +217,9 @@ class InvoiceTool(Tool):
         )
 
     @override
-    async def execute(self, args: InvoiceRequest) -> InvoiceView:
+    async def execute(
+        self, args: InvoiceRequest, payment: PaymentPayload | None = None
+    ) -> InvoiceView:
         return self._registry.get(InvoiceId(args.quote_id)).view()
 
 
@@ -230,7 +245,9 @@ class ToolsDownTool(Tool):
         )
 
     @override
-    async def execute(self, args: InvoiceRequest) -> StatusResponse:
+    async def execute(
+        self, args: InvoiceRequest, payment: PaymentPayload | None = None
+    ) -> StatusResponse:
         invoice_id = InvoiceId(args.quote_id)
         self._engine.tools_down(invoice_id)
         return _status(self._registry.get(invoice_id))
@@ -261,7 +278,9 @@ class HandoverTool(Tool):
         return True
 
     @override
-    async def execute(self, args: InvoiceRequest) -> Handover:
+    async def execute(
+        self, args: InvoiceRequest, payment: PaymentPayload | None = None
+    ) -> Handover:
         return await self._engine.hand_over(InvoiceId(args.quote_id))
 
 

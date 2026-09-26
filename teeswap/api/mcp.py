@@ -35,11 +35,14 @@ from ..wire import HasFromDict, WireStruct, decode_object, encode, parse_json
 from ..x402 import (
     MCP_PAYMENT_META_KEY,
     MCP_PAYMENT_RESPONSE_META_KEY,
+    PaidResponse,
+    PaymentError,
+    PaymentNotSettledError,
     PaymentPayload,
     PaymentRequired,
     SettleResponse,
 )
-from .base import Api, PaidAccept
+from .base import Api
 
 # --- The replies we read (field names are the wire names) ---
 
@@ -79,16 +82,16 @@ class _RpcReply(HasFromDict):
 
 @dataclass(frozen=True, slots=True)
 class _BlindCapability(HasFromDict):
-    """The server's SEP-2133 capability: where blind calls are encrypted to."""
+    """The server's Verifiable MCP capability: where blind calls are encrypted to."""
 
-    proofFormats: tuple[str, ...]  # noqa: N815  # SEP-2133 wire field name
-    blindExecution: bool = False  # noqa: N815  # SEP-2133 wire field name
-    blindEncryptionSchemes: tuple[str, ...] = ()  # noqa: N815  # SEP-2133 wire field name
-    blindPublicKeys: dict[str, str] = field(default_factory=dict)  # noqa: N815  # SEP-2133 wire field name
+    proofFormats: tuple[str, ...]  # noqa: N815  # Verifiable MCP wire field name
+    blindExecution: bool = False  # noqa: N815  # Verifiable MCP wire field name
+    blindEncryptionSchemes: tuple[str, ...] = ()  # noqa: N815  # Verifiable MCP wire field name
+    blindPublicKeys: dict[str, str] = field(default_factory=dict)  # noqa: N815  # Verifiable MCP wire field name
 
 
 class McpApi(Api):
-    """Stateless tools/call requests, and SEP-2133 blind calls for tools whose results
+    """Stateless tools/call requests, and Verifiable MCP blind calls for tools whose results
     are secret. The attestation on each result is not verified here yet, and neither is
     the server's blind key: it is taken from server/discover as given."""
 
@@ -194,16 +197,25 @@ class McpApi(Api):
         return _output(await self._blind_call("quote_keys", request), QuoteResponse)
 
     @override
+    async def payment_required(self, request: InvoiceRequest) -> PaymentRequired:
+        result = await self._tools_call("accept_x402", request, None)
+        required = _payment_required(result)
+        if required is None:
+            _raise_for_error(result)
+            raise PaymentError("teeswap_accept_x402 answered without being paid")
+        return required
+
+    @override
     async def accept_x402(
-        self, request: InvoiceRequest, payment: PaymentPayload | None
-    ) -> PaymentRequired | PaidAccept:
+        self, request: InvoiceRequest, payment: PaymentPayload
+    ) -> PaidResponse[AcceptResponse]:
         result = await self._tools_call("accept_x402", request, payment)
-        if result.isError and result.structuredContent is not None:
-            # x402 MCP transport: payment required, as an isError result
-            return PaymentRequired.from_dict(result.structuredContent)
+        required = _payment_required(result)
+        if required is not None:
+            raise PaymentNotSettledError(required.error)
         accepted = _output(result, AcceptResponse)
         settlement = SettleResponse.from_dict(result.meta[MCP_PAYMENT_RESPONSE_META_KEY])
-        return PaidAccept(accepted=accepted, settlement=settlement)
+        return PaidResponse(response=accepted, settlement=settlement)
 
     @override
     async def status(self, request: InvoiceRequest) -> StatusResponse:
@@ -222,13 +234,24 @@ class McpApi(Api):
         return _output(await self._blind_call("handover", request), Handover)
 
 
-def _output[R: HasFromDict](result: _ToolResult, output: type[R]) -> R:
-    """A tool result's value: its text content, or the error it reports, raised."""
+def _payment_required(result: _ToolResult) -> PaymentRequired | None:
+    """x402 MCP transport: payment required is an isError result carrying it."""
+    if result.isError and result.structuredContent is not None:
+        return PaymentRequired.from_dict(result.structuredContent)
+    return None
+
+
+def _raise_for_error(result: _ToolResult) -> None:
     if result.isError:
         error = result.meta.get(ERROR_META_KEY)
         if error is None:
             raise TeeSwapError(" ".join(c.text for c in result.content))
         raise ErrorResponse.from_dict(error).to_exception()
+
+
+def _output[R: HasFromDict](result: _ToolResult, output: type[R]) -> R:
+    """A tool result's value: its text content, or the error it reports, raised."""
+    _raise_for_error(result)
     (content,) = result.content
     return output.from_dict(decode_object(content.text))
 

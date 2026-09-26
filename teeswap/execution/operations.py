@@ -83,8 +83,8 @@ class OperationContext:
     client: BaseHttpClient  # records RPC traffic on the operation's work-log step
     rpc_url_for: Callable[[Chain], Url]
     report: Callable[[Movement], None]
-    # a facilitator that failed this job: the planner won't choose it again
-    exclude_facilitator: Callable[[str], None]
+    # how a facilitator did with a request: ranks it, for this job and for every job
+    rate_facilitator: Callable[[str, bool], None]
 
     def evm(self, chain: Chain) -> EvmChain:
         return EvmChain(chain, self.client, self.rpc_url_for(chain))
@@ -382,12 +382,12 @@ class FacilitatedTransfer(Operation):
                 await asyncio.sleep(AUTHORIZATION_POLL_INTERVAL)
         else:
             # only facilitators hold the authorization, and none was asked to settle it
-            outcome = Outcome.void(f"no facilitator accepted it: {submitted.why}")
+            outcome = Outcome.void("no facilitator accepted it")
         ctx.step.resolved(latest.key, outcome)
 
         if outcome.status is OutcomeStatus.VOID:
             ctx.report(_movement(MovementKind.TRANSIT, amount, in_flight, self._source))
-            ctx.step.failed(f"transfer not settled: {outcome.reason}")
+            ctx.step.failed(f"transfer not settled: {_why_void(outcome, submitted)}")
             return
         delivered = Place(address=self._output.address, custody=Custody.DELIVERED)
         ctx.report(
@@ -460,6 +460,12 @@ class ReceivePayment(Operation):
         if signed.authorization.valid_before > latest_valid:
             ctx.step.failed("the payment stays valid for longer than maxTimeoutSeconds")
             return
+        # only a payment that pays exactly what was asked is handed on: nothing else is
+        # anyone's business outside the TEE
+        refused = _refuse_payment(signed, self._requirements, evm.chain_id)
+        if refused is not None:
+            ctx.step.failed(refused)
+            return
         if not self._facilitators:
             ctx.step.failed("no facilitator available")
             return
@@ -469,9 +475,9 @@ class ReceivePayment(Operation):
         )
         latest = submitted.submission
         if not submitted.settle_attempted:
-            reason = f"no facilitator accepted the payment: {submitted.why}"
-            ctx.step.resolved(latest.key, Outcome.void(reason))
-            ctx.step.failed(reason)
+            outcome = Outcome.void("no facilitator accepted the payment")
+            ctx.step.resolved(latest.key, outcome)
+            ctx.step.failed(_why_void(outcome, submitted))
             return
         ctx.step.waiting()
 
@@ -491,7 +497,7 @@ class ReceivePayment(Operation):
             outcome = await _check(latest, ctx)
             if outcome.status is OutcomeStatus.VOID:
                 ctx.step.resolved(latest.key, outcome)
-                ctx.step.failed(f"payment not settled: {outcome.reason}")
+                ctx.step.failed(f"payment not settled: {_why_void(outcome, submitted)}")
                 return
             if outcome.took_effect and observed is not None:
                 # used, yet the funds aren't here: we don't have them, and never will
@@ -549,8 +555,10 @@ async def _submit_in_turn(
     before_first: Callable[[], None],
 ) -> _Submitted:
     """Hand the same signed authorization to each facilitator until one settles it, or it
-    turns out to have settled anyway. A facilitator that errors or fails to settle is
-    excluded from the job; one that finds the payment invalid is not (it's the payment)."""
+    turns out to have settled anyway. Each answer rates the facilitator: an error or a
+    failed settlement counts against it, a settlement for it. Finding the payment invalid
+    counts neither way: the payment is someone else's, and whoever sends it mustn't be
+    able to move a facilitator up or down."""
     settle_attempted = False
     said: list[str] = []
     submission: AuthorizationSubmission | None = None
@@ -571,23 +579,49 @@ async def _submit_in_turn(
             settle_attempted = True
             settled = await facilitator.settle(ctx.client, url, signed.payload, requirements)
         except facilitator.FacilitatorError as e:
+            ctx.rate_facilitator(url, False)
             submission.failed(str(e))
             said.append(str(e))
-            ctx.exclude_facilitator(url)
         else:
+            ctx.rate_facilitator(url, settled.success)
             if settled.success:
                 submission.settled_by(TxHash(settled.transaction))
                 return _Submitted(submission, settle_attempted=True, why="")
-            reason = settled.errorReason or settled.errorMessage
+            reason = ": ".join(r for r in (settled.errorReason, settled.errorMessage) if r)
             submission.failed(f"not settled: {reason}")
             said.append(f"{url}: not settled: {reason}")
-            ctx.exclude_facilitator(url)
         # the facilitator may have settled it anyway: don't offer it again if so
         if settle_attempted and (await _check(submission, ctx)).resolved:
             break
     if submission is None:
         raise OperationError("no facilitator to submit to")
     return _Submitted(submission, settle_attempted=settle_attempted, why="; ".join(said))
+
+
+def _why_void(outcome: Outcome, submitted: _Submitted) -> str:
+    """Why an authorization never took effect: what the chain showed, and what the
+    facilitators said about it on the way."""
+    if not submitted.why:
+        return str(outcome.reason)
+    return f"{outcome.reason} (facilitators: {submitted.why})"
+
+
+def _refuse_payment(
+    signed: SignedPayment, requirements: PaymentRequirements, chain_id: int
+) -> str | None:
+    """Why this payment doesn't pay what `requirements` ask, if it doesn't: the right
+    amount, to the right account, signed by its payer for the token that was asked for."""
+    authorization = signed.authorization
+    pay_to = to_checksum_address(requirements.payTo)
+    if authorization.recipient != pay_to:
+        return f"the payment is to {authorization.recipient}, not {pay_to}"
+    if authorization.value != requirements.amount:
+        return f"the payment is for {authorization.value}, not {requirements.amount}"
+    domain = (str(requirements.extra["name"]), str(requirements.extra["version"]))
+    asset = to_checksum_address(requirements.asset)
+    if authorization.signed_by(signed.signature, domain, chain_id, asset) != authorization.sender:
+        return f"the payment isn't signed by {authorization.sender} for {asset}"
+    return None
 
 
 # a request that errored or timed out: no answer, so never taken as one

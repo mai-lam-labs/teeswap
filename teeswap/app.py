@@ -32,26 +32,24 @@ from .common import PKG_NAME, PKG_VERSION, TeeSwapError
 from .dashboard import create_dashboard_router, create_invoice_router
 from .execution.invoice import InvoiceNotFoundError
 from .mcp import (
-    AnyTool,
     JsonRpcNotification,
-    PaidTool,
+    Tool,
     ToolDefinition,
-    ToolOutcome,
     handle_mcp_notification,
     handle_mcp_request,
     parse_message,
 )
-from .response import ErrorResponse, ToolResponse
+from .response import ErrorResponse
 from .schema import SCHEMA_PLUGINS, schema_object_for_type
 from .wire import HasFromDict, WireError, decode_object, encode
 from .x402 import (
     HTTP_PAYMENT_REQUIRED_HEADER,
     HTTP_PAYMENT_RESPONSE_HEADER,
     HTTP_PAYMENT_SIGNATURE_HEADER,
+    PaidResponse,
     PaymentPayload,
+    PaymentRequiredError,
     ResourceInfo,
-    X402PaymentResult,
-    X402PaymentSpec,
 )
 
 if TYPE_CHECKING:
@@ -123,9 +121,9 @@ def _payment_from_headers(request: Request[Any, Any, Any]) -> PaymentPayload | N
 
 
 def _payment_required_response(
-    terms: X402PaymentSpec, request: Request[Any, Any, Any], defn: ToolDefinition
+    error: PaymentRequiredError, request: Request[Any, Any, Any], defn: ToolDefinition
 ) -> Response[bytes]:
-    required = terms.required(
+    required = error.required(
         ResourceInfo(
             url=str(request.url), description=defn.description, mimeType="application/json"
         )
@@ -138,34 +136,23 @@ def _payment_required_response(
     )
 
 
-async def _execute(tool: AnyTool, args: Any, request: Request[Any, Any, Any]) -> ToolOutcome:
-    if isinstance(tool, PaidTool):
-        return await tool.execute(args, _payment_from_headers(request))
-    # a payment sent to a free tool is ignored: never settled, never charged
-    return await tool.execute(args)
-
-
-def _make_rest_handler(tool: AnyTool) -> Any:
+def _make_rest_handler(tool: Tool) -> Any:
     defn = tool.definition
 
     async def handler(request: Request[Any, Any, Any]) -> Response[Any]:
         args = _hydrate(defn.input_type.from_dict, await request.body())
-        outcome = await _execute(tool, args, request)
-        match outcome:
-            case X402PaymentSpec():
-                return _payment_required_response(outcome, request, defn)
-            case X402PaymentResult():
-                body, media_type = outcome.response.to_rest()
-                settlement = base64.b64encode(encode(outcome.settlement)).decode("ascii")
-                return Response(
-                    content=body,
-                    status_code=HTTP_200_OK,
-                    media_type=media_type,
-                    headers={HTTP_PAYMENT_RESPONSE_HEADER: settlement},
-                )
-            case ToolResponse():
-                body, media_type = outcome.to_rest()
-                return Response(content=body, status_code=HTTP_200_OK, media_type=media_type)
+        try:
+            response = await tool.execute(args, _payment_from_headers(request))
+        except PaymentRequiredError as e:
+            return _payment_required_response(e, request, defn)
+        body, media_type = response.to_rest()
+        headers: dict[str, str] = {}
+        if isinstance(response, PaidResponse):
+            settlement = encode(response.settlement)
+            headers[HTTP_PAYMENT_RESPONSE_HEADER] = base64.b64encode(settlement).decode("ascii")
+        return Response(
+            content=body, status_code=HTTP_200_OK, media_type=media_type, headers=headers
+        )
 
     short_name = defn.name.removeprefix(f"{PKG_NAME}_")
     handler.__name__ = short_name

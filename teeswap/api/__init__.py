@@ -7,13 +7,14 @@ types, raising the same TeeSwapError subclasses whichever way it's reached.
 - RestApi: a client for the REST interface (x402 in HTTP headers).
 - McpApi: a client for the MCP interface (x402 in _meta).
 
-Paying for an x402 tool is a Payer's business, not the Api's: accept_x402 says what
-to pay and carries a payment; accept_paid does the whole exchange with a Payer.
+Paying for an x402 tool is a Payer's business, not the Api's: payment_required says
+what to pay, accept_x402 carries a payment; accept_paid does the whole exchange with a
+Payer.
 """
 
-from .base import Api, PaidAccept
+from .base import Api
 from .local import LocalApi
 from .mcp import McpApi
 from .rest import RestApi
 
-__all__ = ["Api", "LocalApi", "McpApi", "PaidAccept", "RestApi"]
+__all__ = ["Api", "LocalApi", "McpApi", "RestApi"]

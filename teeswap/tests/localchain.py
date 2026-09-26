@@ -1,4 +1,4 @@
-"""Set up a local anvil chain for the x402 path: contracts, and a working USDC.
+"""Set up a local anvil chain for the x402 path: contracts, a working USDC, and DORP.
 
 `make anvil-start` runs this right after anvil comes up:
 
@@ -11,7 +11,9 @@ SignatureChecker library that implementation is linked against (without it every
 signature check reverts with no data).
 
 setCode gives code without storage, so USDC is then initialised through its own
-initialize* functions. Balances are left to the tests: mint_usdc().
+initialize* functions. DORP is the same contract at another address, initialised as a
+token of its own: a real EIP-3009 token that nobody asked for. Balances are left to
+the tests: mint().
 
 Idempotent: running it on an already set-up chain changes nothing.
 """
@@ -26,21 +28,27 @@ from typing import Any
 import httpx
 from eth_abi.abi import encode
 from eth_utils.abi import function_signature_to_4byte_selector
+from eth_utils.address import to_checksum_address
+from eth_utils.crypto import keccak
 
 FIXTURES = Path(__file__).parent / "fixtures" / "evm"
 RECEIPT_POLL_SECONDS = 0.1
 RECEIPT_ATTEMPTS = 50
-# anvil's dev accounts: #0 pays the facilitator's gas, #1 owns USDC, #2 plays a user's wallet
+# anvil's dev accounts: #0 pays the facilitator's gas, #1 owns the tokens, #2 plays a
+# user's wallet
+FACILITATOR_ACCOUNT = 0
 DEPOSITOR_ACCOUNT = 2
 # PUSH1 0 PUSH1 0 REVERT: code that refuses every call and every payment
 REVERT_ALWAYS = "0x60006000fd"
 
 
 @dataclass(frozen=True, slots=True)
-class LocalUsdc:
+class LocalToken:
+    """A FiatToken (USDC's contract) on the local chain."""
+
     address: str
-    name: str = "USD Coin"
-    symbol: str = "USDC"
+    name: str
+    symbol: str
     version: str = "2"
     decimals: int = 6
 
@@ -50,7 +58,14 @@ def _manifest() -> dict[str, Any]:
         return json.load(f)
 
 
-USDC = LocalUsdc(address=_manifest()["contracts"]["usdc_fiat_token_v2_2"]["address"])
+USDC_CONTRACT = "usdc_fiat_token_v2_2"
+USDC = LocalToken(
+    address=_manifest()["contracts"][USDC_CONTRACT]["address"], name="USD Coin", symbol="USDC"
+)
+DORP = LocalToken(
+    address=to_checksum_address(keccak(text="DORP")[-20:]), name="Dorp", symbol="DORP"
+)
+TOKENS = (USDC, DORP)
 
 
 class LocalChainError(Exception):
@@ -98,42 +113,44 @@ class LocalChain:
         return int(self._rpc("eth_chainId", []), 16)
 
     @property
-    def usdc_owner(self) -> str:
-        """anvil's second dev account: USDC owner, master minter, pauser and blacklister."""
+    def token_owner(self) -> str:
+        """anvil's second dev account: every token's owner, master minter, pauser and
+        blacklister."""
         return self._rpc("eth_accounts", [])[1]
 
     def install_contracts(self) -> None:
         for name, contract in _manifest()["contracts"].items():
-            code = (FIXTURES / f"{name}.hex").read_text().strip()
-            self._rpc("anvil_setCode", [contract["address"], code])
+            self._rpc("anvil_setCode", [contract["address"], _code(name)])
+        self._rpc("anvil_setCode", [DORP.address, _code(USDC_CONTRACT)])
 
-    def initialize_usdc(self) -> None:
-        master_minter = self.call(USDC.address, "masterMinter()", [], [])
+    def initialize_token(self, token: LocalToken) -> None:
+        master_minter = self.call(token.address, "masterMinter()", [], [])
         if int.from_bytes(master_minter) != 0:
             return
-        owner = self.usdc_owner
+        owner = self.token_owner
         steps: list[tuple[str, list[str], list[Any]]] = [
             (
                 "initialize(string,string,string,uint8,address,address,address,address)",
                 ["string", "string", "string", "uint8"] + ["address"] * 4,
-                [USDC.name, USDC.symbol, "USD", USDC.decimals, owner, owner, owner, owner],
+                [token.name, token.symbol, "USD", token.decimals, owner, owner, owner, owner],
             ),
-            ("initializeV2(string)", ["string"], [USDC.name]),
+            ("initializeV2(string)", ["string"], [token.name]),
             ("initializeV2_1(address)", ["address"], [owner]),
-            ("initializeV2_2(address[],string)", ["address[]", "string"], [[], USDC.symbol]),
+            ("initializeV2_2(address[],string)", ["address[]", "string"], [[], token.symbol]),
             ("configureMinter(address,uint256)", ["address", "uint256"], [owner, 2**255]),
         ]
         for signature, types, args in steps:
-            self.send(owner, USDC.address, signature, types, args)
+            self.send(owner, token.address, signature, types, args)
 
     def setup(self) -> None:
         self.install_contracts()
-        self.initialize_usdc()
+        for token in TOKENS:
+            self.initialize_token(token)
 
-    def mint_usdc(self, to: str, amount: int) -> None:
+    def mint(self, token: LocalToken, to: str, amount: int) -> None:
         self.send(
-            self.usdc_owner,
-            USDC.address,
+            self.token_owner,
+            token.address,
             "mint(address,uint256)",
             ["address", "uint256"],
             [to, amount],
@@ -159,13 +176,37 @@ class LocalChain:
         self._rpc("anvil_setNextBlockBaseFeePerGas", [hex(wei)])
         self._rpc("evm_mine", [])
 
+    @property
+    def facilitator_account(self) -> str:
+        """The account the local facilitator pays settlement gas from."""
+        return self._rpc("eth_accounts", [])[FACILITATOR_ACCOUNT]
+
+    def mine_every(self, seconds: int) -> None:
+        """Make a block every `seconds`, as a real chain does, transactions or not."""
+        self._rpc("evm_setIntervalMining", [seconds])
+
+    def mine_on_demand(self) -> None:
+        """anvil's default: a block for each transaction, and none otherwise."""
+        self._rpc("evm_setIntervalMining", [0])
+        self._rpc("evm_setAutomine", [True])
+
+    def set_eth_balance(self, account: str, wei: int) -> None:
+        self._rpc("anvil_setBalance", [account, hex(wei)])
+
     def eth_balance(self, account: str) -> int:
         return int(self._rpc("eth_getBalance", [account, "latest"]), 16)
 
-    def usdc_balance(self, account: str) -> int:
-        return int.from_bytes(self.call(USDC.address, "balanceOf(address)", ["address"], [account]))
+    def balance_of(self, token: LocalToken, account: str) -> int:
+        return int.from_bytes(
+            self.call(token.address, "balanceOf(address)", ["address"], [account])
+        )
+
+
+def _code(contract: str) -> str:
+    return (FIXTURES / f"{contract}.hex").read_text().strip()
 
 
 if __name__ == "__main__":
     LocalChain(sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8545").setup()
-    print(f">> local chain ready: facilitator contracts + USDC at {USDC.address}")
+    tokens = ", ".join(f"{t.symbol} at {t.address}" for t in TOKENS)
+    print(f">> local chain ready: facilitator contracts, {tokens}")

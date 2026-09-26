@@ -14,13 +14,12 @@ A job (the invoice) has:
 - **Plan**: the actions Mai still intends to take.
 - **In-flight actions**: started and not yet finished.
 - **Work log**: the record of every action and what it moved.
-
 - **Accounts**: the addresses the job controls, where funds are held while
   Mai works on them.
 
 A job has no single address. Each account is a key on one chain, of that
-chain's own key type, derived inside the TEE from the job's seed for a
-purpose (each input gets its own deposit account). Two chains with different
+chain's own key type, derived inside the TEE from the job's seed (itself
+derived from the TEE's root key and the invoice id) for a purpose (each input gets its own deposit account). Two chains with different
 key types give accounts with nothing in common, not even their format. An
 action asks for the account it needs; asking again returns the same one. A
 chain whose key type Mai can't make has no accounts, so it can't be routed.
@@ -89,7 +88,9 @@ The engine's own role is a guardrail for what is truly broken rather than
 merely unsuccessful: an error escaping an action or the planner, books that
 don't add up, an action that ends without reporting how, a planner with
 nothing to do for an unfinished job, passes that make no progress. Then it puts
-the tools down, and records why.
+the tools down, and records why. What's only unavailable for now (a chain that
+doesn't answer, every facilitator down) isn't broken: the engine waits and asks
+the planner again.
 
 The invoice and its work log are the record of all this, for introspection.
 Actions report into them; nothing reads them back to decide what to do.
@@ -136,12 +137,13 @@ paid over the quote. Before each plan, the planner has every operation estimate
 its cost at today's prices, and only goes ahead if the job can pay for it. So
 retrying goes on while it's affordable, a gas spike stops the job before it
 overspends, and the outputs are never spent on costs. The quote's reserve is
-priced at the fee a transaction commits to, not the typical fee. Whatever was in flight is normally
-watched to its end first; when a guardrail stops a broken action partway, it
-may not be, which is why the handover reads balances from the chain rather than
-from the record. The invoice records why, keeps
-anything already delivered, and marks what was held as released once the owner
-has the keys.
+priced at the fee a transaction commits to, not the typical fee.
+
+Whatever was in flight is normally watched to its end first; when a guardrail
+stops a broken action partway, it may not be, which is why the handover reads
+balances from the chain rather than from the record. The invoice records why,
+keeps anything already delivered, and marks what was held as released once the
+owner has the keys.
 
 This replaces refunds. A refund needs Mai to choose where the money goes and to
 still be able to move it; handing over the keys needs neither. It works when
@@ -149,7 +151,7 @@ she can't act (no gas, no facilitator, a bug), and the keys can be the input to
 whatever the owner asks for next, from Mai or anywhere else.
 
 The owner is whoever holds the invoice id: it is the credential. The keys go
-only to a blind call with an encrypted reply (SEP-2133), never over an
+only to a blind call with an encrypted reply (Verifiable MCP), never over an
 interface whose replies the operator could read.
 
 ## Keys as inputs
@@ -171,9 +173,9 @@ carries on: 1.001 ETH against a 1 ETH quote runs the plan as quoted, and the
 surplus stays as a visible held position. An overpayment is taken as leave to
 spend it on finishing, much as the slippage tolerance is: if costs rise, the
 surplus pays for them before the tools go down. Whatever is left, the owner
-can take with the tools down. Anything the record missed is counted when the tools go down: the
-handover reads the chain, and funds beyond what the record accounts for are
-recorded as arrivals before they are released.
+can take with the tools down. Anything the record missed is counted when the
+tools go down: the handover reads the chain, and funds beyond what the record
+accounts for are recorded as arrivals before they are released.
 
 ## Capabilities
 
@@ -184,8 +186,8 @@ recorded as arrivals before they are released.
 
 The USDC path never needs ETH in the job's accounts. Facilitators are free
 (x402 defines no facilitator fees), so a facilitated transfer costs the job
-nothing. One that fails a job's transfer is excluded from that job, and Mai
-re-plans with the next (see X402.md, "Selection"). When the outcome of a
+nothing. One that fails a job's transfer ranks lower for that job, and Mai
+re-plans with the next best (see X402.md, "Selection"). When the outcome of a
 facilitated transfer is unclear, the token contract is the evidence: it records
 whether the authorization was used.
 
@@ -194,3 +196,7 @@ whether the authorization was used.
 - **Fees.** Mai runs as a pure execution engine for now; fee-taking is a
   separate part.
 - **Durable job state.** Needed for recovery across restarts.
+- **Deadlines.** Each quote will estimate how long its route takes when things
+  go normally, for the user to accept with it. By then the job is over, one way
+  or the other; a delay that leaves no hope of finishing in time puts the tools
+  down early, rather than waiting on a counter.

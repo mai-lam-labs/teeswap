@@ -20,6 +20,7 @@ from datetime import timedelta
 
 from ..common import TeeSwapError
 from ..config import Operator
+from ..facilitator import Reliability
 from ..response import DataclassResponse
 from ..types import (
     Address,
@@ -190,8 +191,8 @@ class Invoice:
     reason: str | None = None
     # the owner asked Mai to stop: the planner puts the tools down once nothing is in flight
     tools_down_requested: bool = False
-    # facilitators that failed an operation for this job; the planner won't pick them again
-    excluded_facilitators: set[str] = field(default_factory=set)
+    # how the facilitators this job used did for it: the planner tries the best first
+    facilitator_reliability: dict[str, Reliability] = field(default_factory=dict)
 
     holdings: Holdings = field(default_factory=Holdings)
     worklog: WorkLog = field(default_factory=WorkLog)
@@ -204,8 +205,10 @@ class Invoice:
             raise InvoiceFundingError(f"the invoice is funded by {self.funding}, not {allowed}")
 
     def check_acceptable(self) -> None:
+        if self.status == InvoiceStatus.EXPIRED:
+            raise InvoiceExpiredError("the quote has expired")
         if self.status != InvoiceStatus.QUOTED:
-            raise InvoiceStateError(f"cannot accept invoice in state {self.status}")
+            raise InvoiceStateError(f"the quote was already accepted: it's {self.status}")
         if Timestamp.now() > self.expires_at:
             self.status = InvoiceStatus.EXPIRED
             raise InvoiceExpiredError("the quote has expired")

@@ -41,6 +41,7 @@ from teeswap.mcp import (
 from teeswap.response import JsonResponse
 from teeswap.types import Address, Amount, Balance, QuoteRequest, Token, TokenAmount
 from teeswap.wire import HasFromDict, decode_object, encode
+from teeswap.x402 import PaymentPayload
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +63,7 @@ class EchoTool(Tool):
         )
 
     @override
-    async def execute(self, args: EchoInput) -> JsonResponse:
+    async def execute(self, args: EchoInput, payment: PaymentPayload | None = None) -> JsonResponse:
         return JsonResponse({"echoed": True})
 
 

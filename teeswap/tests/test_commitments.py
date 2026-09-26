@@ -1,4 +1,4 @@
-"""Known-answer tests for SEP-2133 commitment construction.
+"""Known-answer tests for Verifiable MCP commitment construction.
 
 These vectors are derived directly from the spec definitions:
 - JCS = RFC 8785 JSON Canonicalization (sorted keys, no whitespace)

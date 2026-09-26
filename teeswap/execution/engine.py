@@ -13,6 +13,7 @@ The reaper runs alongside and expires stale quotes.
 
 import asyncio
 import logging
+from collections.abc import Callable, Mapping
 
 import httpx
 from eth_utils.address import to_checksum_address
@@ -21,7 +22,7 @@ from ..blockchain.chains import Chain
 from ..blockchain.evm import EvmChain
 from ..blockchain.keys import ChainKey
 from ..common import TeeSwapError
-from ..facilitator import FacilitatorMonitor
+from ..facilitator import FacilitatorMonitor, FacilitatorsDownError, Reliability
 from ..http import BaseHttpClient, HttpClient, RecordingClient
 from ..types import (
     AcceptResponse,
@@ -36,11 +37,10 @@ from ..types import (
     Url,
 )
 from ..x402 import (
+    PaidResponse,
     PaymentPayload,
     PaymentRequirements,
     SettleResponse,
-    X402PaymentResult,
-    X402PaymentSpec,
 )
 from .accounts import Accounts
 from .invoice import (
@@ -97,11 +97,18 @@ class Engine:
             raise NoRouteError(f"no RPC configured for {chain.name} ({chain.caip2})")
         return url
 
-    def facilitators_for(self, chain: Chain, excluded: set[str]) -> tuple[str, ...]:
-        return self._facilitators.candidates(X402_SCHEME, chain.caip2, excluded)
+    def facilitators_for(self, chain: Chain, job: Mapping[str, Reliability]) -> tuple[str, ...]:
+        return self._facilitators.candidates(X402_SCHEME, chain.caip2, job)
 
     def _facilitators_for_job(self, invoice: Invoice) -> FacilitatorsFor:
-        return lambda chain: self.facilitators_for(chain, invoice.excluded_facilitators)
+        return lambda chain: self.facilitators_for(chain, invoice.facilitator_reliability)
+
+    def _rate_facilitator(self, invoice: Invoice) -> Callable[[str, bool], None]:
+        def rate(url: str, ok: bool) -> None:
+            invoice.facilitator_reliability.setdefault(url, Reliability()).record(ok)
+            self._facilitators.record(url, ok)
+
+        return rate
 
     async def quote(self, request: QuoteRequest, funding: Funding) -> QuoteResponse:
         """Quote the request and hold it as an invoice, ready to accept."""
@@ -153,7 +160,7 @@ class Engine:
             quote_id,
             accounts,
             funding,
-            lambda chain: self.facilitators_for(chain, set()),
+            lambda chain: self.facilitators_for(chain, {}),
         )
         self._registry.create_quote(request, quote, accounts, funding)
         return quote
@@ -229,17 +236,18 @@ class Engine:
 
     # --- x402 funding ---
 
-    async def payment_spec(self, invoice_id: InvoiceId, error: str) -> X402PaymentSpec:
-        """What paying for this invoice takes: its input, paid to the job's address."""
+    async def payment_accepts(self, invoice_id: InvoiceId) -> tuple[PaymentRequirements, ...]:
+        """What paying for this invoice takes: its input, paid to the job's address. Only
+        while it can be paid for: once accepted (or expired) there's nothing to pay."""
         invoice = self._registry.get(invoice_id)
         invoice.require_funding(Funding.X402)
+        invoice.check_acceptable()
         async with HttpClient() as client:
-            requirements = await self._payment_requirements(client, invoice)
-        return X402PaymentSpec(error=error, accepts=(requirements,))
+            return (await self._payment_requirements(client, invoice),)
 
     async def accept_x402(
         self, invoice_id: InvoiceId, payment: PaymentPayload
-    ) -> X402PaymentResult:
+    ) -> PaidResponse[AcceptResponse]:
         """Receive the client's payment into the input's account, then start the job.
 
         Returns only once the payment is final: the funds are there, or the payment can
@@ -260,7 +268,7 @@ class Engine:
                 deposit,
                 payment,
                 requirements,
-                self.facilitators_for(chain, invoice.excluded_facilitators),
+                self.facilitators_for(chain, invoice.facilitator_reliability),
             )
             step = await self._run(invoice, receive)
             if receive.settlement is None:
@@ -273,7 +281,7 @@ class Engine:
             expires_at=invoice.expires_at,
             instructions=_paid_instructions(receive.settlement),
         )
-        return X402PaymentResult(response=response, settlement=receive.settlement)
+        return PaidResponse(response=response, settlement=receive.settlement)
 
     async def _payment_requirements(
         self, client: BaseHttpClient, invoice: Invoice
@@ -316,8 +324,9 @@ class Engine:
         while True:
             try:
                 operations = await self._decide(invoice)
-            except httpx.HTTPError as e:
-                # no answer from the chain: not a reason to stop, but not progress either
+            except (httpx.HTTPError, FacilitatorsDownError) as e:
+                # no answer from the chain, or no facilitator up right now: not a reason to
+                # stop, but not progress either
                 logger.warning("invoice %s: can't plan yet: %s", invoice.id.ref, e)
                 stalled += 1
                 if stalled >= MAX_STALLED_PASSES:
@@ -363,7 +372,7 @@ class Engine:
                 client=client,
                 rpc_url_for=self.rpc_url_for_chain,
                 report=invoice.holdings.apply,
-                exclude_facilitator=invoice.excluded_facilitators.add,
+                rate_facilitator=self._rate_facilitator(invoice),
             )
             await operation.run(ctx)
         if not step.finished:

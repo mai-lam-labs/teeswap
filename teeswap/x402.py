@@ -1,8 +1,8 @@
 """x402 v2 wire types and transport constants (see docs/X402.md).
 
-Field names are the spec's. Transport-neutral: a PaidTool returns X402PaymentSpec;
-the MCP and HTTP layers add the resource (they know where the call was made)
-and render the PaymentRequired in their own transport.
+Field names are the spec's. Transport-neutral: a paid tool raises PaymentRequiredError
+and, once paid, returns a PaidResponse; the MCP and HTTP layers add the resource (they
+know where the call was made) and render both in their own transport.
 """
 
 import abc
@@ -69,19 +69,6 @@ class PaymentPayload(WireStruct):
 
 
 @dataclass(frozen=True, slots=True)
-class X402PaymentSpec:
-    """What a PaidTool returns when it needs paying: the transport adds the resource."""
-
-    error: str
-    accepts: tuple[PaymentRequirements, ...]
-
-    def required(self, resource: ResourceInfo) -> PaymentRequired:
-        return PaymentRequired(
-            x402Version=X402_VERSION, error=self.error, resource=resource, accepts=self.accepts
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class VerifyResponse(WireStruct):
     isValid: bool  # noqa: N815  # x402 wire field name
     payer: str
@@ -102,16 +89,41 @@ class SettleResponse(WireStruct):
 
 
 @dataclass(frozen=True, slots=True)
-class X402PaymentResult:
-    """What a PaidTool returns when paid and settled: the transport reports the
-    settlement (MCP _meta["x402/payment-response"], HTTP PAYMENT-RESPONSE)."""
+class PaidResponse[R: ToolResponse](ToolResponse):
+    """A paid tool's response, once its payment settled: the transport reports the
+    settlement with it (MCP _meta["x402/payment-response"], HTTP PAYMENT-RESPONSE)."""
 
-    response: ToolResponse
+    response: R
     settlement: SettleResponse
+
+    @override
+    def to_mcp_content(self) -> list[dict[str, Any]]:
+        return self.response.to_mcp_content()
+
+    @override
+    def to_rest(self) -> tuple[Any, str]:
+        return self.response.to_rest()
 
 
 class PaymentError(TeeSwapError):
     pass
+
+
+class PaymentRequiredError(PaymentError):
+    """A paid tool asks to be paid, first or again (`error` says why the last payment
+    wasn't taken). The tool knows what to pay; the transport adds the resource, since
+    only it knows where the call was made, and sends x402's PaymentRequired."""
+
+    # `accepts` has a default so a client can rebuild it from its code and message alone
+    def __init__(self, error: str, accepts: tuple[PaymentRequirements, ...] = ()) -> None:
+        super().__init__(error)
+        self.error = error
+        self.accepts = accepts
+
+    def required(self, resource: ResourceInfo) -> PaymentRequired:
+        return PaymentRequired(
+            x402Version=X402_VERSION, error=self.error, resource=resource, accepts=self.accepts
+        )
 
 
 class PaymentNotSettledError(PaymentError):
@@ -193,10 +205,15 @@ def sign_exact_evm(
 
 
 class EvmPayer(Payer):
-    """Pays `exact` requirements on EVM networks (EIP-3009) from one key."""
+    """Pays `exact` requirements on EVM networks (EIP-3009) from one key.
 
-    def __init__(self, signer: EthSigner) -> None:
+    A payment stays usable for as long as the resource allows (maxTimeoutSeconds), or
+    for `valid_for` seconds if that's sooner: after that, nobody can settle it.
+    """
+
+    def __init__(self, signer: EthSigner, valid_for: int | None = None) -> None:
         self._signer = signer
+        self._valid_for = valid_for
 
     @property
     def address(self) -> str:
@@ -207,12 +224,15 @@ class EvmPayer(Payer):
         for requirements in required.accepts:
             if requirements.scheme == "exact" and requirements.network.startswith("eip155:"):
                 now = int(Timestamp.now().dt.timestamp())
+                valid_for = requirements.maxTimeoutSeconds
+                if self._valid_for is not None:
+                    valid_for = min(valid_for, self._valid_for)
                 return sign_exact_evm(
                     self._signer,
                     required.resource,
                     requirements,
                     valid_after=now - 60,
-                    valid_before=now + requirements.maxTimeoutSeconds,
+                    valid_before=now + valid_for,
                     nonce=Hex32.from_bytes(os.urandom(32)),
                 ).payload
         raise PaymentError("none of the payment requirements can be paid from an EVM key")

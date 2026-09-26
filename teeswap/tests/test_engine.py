@@ -6,9 +6,11 @@ the local facilitator.
 """
 
 import asyncio
+import enum
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import override
 
 import pytest
 from eth_typing import HexStr
@@ -28,11 +30,12 @@ from teeswap.tests.conftest import (
     ONE_USDC,
     OPERATOR_NAME,
     USDC_TOKEN,
+    FacilitatorGas,
     SaveInvoice,
     Served,
     new_address,
 )
-from teeswap.tests.localchain import LocalChain
+from teeswap.tests.localchain import DORP, USDC, LocalChain
 from teeswap.tools import StatusResponse
 from teeswap.types import (
     Address,
@@ -44,10 +47,18 @@ from teeswap.types import (
     KeysQuoteRequest,
     QuoteRequest,
     QuoteResponse,
+    Timestamp,
     TokenAmount,
 )
 from teeswap.wire import decode_object
-from teeswap.x402 import EvmPayer
+from teeswap.x402 import (
+    EvmPayer,
+    Payer,
+    PaymentNotSettledError,
+    PaymentPayload,
+    PaymentRequired,
+    sign_exact_evm,
+)
 
 SURPLUS = 10**15  # 0.001 ETH
 FINISHED = ("delivered", "tools_down", "expired")
@@ -112,7 +123,7 @@ async def test_eth_split(
     chain.transfer_eth(deposit_to.address.value, paid)
 
     status = await _until_finished(api, quote.quote_id)
-    assert status.status == "delivered", f"invoice ended {status.status}"
+    assert status.status == "delivered", f"invoice ended {status.status}: {status.reason}"
     (deposit,) = status.inputs
     assert deposit.status == InputStatus.RECEIVED
     assert deposit.deposit.address == deposit_to.address
@@ -168,24 +179,136 @@ async def test_usdc_split_paid_by_x402(
 
     paid = await api.accept_paid(InvoiceRequest(quote_id=quote.quote_id), payer)
     assert paid.settlement.success
-    assert paid.settlement.transaction in paid.accepted.instructions
+    assert paid.settlement.transaction in paid.response.instructions
 
     status = await _until_finished(api, quote.quote_id)
-    assert status.status == "delivered", f"invoice ended {status.status}"
+    assert status.status == "delivered", f"invoice ended {status.status}: {status.reason}"
     (deposit,) = status.inputs
     assert deposit.status == InputStatus.RECEIVED
     assert deposit.received.amount == 5 * ONE_USDC
     assert [o.status for o in status.outputs] == [OutputStatus.DELIVERED] * 2
-    assert chain.usdc_balance(payer.address) == 5 * ONE_USDC
-    assert chain.usdc_balance(recipient_a) == 3 * ONE_USDC
-    assert chain.usdc_balance(recipient_b) == 2 * ONE_USDC
+    assert chain.balance_of(USDC, payer.address) == 5 * ONE_USDC
+    assert chain.balance_of(USDC, recipient_a) == 3 * ONE_USDC
+    assert chain.balance_of(USDC, recipient_b) == 2 * ONE_USDC
 
     # custody: everything that came in was delivered, nothing is left held or in flight
     by_custody = _by_custody(await api.invoice(InvoiceRequest(quote_id=quote.quote_id)))
     assert by_custody.get(Custody.DELIVERED) == 5 * ONE_USDC
     assert not by_custody.get(Custody.HELD) and not by_custody.get(Custody.IN_FLIGHT)
-    assert chain.usdc_balance(deposit.deposit.address.value) == 0
+    assert chain.balance_of(USDC, deposit.deposit.address.value) == 0
     await invoice_page(quote.quote_id)
+
+
+class Tamper(enum.Enum):
+    """Ways a payment can differ from what was asked for."""
+
+    DORP = enum.auto()  # pays in DORP, and says so
+    DORP_DISGUISED = enum.auto()  # pays in DORP, while claiming to be the USDC asked for
+    RECIPIENT = enum.auto()  # pays someone else
+    AMOUNT = enum.auto()  # pays less
+
+
+class TamperedPayer(Payer):
+    """A wallet whose payment doesn't pay what was asked. Except for DORP, the payment
+    still claims to be exactly what was asked for: only what it signs differs."""
+
+    def __init__(self, signer: EthSigner, tamper: Tamper) -> None:
+        self._signer = signer
+        self._tamper = tamper
+
+    @override
+    async def pay(self, required: PaymentRequired) -> PaymentPayload:
+        (asked,) = required.accepts
+        match self._tamper:
+            case Tamper.DORP | Tamper.DORP_DISGUISED:
+                dorp = {**asked.extra, "name": DORP.name, "version": DORP.version}
+                signed = replace(asked, asset=DORP.address, extra=dorp)
+            case Tamper.RECIPIENT:
+                signed = replace(asked, payTo=new_address())
+            case Tamper.AMOUNT:
+                signed = replace(asked, amount=Amount(asked.amount - 1))
+        now = int(Timestamp.now().dt.timestamp())
+        payment = sign_exact_evm(
+            self._signer,
+            required.resource,
+            signed,
+            valid_after=now - 60,
+            valid_before=now + asked.maxTimeoutSeconds,
+            nonce=Hex32.from_bytes(os.urandom(32)),
+        ).payload
+        return payment if self._tamper is Tamper.DORP else replace(payment, accepted=asked)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tamper", "refusal"),
+    [
+        (Tamper.DORP, "does not match the payment requirements"),
+        (Tamper.DORP_DISGUISED, "isn't signed by"),
+        (Tamper.RECIPIENT, "the payment is to"),
+        (Tamper.AMOUNT, "the payment is for"),
+    ],
+    ids=["dorp", "dorp-disguised", "recipient", "amount"],
+)
+async def test_payment_that_doesnt_pay_what_was_asked_is_refused(
+    api: Api, chain: LocalChain, tamper: Tamper, refusal: str
+) -> None:
+    five_usdc = TokenAmount(token=USDC_TOKEN, amount=Amount(5 * ONE_USDC))
+    quote = await _quote_x402_when_routable(
+        api, QuoteRequest(inputs=(five_usdc,), outputs=(_to(new_address(), five_usdc),))
+    )
+    invoice = InvoiceRequest(quote_id=quote.quote_id)
+    wallet = EthSigner(os.urandom(32))
+    chain.mint(USDC, wallet.address, 10 * ONE_USDC)
+    chain.mint(DORP, wallet.address, 10 * ONE_USDC)
+
+    with pytest.raises(PaymentNotSettledError, match=refusal):
+        await api.accept_paid(invoice, TamperedPayer(wallet, tamper))
+
+    # refused inside: nothing taken, nothing handed to a facilitator, the quote still stands
+    assert chain.balance_of(USDC, wallet.address) == 10 * ONE_USDC
+    assert chain.balance_of(DORP, wallet.address) == 10 * ONE_USDC
+    view = await api.invoice(invoice)
+    assert not [e for a in view.actions for step in a.steps for e in step.side_effects]
+    assert (await api.status(invoice)).status == "quoted"
+
+
+# long enough for the facilitator to verify it; short, so a payment that can't settle is
+# known to be dead soon after
+SHORT_LIVED_PAYMENT_SECONDS = 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("block_time")
+async def test_facilitator_without_gas(
+    served: Served, chain: LocalChain, facilitator_gas: FacilitatorGas, invoice_page: SaveInvoice
+) -> None:
+    # below the Api, so the same whichever interface: in process only
+    api = served.instance.api
+    signer = EthSigner(os.urandom(32))
+    chain.mint(USDC, signer.address, 10 * ONE_USDC)
+    payer = EvmPayer(signer, valid_for=SHORT_LIVED_PAYMENT_SECONDS)
+    recipient = new_address()
+    five_usdc = TokenAmount(token=USDC_TOKEN, amount=Amount(5 * ONE_USDC))
+    quote = await _quote_x402_when_routable(
+        api, QuoteRequest(inputs=(five_usdc,), outputs=(_to(recipient, five_usdc),))
+    )
+    invoice = InvoiceRequest(quote_id=quote.quote_id)
+
+    # verify needs no gas, settle does: the facilitator takes the payment, and can't settle it
+    facilitator_gas.starve()
+    with pytest.raises(PaymentNotSettledError):
+        await api.accept_paid(invoice, payer)
+    assert chain.balance_of(USDC, payer.address) == 10 * ONE_USDC
+    assert (await api.status(invoice)).status == "quoted"
+
+    # a failure only ranks a facilitator lower: once it can settle again, it's used again
+    facilitator_gas.feed()
+    await api.accept_paid(invoice, payer)
+    status = await _until_finished(api, quote.quote_id)
+    await invoice_page(quote.quote_id)
+    assert status.status == "delivered", f"invoice ended {status.status}: {status.reason}"
+    assert chain.balance_of(USDC, recipient) == 5 * ONE_USDC
 
 
 @pytest.mark.asyncio
@@ -283,7 +406,7 @@ async def test_handed_over_keys_become_inputs(
     assert input_account.address == deposit_to.address  # the same account, not a new one
 
     status = await _until_finished(api, quote.quote_id)
-    assert status.status == "delivered", f"invoice ended {status.status}"
+    assert status.status == "delivered", f"invoice ended {status.status}: {status.reason}"
     (output,) = quote.outputs
     assert chain.eth_balance(recipient) == output.amount.amount
     await invoice_page(quote.quote_id)

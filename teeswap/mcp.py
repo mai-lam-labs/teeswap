@@ -24,10 +24,10 @@ from .wire import HasFromDict, WireError, encode, parse_json
 from .x402 import (
     MCP_PAYMENT_META_KEY,
     MCP_PAYMENT_RESPONSE_META_KEY,
+    PaidResponse,
     PaymentPayload,
+    PaymentRequiredError,
     ResourceInfo,
-    X402PaymentResult,
-    X402PaymentSpec,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,10 +158,10 @@ class ToolsCallParams(McpParams):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BlindCallParams(McpParams):
     name: str
-    inputCommitment: str  # noqa: N815  # SEP-2133 wire field name
-    encryptionScheme: str  # noqa: N815  # SEP-2133 wire field name
-    encryptedArguments: str  # noqa: N815  # SEP-2133 wire field name
-    replyPublicKey: str | None = None  # noqa: N815  # SEP-2133 wire field name
+    inputCommitment: str  # noqa: N815  # Verifiable MCP wire field name
+    encryptionScheme: str  # noqa: N815  # Verifiable MCP wire field name
+    encryptedArguments: str  # noqa: N815  # Verifiable MCP wire field name
+    replyPublicKey: str | None = None  # noqa: N815  # Verifiable MCP wire field name
 
 
 _PARAMS_BY_METHOD: dict[str, type[McpParams]] = {
@@ -214,8 +214,8 @@ class ToolDefinition:
         return "POST"
 
 
-class ToolBase(abc.ABC):
-    """What every tool has: its definition and where it may be called from."""
+class Tool(abc.ABC):
+    """A tool: its definition, where it may be called from, and what it does."""
 
     @property
     @abc.abstractmethod
@@ -235,26 +235,11 @@ class ToolBase(abc.ABC):
         never a plain tools/call or REST, where the operator can read the reply."""
         return False
 
-
-class Tool(ToolBase):
     @abc.abstractmethod
-    async def execute(self, args: Any) -> ToolResponse: ...
-
-
-class PaidTool(ToolBase):
-    """A tool that may require an x402 payment.
-
-    Not a Tool subclass: its execute takes the payment (None when the client sent
-    none) and may return X402PaymentSpec (pay first) or X402PaymentResult (paid,
-    with the settlement to report), which a Tool never does.
-    """
-
-    @abc.abstractmethod
-    async def execute(self, args: Any, payment: PaymentPayload | None) -> ToolOutcome: ...
-
-
-type AnyTool = Tool | PaidTool
-type ToolOutcome = ToolResponse | X402PaymentSpec | X402PaymentResult
+    async def execute(self, args: Any, payment: PaymentPayload | None = None) -> ToolResponse:
+        """Run the tool. `payment` is the client's x402 payment, if it sent one: a paid
+        tool raises PaymentRequiredError until it's paid, then returns a PaidResponse.
+        Any other tool ignores it, so it is never settled or charged."""
 
 
 class ToolNotAvailableError(TeeSwapError):
@@ -267,7 +252,7 @@ class Dispatcher:
         signer: Signer | None = None,
         hpke_keypair: HpkeKeypair | None = None,
     ) -> None:
-        self._tools: dict[str, AnyTool] = {}
+        self._tools: dict[str, Tool] = {}
         self._signer = signer
         self._hpke_keypair = hpke_keypair
         self._blind_executor: BlindExecutor | None = (
@@ -276,11 +261,11 @@ class Dispatcher:
             else None
         )
 
-    def register(self, tool: AnyTool) -> None:
+    def register(self, tool: Tool) -> None:
         self._tools[tool.definition.name] = tool
 
     @property
-    def tools(self) -> dict[str, AnyTool]:
+    def tools(self) -> dict[str, Tool]:
         return self._tools
 
     def tools_list(self, has_session: bool = True) -> list[dict[str, Any]]:
@@ -302,7 +287,7 @@ class Dispatcher:
         payment: PaymentPayload | None,
         has_session: bool = True,
         encrypted_reply: bool = False,
-    ) -> ToolOutcome:
+    ) -> ToolResponse:
         tool = self._tools.get(name)
         if tool is None:
             raise ToolNotFoundError(f"unknown tool: {name}")
@@ -319,12 +304,7 @@ class Dispatcher:
             args = tool.definition.input_type.from_dict(arguments)
         except (DaciteError, ValueError, TypeError) as e:
             raise InvalidToolArgumentsError(f"invalid arguments for {name}: {e}") from e
-        match tool:
-            case PaidTool():
-                return await tool.execute(args, payment)
-            case Tool():
-                # a payment sent to a free tool is ignored: never settled, never charged
-                return await tool.execute(args)
+        return await tool.execute(args, payment)
 
     @property
     def signer(self) -> Signer | None:
@@ -338,7 +318,7 @@ class Dispatcher:
     def blind_executor(self) -> BlindExecutor | None:
         return self._blind_executor
 
-    def get(self, name: str) -> AnyTool | None:
+    def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
 
@@ -547,20 +527,21 @@ async def _handle_tools_call(
     has_session: bool = True,
 ) -> McpResult:
     try:
-        outcome = await dispatcher.call(
+        response = await dispatcher.call(
             params.name, params.arguments, params.payment, has_session=has_session
         )
     except (ToolNotFoundError, ToolNotAvailableError) as e:
         return McpResult(body=_error(req_id, -32601, str(e), ErrorResponse.of(e)))
     except InvalidToolArgumentsError as e:
         return McpResult(body=_error(req_id, -32602, str(e), ErrorResponse.of(e)))
+    except PaymentRequiredError as e:
+        rendered = _payment_required_content(dispatcher, params.name, e)
+        return _attested_result(dispatcher, req_id, params, rendered)
     except TeeSwapError as e:
         # a domain failure is a tool result the model can see and act on, not a protocol error
         return _attested_result(dispatcher, req_id, params, _error_content(e))
 
-    return _attested_result(
-        dispatcher, req_id, params, _render_outcome(dispatcher, params.name, outcome)
-    )
+    return _attested_result(dispatcher, req_id, params, _render_response(response))
 
 
 def _error_content(error: TeeSwapError) -> RenderedOutcome:
@@ -582,30 +563,32 @@ class RenderedOutcome:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
-def _render_outcome(dispatcher: Dispatcher, name: str, outcome: ToolOutcome) -> RenderedOutcome:
-    match outcome:
-        case X402PaymentSpec():
-            # x402 MCP transport: the PaymentRequired goes in structuredContent and,
-            # as JSON, in the first text content item
-            required = outcome.required(
-                ResourceInfo(
-                    url=f"mcp://tool/{name}",
-                    description=dispatcher.tools[name].definition.description,
-                    mimeType="application/json",
-                )
-            )
-            return RenderedOutcome(
-                content=[{"type": "text", "text": encode(required).decode()}],
-                fields={"isError": True, "structuredContent": required},
-            )
-        case X402PaymentResult():
-            # x402 MCP transport: the settlement goes in _meta
-            return RenderedOutcome(
-                content=outcome.response.to_mcp_content(),
-                meta={MCP_PAYMENT_RESPONSE_META_KEY: outcome.settlement},
-            )
-        case ToolResponse():
-            return RenderedOutcome(content=outcome.to_mcp_content())
+def _payment_required_content(
+    dispatcher: Dispatcher, name: str, error: PaymentRequiredError
+) -> RenderedOutcome:
+    """x402 MCP transport: the PaymentRequired goes in structuredContent and, as JSON,
+    in the first text content item."""
+    required = error.required(
+        ResourceInfo(
+            url=f"mcp://tool/{name}",
+            description=dispatcher.tools[name].definition.description,
+            mimeType="application/json",
+        )
+    )
+    return RenderedOutcome(
+        content=[{"type": "text", "text": encode(required).decode()}],
+        fields={"isError": True, "structuredContent": required},
+    )
+
+
+def _render_response(response: ToolResponse) -> RenderedOutcome:
+    if isinstance(response, PaidResponse):
+        # x402 MCP transport: the settlement goes in _meta
+        return RenderedOutcome(
+            content=response.to_mcp_content(),
+            meta={MCP_PAYMENT_RESPONSE_META_KEY: response.settlement},
+        )
+    return RenderedOutcome(content=response.to_mcp_content())
 
 
 def _attested_result(
@@ -655,17 +638,19 @@ async def _handle_blind_call(
         return McpResult(body=_error(req_id, -32602, str(e), ErrorResponse.of(e)))
 
     try:
-        outcome = await dispatcher.call(
+        response = await dispatcher.call(
             params.name,
             decrypted.arguments,
             params.payment,
             encrypted_reply=params.replyPublicKey is not None,
         )
-        rendered = _render_outcome(dispatcher, params.name, outcome)
+        rendered = _render_response(response)
     except ToolNotFoundError as e:
         return McpResult(body=_error(req_id, -32601, str(e), ErrorResponse.of(e)))
     except InvalidToolArgumentsError as e:
         return McpResult(body=_error(req_id, -32602, str(e), ErrorResponse.of(e)))
+    except PaymentRequiredError as e:
+        rendered = _payment_required_content(dispatcher, params.name, e)
     except TeeSwapError as e:
         rendered = _error_content(e)
 
@@ -678,7 +663,7 @@ async def _handle_blind_call(
         reply_public_key_b64=params.replyPublicKey,
     )
 
-    # SEP-2133 blind replies encrypt `content` only; other result fields
+    # Verifiable MCP blind replies encrypt `content` only; other result fields
     # (isError, x402's structuredContent and _meta settlement) are sent as they are
     result_body: dict[str, Any] = {
         "content": content,

@@ -23,11 +23,14 @@ from ..x402 import (
     HTTP_PAYMENT_REQUIRED_HEADER,
     HTTP_PAYMENT_RESPONSE_HEADER,
     HTTP_PAYMENT_SIGNATURE_HEADER,
+    PaidResponse,
+    PaymentError,
+    PaymentNotSettledError,
     PaymentPayload,
     PaymentRequired,
     SettleResponse,
 )
-from .base import Api, PaidAccept
+from .base import Api
 
 
 class RestApi(Api):
@@ -69,16 +72,25 @@ class RestApi(Api):
         )
 
     @override
-    async def accept_x402(
-        self, request: InvoiceRequest, payment: PaymentPayload | None
-    ) -> PaymentRequired | PaidAccept:
-        headers = {} if payment is None else {HTTP_PAYMENT_SIGNATURE_HEADER: _b64(payment)}
-        resp = await self._post("accept_x402", request, headers)
+    async def payment_required(self, request: InvoiceRequest) -> PaymentRequired:
+        resp = await self._post("accept_x402", request)
         if resp.status_code == httpx.codes.PAYMENT_REQUIRED:
-            return PaymentRequired.from_dict(_header_object(resp, HTTP_PAYMENT_REQUIRED_HEADER))
+            return _payment_required(resp)
         _raise_for_error(resp)
-        return PaidAccept(
-            accepted=AcceptResponse.from_dict(decode_object(resp.content)),
+        raise PaymentError("teeswap_accept_x402 answered without being paid")
+
+    @override
+    async def accept_x402(
+        self, request: InvoiceRequest, payment: PaymentPayload
+    ) -> PaidResponse[AcceptResponse]:
+        resp = await self._post(
+            "accept_x402", request, {HTTP_PAYMENT_SIGNATURE_HEADER: _b64(payment)}
+        )
+        if resp.status_code == httpx.codes.PAYMENT_REQUIRED:
+            raise PaymentNotSettledError(_payment_required(resp).error)
+        _raise_for_error(resp)
+        return PaidResponse(
+            response=AcceptResponse.from_dict(decode_object(resp.content)),
             settlement=SettleResponse.from_dict(_header_object(resp, HTTP_PAYMENT_RESPONSE_HEADER)),
         )
 
@@ -108,6 +120,10 @@ def _raise_for_error(resp: httpx.Response) -> None:
 
 def _b64(value: WireStruct) -> str:
     return base64.b64encode(encode(value)).decode("ascii")
+
+
+def _payment_required(resp: httpx.Response) -> PaymentRequired:
+    return PaymentRequired.from_dict(_header_object(resp, HTTP_PAYMENT_REQUIRED_HEADER))
 
 
 def _header_object(resp: httpx.Response, header: str) -> dict[str, Any]:

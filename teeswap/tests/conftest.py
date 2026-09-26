@@ -119,7 +119,7 @@ def invoice_page(request: pytest.FixtureRequest, served: Served) -> SaveInvoice:
 def payer(chain: LocalChain) -> EvmPayer:
     """A user's wallet holding 10 USDC."""
     payer = EvmPayer(EthSigner(os.urandom(32)))
-    chain.mint_usdc(payer.address, 10 * ONE_USDC)
+    chain.mint(USDC, payer.address, 10 * ONE_USDC)
     return payer
 
 
@@ -141,3 +141,34 @@ def gas_spike(chain: LocalChain) -> Iterator[Callable[[], None]]:
 
     yield spike
     chain.set_base_fee(before)
+
+
+@dataclass(frozen=True, slots=True)
+class FacilitatorGas:
+    """The local facilitator's gas money: take it away, give it back."""
+
+    chain: LocalChain
+    balance: int
+
+    def starve(self) -> None:
+        self.chain.set_eth_balance(self.chain.facilitator_account, 0)
+
+    def feed(self) -> None:
+        self.chain.set_eth_balance(self.chain.facilitator_account, self.balance)
+
+
+@pytest.fixture
+def facilitator_gas(chain: LocalChain) -> Iterator[FacilitatorGas]:
+    """The facilitator's gas; given back afterwards, since every test shares the chain."""
+    gas = FacilitatorGas(chain, chain.eth_balance(chain.facilitator_account))
+    yield gas
+    gas.feed()
+
+
+@pytest.fixture
+def block_time(chain: LocalChain) -> Iterator[None]:
+    """A chain whose time moves on: a block every second, as a real chain makes them.
+    anvil otherwise only mines for a transaction, so waiting on chain time waits forever."""
+    chain.mine_every(1)
+    yield
+    chain.mine_on_demand()

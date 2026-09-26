@@ -10,10 +10,13 @@ from typing import Any, override
 
 from eth_abi.abi import decode, encode
 from eth_account import Account
+from eth_account.messages import encode_typed_data
 from eth_account.signers.local import LocalAccount
+from eth_keys.exceptions import BadSignature
 from eth_typing import BlockNumber, ChainId, ChecksumAddress, Hash32, HexStr
 from eth_utils.abi import function_signature_to_4byte_selector
 from eth_utils.address import to_checksum_address
+from eth_utils.exceptions import ValidationError
 
 from ..common import TeeSwapError
 from ..http import BaseHttpClient
@@ -148,25 +151,40 @@ class TransferAuthorization:
     def sign(
         self, signer: EthSigner, domain: tuple[str, str], chain_id: int, token: ChecksumAddress
     ) -> bytes:
-        name, version = domain
         return signer.sign_typed_data(
-            domain={
-                "name": name,
-                "version": version,
-                "chainId": chain_id,
-                "verifyingContract": token,
-            },
+            domain=_eip712_domain(domain, chain_id, token),
             types={"TransferWithAuthorization": _TRANSFER_WITH_AUTHORIZATION},
             primary_type="TransferWithAuthorization",
-            message={
-                "from": self.sender,
-                "to": self.recipient,
-                "value": self.value,
-                "validAfter": self.valid_after,
-                "validBefore": self.valid_before,
-                "nonce": self.nonce.to_bytes(),
-            },
+            message=self._message(),
         )
+
+    def signed_by(
+        self, signature: bytes, domain: tuple[str, str], chain_id: int, token: ChecksumAddress
+    ) -> ChecksumAddress | None:
+        """Who signed this authorization for `token`: whoever it recovers to under that
+        token's domain. None if the signature is malformed."""
+        signable = encode_typed_data(
+            full_message={
+                "domain": _eip712_domain(domain, chain_id, token),
+                "types": {"TransferWithAuthorization": _TRANSFER_WITH_AUTHORIZATION},
+                "primaryType": "TransferWithAuthorization",
+                "message": self._message(),
+            }
+        )
+        try:
+            return to_checksum_address(Account.recover_message(signable, signature=signature))
+        except BadSignature, ValidationError:
+            return None
+
+    def _message(self) -> dict[str, Any]:
+        return {
+            "from": self.sender,
+            "to": self.recipient,
+            "value": self.value,
+            "validAfter": self.valid_after,
+            "validBefore": self.valid_before,
+            "nonce": self.nonce.to_bytes(),
+        }
 
     @classmethod
     def from_wire(cls, fields: dict[str, str]) -> TransferAuthorization:
@@ -190,6 +208,13 @@ class TransferAuthorization:
             "validBefore": str(self.valid_before),
             "nonce": self.nonce,
         }
+
+
+def _eip712_domain(
+    domain: tuple[str, str], chain_id: int, token: ChecksumAddress
+) -> dict[str, Any]:
+    name, version = domain
+    return {"name": name, "version": version, "chainId": chain_id, "verifyingContract": token}
 
 
 _TRANSFER_WITH_AUTHORIZATION = [

@@ -1,4 +1,4 @@
-"""SEP-2133 — Verifiable MCP Tools (per-result attestation + blind execution).
+"""Verifiable MCP: the verifiable-tools extension (per-result attestation + blind execution).
 
 Proposal: https://github.com/nicholasgasior/model-context-protocol/blob/sep-2133/docs/specification/draft/extensions/verifiable-tools.md
 Reference impl: https://github.com/nicholasgasior/verifiable-mcp-tools
@@ -33,31 +33,31 @@ class ProofFormat(enum.StrEnum):
     TEE_VAPORTPM_V1 = "tee-vaportpm-v1"
 
 
-# --- SEP-2133 constants ---
+# --- Verifiable MCP constants ---
 
 VERIFIABLE_TOOLS_NS = "io.github.ripple-node-lab/verifiable-tools"
 HPKE_INFO_ARGS = f"{VERIFIABLE_TOOLS_NS}/hpke-v1/args".encode()
 HPKE_INFO_REPLY = f"{VERIFIABLE_TOOLS_NS}/hpke-v1/reply".encode()
 
 
-# --- SEP-2133 per-result proof ---
+# --- Verifiable MCP per-result proof ---
 
 
 @dataclass(frozen=True, slots=True)
 class VerifiableResult(WireStruct):
-    """The SEP-2133 verifiable-tools _meta block; field names are the wire names."""
+    """The verifiable-tools _meta block; field names are the wire names."""
 
-    inputCommitment: str  # noqa: N815  # SEP-2133 wire field name
-    outputCommitment: str  # noqa: N815  # SEP-2133 wire field name
+    inputCommitment: str  # noqa: N815  # Verifiable MCP wire field name
+    outputCommitment: str  # noqa: N815  # Verifiable MCP wire field name
     proof: str
-    proofFormat: ProofFormat  # noqa: N815  # SEP-2133 wire field name
+    proofFormat: ProofFormat  # noqa: N815  # Verifiable MCP wire field name
     nonce: str | None = None
-    teeAttestation: dict[str, Any] | None = None  # noqa: N815  # SEP-2133 wire field name
-    encryptedContent: bool = False  # noqa: N815  # SEP-2133 wire field name
+    teeAttestation: dict[str, Any] | None = None  # noqa: N815  # Verifiable MCP wire field name
+    encryptedContent: bool = False  # noqa: N815  # Verifiable MCP wire field name
 
     @override
     def to_wire(self) -> Encodable:
-        """The SEP-2133 block: unset optional fields are omitted, not null."""
+        """The Verifiable MCP block: unset optional fields are omitted, not null."""
         meta: dict[str, Encodable] = {
             "inputCommitment": self.inputCommitment,
             "outputCommitment": self.outputCommitment,

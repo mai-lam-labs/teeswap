@@ -13,6 +13,7 @@ See: https://docs.x402.org/core-concepts/facilitator
 import asyncio
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,6 +34,53 @@ SETTLE_TIMEOUT = 60.0
 
 class FacilitatorError(TeeSwapError):
     """The facilitator couldn't be reached or answered with something we can't read."""
+
+
+class FacilitatorsDownError(TeeSwapError):
+    """Every facilitator that can settle a payment is down right now: try again soon."""
+
+
+# after a failed poll, how soon to look again: sooner than the poll interval, so one failed
+# poll doesn't take a facilitator out for long
+FAILED_POLL_RETRY_SECONDS = 10.0
+
+
+# how fast a facilitator's record fades: what happened an hour ago counts half as much
+RELIABILITY_HALF_LIFE_SECONDS = 3600.0
+# what's assumed before there's a record: one success, so a new or rarely used facilitator
+# ranks well rather than being penalised for having been quiet
+PRIOR_SUCCESSES = 1.0
+PRIOR_FAILURES = 0.0
+
+
+@dataclass(slots=True)
+class Reliability:
+    """How a facilitator has been doing lately: counts of what it did and didn't do that
+    fade with a half-life, so an old failure stops counting. Constant-sized; facilitators
+    are ranked by their success rate, never dropped for their failures."""
+
+    successes: float = 0.0
+    failures: float = 0.0
+    updated_at: float = field(default_factory=time.monotonic)
+
+    def record(self, ok: bool) -> None:
+        weight = self._weight(time.monotonic())
+        self.successes *= weight
+        self.failures *= weight
+        self.updated_at = time.monotonic()
+        if ok:
+            self.successes += 1
+        else:
+            self.failures += 1
+
+    @property
+    def success_rate(self) -> float:
+        weight = self._weight(time.monotonic())
+        successes = self.successes * weight + PRIOR_SUCCESSES
+        return successes / (successes + self.failures * weight + PRIOR_FAILURES)
+
+    def _weight(self, now: float) -> float:
+        return 0.5 ** ((now - self.updated_at) / RELIABILITY_HALF_LIFE_SECONDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +137,10 @@ class FacilitatorSnapshot:
 async def poll_facilitator(
     client: httpx.AsyncClient,
     url: str,
+    known: FacilitatorStatus | None = None,
 ) -> FacilitatorStatus:
+    """Whether the facilitator is up, and what it can settle. One that's down keeps what it
+    was last known to settle (`known`): it's down, not incapable."""
     now = time.time()
     try:
         resp = await client.get(f"{url}/supported", timeout=REQUEST_TIMEOUT)
@@ -100,9 +151,9 @@ async def poll_facilitator(
         return FacilitatorStatus(
             url=url,
             healthy=False,
-            kinds=(),
-            extensions=(),
-            signers=(),
+            kinds=() if known is None else known.kinds,
+            extensions=() if known is None else known.extensions,
+            signers=() if known is None else known.signers,
             last_polled=now,
         )
 
@@ -139,10 +190,12 @@ class _FacilitatorPoller:
             await asyncio.sleep(self._initial_delay)
         async with httpx.AsyncClient() as client:
             while True:
-                status = await poll_facilitator(client, self._url)
+                known = self._snapshot.facilitators.get(self._url)
+                status = await poll_facilitator(client, self._url, known)
                 self._snapshot.facilitators[self._url] = status
                 self._snapshot.updated_at = time.time()
-                await asyncio.sleep(self._config.poll_interval)
+                interval = self._config.poll_interval
+                await asyncio.sleep(interval if status.healthy else FAILED_POLL_RETRY_SECONDS)
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -160,6 +213,8 @@ class FacilitatorMonitor:
     def __init__(self, configs: tuple[FacilitatorConfig, ...]) -> None:
         self._configs = configs
         self._snapshot = FacilitatorSnapshot()
+        # how each has done for every job, as they reported it
+        self._reliability = {c.url: Reliability() for c in configs}
         self._pollers = [
             _FacilitatorPoller(c, self._snapshot, initial_delay=i * STAGGER_INTERVAL)
             for i, c in enumerate(configs)
@@ -169,10 +224,29 @@ class FacilitatorMonitor:
     def snapshot(self) -> FacilitatorSnapshot:
         return self._snapshot
 
-    def candidates(self, scheme: str, network: str, excluded: set[str]) -> tuple[str, ...]:
-        """Healthy facilitators that support (scheme, network), in config order."""
+    def record(self, url: str, ok: bool) -> None:
+        """How a facilitator did with a request: it counts toward its ranking for everyone."""
+        self._reliability.setdefault(url, Reliability()).record(ok)
+
+    def candidates(
+        self, scheme: str, network: str, job: Mapping[str, Reliability]
+    ) -> tuple[str, ...]:
+        """Healthy facilitators that support (scheme, network), best first: by how they
+        did for this job, then for every job, then in config order. A failure only moves a
+        facilitator down; it's still tried when the others fail too."""
         capable = {f.url for f in self._snapshot.facilitators_for(scheme, network)}
-        return tuple(c.url for c in self._configs if c.url in capable and c.url not in excluded)
+        if not capable and any(
+            k.scheme == scheme and k.network == network
+            for f in self._snapshot.facilitators.values()
+            for k in f.kinds
+        ):
+            raise FacilitatorsDownError(f"every facilitator for {scheme} on {network} is down")
+        ranked = [
+            (-_success_rate(job, c.url), -_success_rate(self._reliability, c.url), i, c.url)
+            for i, c in enumerate(self._configs)
+            if c.url in capable
+        ]
+        return tuple(url for *_, url in sorted(ranked))
 
     def start(self) -> None:
         for p in self._pollers:
@@ -181,6 +255,11 @@ class FacilitatorMonitor:
     def stop(self) -> None:
         for p in self._pollers:
             p.stop()
+
+
+def _success_rate(record: Mapping[str, Reliability], url: str) -> float:
+    reliability = record.get(url)
+    return Reliability().success_rate if reliability is None else reliability.success_rate
 
 
 # --- Verify and settle (x402 facilitator API) ---
