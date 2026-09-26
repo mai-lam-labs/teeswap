@@ -33,8 +33,8 @@ class ValidatedSchemaPlugin(OpenAPISchemaPlugin):
             description=ws.description,
             format=OpenAPIFormat(ws.format) if ws.format is not None else None,
             pattern=ws.pattern,
-            minimum=float(ws.minimum) if ws.minimum is not None else None,
-            maximum=float(ws.maximum) if ws.maximum is not None else None,
+            minimum=ws.minimum,
+            maximum=ws.maximum,
         )
 
 

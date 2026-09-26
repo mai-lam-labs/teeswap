@@ -3,8 +3,8 @@
 import time
 
 from ..blockchain.rpc import RpcMonitor, RpcStatus
+from ..execution.invoice import InvoiceRegistry
 from ..facilitator import FacilitatorMonitor
-from ..invoice import InvoiceRegistry
 from .html import (
     a,
     button,
@@ -221,19 +221,19 @@ def render_invoices(registry: InvoiceRegistry) -> str:
                         css = (
                             "up"
                             if inv.is_active
-                            else ("down" if inv.status.value == "failed" else "warn")
+                            else ("down" if inv.status.value == "tools_down" else "warn")
                         )
                         current = inv.current_action
                         with tr():
                             with td():
                                 _badge(inv.status.value.upper(), css)
-                            td(str(inv.id), cls="mono")
+                            td(inv.id.ref, cls="mono")
                             td(", ".join(sorted({i.token.chain.name for i in inv.quote.inputs})))
                             td(", ".join(f"{i.amount} {i.token.symbol}" for i in inv.quote.inputs))
                             td(f"{len(inv.request.outputs)} output(s)")
-                            deposits = [i.deposit.address.value[:10] + "…" for i in inv.inputs]
+                            deposits = [d.address.value[:10] + "…" for d in inv.deposits]
                             td(", ".join(deposits) or "—", cls="mono")
-                            td(str(len(inv.actions)))
+                            td(str(len(inv.worklog.actions)))
                             td(current.description if current else "—")
                             td(inv.created_at.dt.strftime("%Y-%m-%d %H:%M"), cls="age")
     return str(doc)
@@ -261,7 +261,7 @@ def render_processes(registry: InvoiceRegistry) -> str:
                         action = inv.current_action
                         step = action.current_step if action else None
                         with tr():
-                            td(str(inv.id), cls="mono")
+                            td(inv.id.ref, cls="mono")
                             td(action.description if action else "—")
                             td(step.operation if step else "—")
                             with td():

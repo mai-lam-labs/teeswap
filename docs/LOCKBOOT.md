@@ -49,8 +49,8 @@ a signed manifest.
     }
   },
   "teeswap": {
-    "bind": "0.0.0.0:8402",
-    "payment_address": "0x..."
+    "operator": {"legal_name": "...", "extra": "..."},
+    "facilitators": [{"url": "https://facilitator.example"}]
   }
 }
 ```
@@ -78,72 +78,46 @@ sha256.
 Updates: rebuild the image, re-sign the manifest, push. No user-data change
 needed — the ed25519 key is pinned, not the binary hash.
 
-## Build pipeline
+## Build
 
-All builds run inside Docker containers — no Rust toolchain on the host.
+Builds run in Docker, so no Rust toolchain is needed on the host. The lockboot
+images (`lockboot:erofs-builder` and friends) are built from the lockboot repo.
 
-### Prerequisites (already on this machine)
+- `make bundle-<arch>` builds TEESwap as a self-contained Python bundle
+  (`Dockerfile.bundle`: musl Python and the dependencies, stripped).
+- `make payload-<arch>` packages it: the container filesystem becomes an erofs
+  image with dm-verity, appended to the generic lockboot stage2 loader
+  (`dist/<arch>/bootstrap`), giving `dist/<arch>/stage2`.
+- The result is signed with TEESwap's release key
+  (`lockboot-deploy sign --domain lockboot.v1.stage2.payload`).
 
-```
-lockboot:build          — Rust + musl cross-compilation
-lockboot:erofs-builder  — mkfs.erofs + veritysetup + zip (the packaging CLI)
-lockboot:harness        — QEMU/swtpm test harness
-```
+## Boot: `teeswap container-init`
 
-If missing, build from the lockboot repo:
-```bash
-cd /home/user/Projects/lockboot/stage2
-make docker-build-base docker-build-erofs
-```
+stage2 runs `/init` as PID 1, which runs `teeswap container-init`:
 
-### Build the TEESwap stage2 binary
+1. **Reads the configuration from stdin** (the full user-data JSON, in a memfd)
+   and takes the `teeswap` key.
+2. **Derives the keys from the TPM**, bound to the PCRs: the Ed25519 signing key,
+   the X25519 HPKE key, and the EVM root key the job accounts come from. The same
+   code and configuration give the same keys on every boot.
+3. **Attests**: `vaportpm-attest` with a nonce committing to both public keys, a
+   timestamp, and the signing key's signature over the timestamp (proof the key
+   is live, not replayed from an earlier boot):
 
-```bash
-# 1. Build the TEESwap container image (must have /init)
-docker build -t teeswap .
+   ```
+   nonce = SHA-256(signing_public_key || hpke_public_key || timestamp || ed25519_sig(timestamp))
+   ```
 
-# 2. Get the lockboot loader (pre-built or from lockboot repo)
-#    The loader is generic — same binary for any payload.
-LOADER=/home/user/Projects/lockboot/stage2/target/x86_64-unknown-linux-musl/release/bootstrap
-
-# 3. Package: export container → erofs → append to loader → stage2 binary
-docker export "$(docker create --rm teeswap)" \
-  | docker run --rm -i \
-      -v "$LOADER:/bootstrap:ro" \
-      lockboot:erofs-builder --bootstrap /bootstrap - - > build/stage2
-
-# 4. Sign with TEESwap's release key (lockboot-deploy)
-lockboot-deploy sign \
-  --domain lockboot.v1.stage2.payload \
-  --key teeswap-release.pem \
-  --in build/stage2 \
-  --out build/stage2.sig
-```
-
-## What `/init` does
-
-stage2 does `execv("/init")` as PID 1 in the overlay root. Our `/init` must:
-
-1. **Read config from stdin** (fd 0) — a seekable memfd containing the full
-   user-data JSON. Parse the `teeswap` key for app config.
-
-2. **Generate key material** — Ed25519 signing key + X25519 HPKE keypair.
-   These are ephemeral to each boot (not persisted to `/data`).
-
-3. **Attest the keys** — call `vaportpm-attest` with a nonce that commits to
-   both public keys + a timestamp + liveness signatures from both keys. This
-   proves "these keys were generated inside this TEE with this code and config."
-
-4. **Start the server** — bind to the address from config, serve MCP + REST.
-
-5. **Handle PID 1 duties** — SIGTERM for graceful shutdown, SIGCHLD reaping.
+4. **Drops privileges** to `nobody`, and re-executes itself as `teeswap serve`,
+   passing the key material over an inherited pipe: never on disk, never in
+   arguments or the environment.
 
 ## Filesystem at runtime
 
 | Path | Type | Survives reboot? | Use |
 |---|---|---|---|
 | `/` | overlay (erofs + tmpfs) | No | Immutable code, ephemeral writes |
-| `/data` | ext4 on dm-crypt | Yes | Invoice store, persistent state |
+| `/data` | ext4 on dm-crypt | Yes | Durable job state (planned) |
 | `/run/lockboot/stage1.attest` | file | No | Stage1 attestation |
 | `/run/lockboot/stage2.attest` | file | No | Stage2 config digest |
 | stdin (fd 0) | memfd | No | User-data JSON config |
@@ -157,54 +131,9 @@ stage2 does `execv("/init")` as PID 1 in the overlay root. Our `/init` must:
 | 15 | SHA-256 of user-data JSON | Config identity — any config change wipes `/data` |
 | 5, 10 | Excluded (GPT, IMA) | See PCR-BINDING.md |
 
-## Attestation flow (boot time)
-
-```
-generate ed25519 signing keypair
-generate x25519 HPKE keypair
-timestamp = current unix time
-
-both keys sign the timestamp (liveness proof)
-
-nonce = SHA-256(
-  signing_public_key
-  || hpke_public_key
-  || timestamp
-  || ed25519_signature(timestamp)
-  || x25519... (TBD: X25519 is not a signing key, need to reconsider)
-)
-
-attestation = vaportpm-attest(nonce)
-```
-
-**Open question:** X25519 is a DH key, not a signing key — it can't sign the
-timestamp. Options:
-- Use only the Ed25519 signature in the nonce (HPKE key is still committed by
-  inclusion in the hash)
-- Generate an Ed25519 key for HPKE signing and use X25519 only for DH
-- Derive the X25519 key from the Ed25519 key (RFC 7748 birational map)
-
-The nonce commits to both public keys regardless — the liveness signature just
-additionally proves the signing key is live (not replayed from a previous boot).
-
-## Docker dev environment (no TEE)
-
-For local development without a real TPM or lockboot chain:
-
-```bash
-# TODO: Dockerfile that runs TEESwap with:
-# - Ephemeral Ed25519 key (no attestation)
-# - Config from a mounted JSON file (simulates stdin)
-# - SQLite in a volume (simulates /data)
-# - No dm-verity, no overlay — just runs the Python app directly
-```
-
 ## Open questions
 
-- [ ] `/init` implementation: shell script wrapping Python, or a small Go/Rust
-  binary that sets up PID 1 duties then execs Python?
-- [ ] How to bundle Python 3.14 + deps in the container image — venv? PyInstaller?
-  uv-managed self-contained directory?
-- [ ] Persistent state schema for `/data` — SQLite? append-only log?
-- [ ] Config schema for the `teeswap` block in user-data
-- [ ] X25519 liveness proof approach (see attestation flow above)
+- [ ] Durable state on `/data`: its format, and recovering jobs from it at boot.
+- [ ] A configuration change changes PCR 15, and so every derived key: jobs still
+  running when the configuration changes can't be reached afterwards. How an
+  operator changes configuration safely (drain first, or hand over).

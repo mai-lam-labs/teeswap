@@ -9,6 +9,7 @@ from teeswap.response import JsonResponse
 from teeswap.schema import schema_for_type
 from teeswap.types import HexStr, InvoiceRequest, QuoteRequest, TxHash
 from teeswap.wire import HasFromDict
+from teeswap.x402 import PaymentPayload
 
 
 class DummyQuoteTool(Tool):
@@ -24,7 +25,9 @@ class DummyQuoteTool(Tool):
         )
 
     @override
-    async def execute(self, args: QuoteRequest) -> JsonResponse:
+    async def execute(
+        self, args: QuoteRequest, payment: PaymentPayload | None = None
+    ) -> JsonResponse:
         return JsonResponse({"status": "ok"})
 
 

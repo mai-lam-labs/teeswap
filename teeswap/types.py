@@ -1,4 +1,3 @@
-import enum
 import functools
 import re
 from dataclasses import dataclass, field
@@ -58,12 +57,12 @@ class HexStr(str, Validated):
         )
 
 
-class TxHash(HexStr):
-    LENGTH = 32
-
-
 class Hex32(HexStr):
     LENGTH = 32
+
+
+class TxHash(Hex32):
+    pass
 
 
 class Amount(int, Validated):
@@ -189,9 +188,7 @@ class Percent(Decimal, Validated):
     @override
     @classmethod
     def json_schema(cls) -> WireSchema:
-        return WireSchema(
-            type="number", minimum=Decimal(0), maximum=Decimal(100), description="percentage"
-        )
+        return WireSchema(type="number", minimum=0, maximum=100, description="percentage")
 
 
 # --- Duration types ---
@@ -229,6 +226,13 @@ class Token(WireStruct):
     chain: Chain
     contract: str | None
     decimals: int
+
+    @classmethod
+    def native(cls, chain: Chain) -> Token:
+        """The chain's native token (what gas is paid in)."""
+        return cls(
+            symbol=chain.native_token, chain=chain, contract=None, decimals=chain.native_decimals
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,13 +286,6 @@ class HttpExchange:
     latency: Millis
 
 
-class ProtocolClass(enum.StrEnum):
-    A = "A"
-    B = "B"
-    C = "C"
-    D = "D"
-
-
 # --- Quote / Invoice request types ---
 
 DEFAULT_TOLERANCE = Percent("0.5")
@@ -306,15 +303,37 @@ class QuoteRequest(WireStruct):
     ] = DEFAULT_TOLERANCE
 
 
+@dataclass(frozen=True, slots=True)
+class HeldInput(WireStruct):
+    """An input already in an account its owner holds the key to: what the account holds
+    of `token` is the input."""
+
+    token: Token
+    private_key: Annotated[Hex32, Parameter(description="The account's key: a secret")]
+
+
+@dataclass(frozen=True, slots=True)
+class KeysQuoteRequest(WireStruct):
+    inputs: Annotated[
+        tuple[HeldInput, ...],
+        Parameter(description="The accounts holding the inputs, one per token, with their keys"),
+    ]
+    outputs: Annotated[tuple[Balance, ...], Parameter(description="Where to send the results")]
+    tolerance_percent: Annotated[
+        Percent, Parameter(description="Acceptable slippage as a percentage")
+    ] = DEFAULT_TOLERANCE
+
+
 @dataclass(frozen=True)
 class QuoteResponse(DataclassResponse):
     quote_id: Annotated[str, Parameter(description="Use this ID with teeswap_accept")]
     inputs: Annotated[tuple[TokenAmount, ...], Parameter(description="Inputs, one per token")]
-    outputs: Annotated[
-        tuple[Balance, ...], Parameter(description="Estimated amounts after gas and fees")
-    ]
+    outputs: Annotated[tuple[Balance, ...], Parameter(description="Estimated amounts after gas")]
     gas: Annotated[TokenAmount, Parameter(description="Estimated gas cost")]
-    fee: TokenAmount
+    plan: Annotated[
+        tuple[str, ...],
+        Parameter(description="Provisional plan: what Mai expects to do (may change)"),
+    ]
     expires_at: Annotated[Timestamp, Parameter(description="Quote expires at this time")]
 
 

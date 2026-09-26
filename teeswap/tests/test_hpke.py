@@ -1,6 +1,6 @@
 """HPKE conformance tests against RFC 9180 A.1.1 test vector.
 
-These values come from the SEP-2133 reference implementation's hpke.test.ts,
+These values come from the Verifiable MCP reference implementation's hpke.test.ts,
 which itself uses the RFC 9180 Appendix A.1.1 vector for
 DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM base mode.
 

@@ -1,175 +1,482 @@
-"""End-to-end engine test against a local anvil node.
+"""End-to-end flows: what a user does, through each interface, against a real chain.
 
-Requires: make anvil-start
+Each test runs once per interface (see conftest.api). Deposits are real transfers
+from a funded account; x402 payments are signed by the user's wallet and settled by
+the local facilitator.
 """
 
 import asyncio
-from pathlib import Path
+import enum
+import os
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from typing import override
 
-import httpx
 import pytest
-import pytest_asyncio
-from litestar.testing import AsyncTestClient
+from eth_typing import HexStr
 
-from teeswap.app import make_http_app
-from teeswap.blockchain.chains import Chain, ChainFamily
-from teeswap.blockchain.evm import EthSigner, EvmRpcClient
-from teeswap.blockchain.rpc import RpcConfig, jsonrpc
-from teeswap.config import Operator, TeeSwapConfig
+from teeswap.api import Api, RestApi
+from teeswap.blockchain.evm import EncodedCall, EthSigner, EvmChain
+from teeswap.execution.invoice import InputStatus, InvoiceNotFoundError, InvoiceView, OutputStatus
+from teeswap.execution.ledger import Custody
+from teeswap.execution.planner import NoRouteError
 from teeswap.http import HttpClient
-from teeswap.instance import TeeSwap
-from teeswap.invoice import InputStatus, InvoiceView, OutputStatus
+from teeswap.mcp import ToolNotAvailableError
+from teeswap.tests.conftest import (
+    ANVIL_CHAIN,
+    ANVIL_URL,
+    ETH,
+    ONE_ETH,
+    ONE_USDC,
+    OPERATOR_NAME,
+    USDC_TOKEN,
+    FacilitatorGas,
+    SaveInvoice,
+    Served,
+    new_address,
+)
+from teeswap.tests.localchain import DORP, USDC, LocalChain
+from teeswap.tools import StatusResponse
 from teeswap.types import (
     Address,
     Amount,
     Balance,
+    HeldInput,
+    Hex32,
     InvoiceRequest,
+    KeysQuoteRequest,
     QuoteRequest,
     QuoteResponse,
-    Token,
+    Timestamp,
     TokenAmount,
 )
-from teeswap.wire import decode_object, encode
-
-ANVIL_URL = "http://127.0.0.1:8545"
-ANVIL_CHAIN = Chain(
-    caip2="eip155:31337",
-    family=ChainFamily.EVM,
-    name="Anvil",
-    short_name="anvil",
-    native_token="ETH",
-    native_decimals=18,
-    testnet=True,
+from teeswap.wire import decode_object
+from teeswap.x402 import (
+    EvmPayer,
+    Payer,
+    PaymentNotSettledError,
+    PaymentPayload,
+    PaymentRequired,
+    sign_exact_evm,
 )
-ETH = Token(symbol="ETH", chain=ANVIL_CHAIN, contract=None, decimals=18)
-ROOT_KEY = b"\xbb" * 32
-ONE_ETH = 10**18
-OPERATOR_NAME = "CÔNG TY TNHH THỐNG TRỊ TOÀN CẦU MAI LÀM"
+
+SURPLUS = 10**15  # 0.001 ETH
+FINISHED = ("delivered", "tools_down", "expired")
 
 
-class Anvil:
-    def __init__(self, url: str = ANVIL_URL) -> None:
-        self.url = url
-        self.client = HttpClient()
-        self.rpc = EvmRpcClient(self.client, url)
-
-    async def close(self) -> None:
-        await self.client.__aexit__(None, None, None)
-
-    async def set_balance(self, address: str, amount_wei: int) -> None:
-        await jsonrpc(self.client, self.url, "anvil_setBalance", [address, hex(amount_wei)])
-
-    async def mine(self) -> None:
-        await jsonrpc(self.client, self.url, "evm_mine")
+def _to(address: str, amount: TokenAmount) -> Balance:
+    return Balance(amount=amount, address=Address(amount.token.chain, address))
 
 
-@pytest_asyncio.fixture
-async def anvil():
-    node = Anvil()
-    try:
-        await node.rpc.chain_id()
-    except httpx.ConnectError as e:
-        raise RuntimeError("anvil not running — run make anvil-start") from e
-    yield node
-    await node.close()
+async def _until_finished(api: Api, quote_id: str) -> StatusResponse:
+    request = InvoiceRequest(quote_id=quote_id)
+    status = await api.status(request)
+    for _ in range(120):
+        if status.status in FINISHED:
+            break
+        await asyncio.sleep(0.5)
+        status = await api.status(request)
+    return status
+
+
+async def _quote_x402_when_routable(api: Api, request: QuoteRequest) -> QuoteResponse:
+    """A client's view of a TeeSwap that has just started: no route until its
+    facilitators have been seen healthy."""
+    for _ in range(50):
+        try:
+            return await api.quote_x402(request)
+        except NoRouteError:
+            await asyncio.sleep(0.1)
+    return await api.quote_x402(request)
+
+
+def _by_custody(view: InvoiceView) -> dict[Custody, int]:
+    totals: dict[Custody, int] = {}
+    for position in view.holdings:
+        custody = position.place.custody
+        totals[custody] = totals.get(custody, 0) + position.amount.amount
+    return totals
 
 
 @pytest.mark.asyncio
-async def test_eth_split_via_api(anvil: Anvil):
-    instance = TeeSwap(
-        config=TeeSwapConfig(
-            chains=(ANVIL_CHAIN,),
-            rpcs=(RpcConfig(chain=ANVIL_CHAIN.caip2, urls=(ANVIL_URL,)),),
-            facilitators=(),
-            operator=Operator(legal_name=OPERATOR_NAME, extra="MST: 0123456789"),
-        ),
-    )
-
-    recipient_a = EthSigner.derive(ROOT_KEY, b"recipient-a").address
-    recipient_b = EthSigner.derive(ROOT_KEY, b"recipient-b").address
-
+async def test_eth_split(
+    api: Api, served: Served, chain: LocalChain, invoice_page: SaveInvoice
+) -> None:
+    recipient_a, recipient_b = new_address(), new_address()
     request = QuoteRequest(
         inputs=(
             TokenAmount(token=ETH, amount=Amount(ONE_ETH * 40 // 100)),
             TokenAmount(token=ETH, amount=Amount(ONE_ETH * 60 // 100)),
         ),
         outputs=(
-            Balance(
-                amount=TokenAmount(token=ETH, amount=Amount(ONE_ETH * 60 // 100)),
-                address=Address(ANVIL_CHAIN, recipient_a),
-            ),
-            Balance(
-                amount=TokenAmount(token=ETH, amount=Amount(ONE_ETH * 40 // 100)),
-                address=Address(ANVIL_CHAIN, recipient_b),
-            ),
+            _to(recipient_a, TokenAmount(token=ETH, amount=Amount(ONE_ETH * 60 // 100))),
+            _to(recipient_b, TokenAmount(token=ETH, amount=Amount(ONE_ETH * 40 // 100))),
         ),
     )
-
-    # the quote goes over REST as JSON, so hydration is exercised the way clients hit it
-    app = make_http_app(instance)
-    async with AsyncTestClient(app) as client:
-        resp = await client.post(
-            "/teeswap/quote",
-            content=encode(request),
-            headers={"content-type": "application/json"},
-        )
-    assert resp.status_code == 200, resp.text
-    quote = QuoteResponse.from_dict(decode_object(resp.content))
-    quote_id = quote.quote_id
+    quote = await api.quote(request)
     assert quote.inputs == (TokenAmount(token=ETH, amount=Amount(ONE_ETH)),)
 
-    accept_response = await instance.api.accept(InvoiceRequest(quote_id=quote_id))
-    deposit_address = accept_response.deposits[0].address.value
+    accepted = await api.accept(InvoiceRequest(quote_id=quote.quote_id))
+    (deposit_to,) = accepted.deposits
+    # a little over the quote: Mai carries on and the surplus stays held
+    paid = ONE_ETH + SURPLUS
+    chain.transfer_eth(deposit_to.address.value, paid)
 
-    await anvil.set_balance(deposit_address, ONE_ETH)
-
-    status_response = await instance.api.status(InvoiceRequest(quote_id=quote_id))
-    for _ in range(30):
-        await asyncio.sleep(1)
-        await anvil.mine()
-        status_response = await instance.api.status(InvoiceRequest(quote_id=quote_id))
-        if status_response.status in ("delivered", "failed"):
-            break
-
-    assert status_response.status == "delivered", f"invoice stuck in {status_response.status}"
-    (deposit,) = status_response.inputs
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "delivered", f"invoice ended {status.status}: {status.reason}"
+    (deposit,) = status.inputs
     assert deposit.status == InputStatus.RECEIVED
-    assert deposit.deposit.address.value == deposit_address
-    assert deposit.received.amount >= ONE_ETH
-    assert [o.status for o in status_response.outputs] == [OutputStatus.SUBMITTED] * 2
-    assert all(len(o.transactions) == 1 for o in status_response.outputs)
+    assert deposit.deposit.address == deposit_to.address
+    assert deposit.received.amount == paid
+    assert [o.status for o in status.outputs] == [OutputStatus.DELIVERED] * 2
+    assert all(len(o.transactions) == 1 for o in status.outputs)
+    assert chain.eth_balance(recipient_a) > chain.eth_balance(recipient_b) > 0
 
-    balance_a = await anvil.rpc.get_balance(recipient_a)
-    balance_b = await anvil.rpc.get_balance(recipient_b)
-    assert balance_a > 0
-    assert balance_b > 0
-    assert balance_a > balance_b
+    view = await api.invoice(InvoiceRequest(quote_id=quote.quote_id))
+    # nothing went wrong, so Mai did exactly what her provisional plan said
+    assert tuple(a.description for a in view.actions) == quote.plan
+    assert view.outputs == status.outputs
 
-    invoice_view = await instance.api.invoice(InvoiceRequest(quote_id=quote_id))
-    assert [a.description for a in invoice_view.actions] == [
-        "wait for ETH deposit",
-        "send ETH to 2 recipients",
-    ]
-    assert invoice_view.outputs == status_response.outputs
+    # custody: every wei that arrived is held, delivered or consumed, and the chain agrees
+    by_custody = _by_custody(view)
+    assert sum(by_custody.values()) == paid
+    assert by_custody.get(Custody.IN_FLIGHT, 0) == 0
+    delivered = {
+        p.place.address.value: p.amount.amount
+        for p in view.holdings
+        if p.place.custody == Custody.DELIVERED
+    }
+    assert delivered == {o.balance.address.value: o.balance.amount.amount for o in view.outputs}
+    assert by_custody[Custody.HELD] == chain.eth_balance(deposit_to.address.value)
+    assert by_custody[Custody.HELD] >= SURPLUS
 
-    # --- Invoice view routes ---
-    async with AsyncTestClient(app) as client:
-        html_resp = await client.get(f"/invoice/{quote_id}.html")
-        assert html_resp.status_code == 200
-        assert "DELIVERED" in html_resp.text
-        assert OPERATOR_NAME in html_resp.text
-        assert "MST: 0123456789" in html_resp.text
-        assert deposit_address in html_resp.text
+    # the invoice pages show the same invoice
+    html = await invoice_page(quote.quote_id)
+    assert "DELIVERED" in html
+    assert OPERATOR_NAME in html
+    assert "MST: 0123456789" in html
+    assert deposit_to.address.value in html
+    json = await served.client.get(f"/invoice/{quote.quote_id}.json")
+    assert json.status_code == 200
+    assert InvoiceView.from_dict(decode_object(json.content)) == view
 
-        json_resp = await client.get(f"/invoice/{quote_id}.json")
-        assert json_resp.status_code == 200
-        # what a client reads back is exactly the invoice the TEE holds
-        assert InvoiceView.from_dict(decode_object(json_resp.content)) == invoice_view
 
-        not_found = await client.get("/invoice/inv_bogus.html")
-        assert not_found.status_code == 404
+@pytest.mark.asyncio
+async def test_usdc_split_paid_by_x402(
+    api: Api, payer: EvmPayer, chain: LocalChain, invoice_page: SaveInvoice
+) -> None:
+    recipient_a, recipient_b = new_address(), new_address()
+    request = QuoteRequest(
+        inputs=(TokenAmount(token=USDC_TOKEN, amount=Amount(5 * ONE_USDC)),),
+        outputs=(
+            _to(recipient_a, TokenAmount(token=USDC_TOKEN, amount=Amount(3 * ONE_USDC))),
+            _to(recipient_b, TokenAmount(token=USDC_TOKEN, amount=Amount(2 * ONE_USDC))),
+        ),
+    )
+    quote = await _quote_x402_when_routable(api, request)
+    # the facilitator pays the gas: the outputs are exactly what was asked for
+    assert quote.outputs == request.outputs
 
-    out = Path("dist/demo_invoice.html")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(html_resp.text)
-    print(f"\n>>> invoice HTML saved to {out.resolve()}")
+    paid = await api.accept_paid(InvoiceRequest(quote_id=quote.quote_id), payer)
+    assert paid.settlement.success
+    assert paid.settlement.transaction in paid.response.instructions
+
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "delivered", f"invoice ended {status.status}: {status.reason}"
+    (deposit,) = status.inputs
+    assert deposit.status == InputStatus.RECEIVED
+    assert deposit.received.amount == 5 * ONE_USDC
+    assert [o.status for o in status.outputs] == [OutputStatus.DELIVERED] * 2
+    assert chain.balance_of(USDC, payer.address) == 5 * ONE_USDC
+    assert chain.balance_of(USDC, recipient_a) == 3 * ONE_USDC
+    assert chain.balance_of(USDC, recipient_b) == 2 * ONE_USDC
+
+    # custody: everything that came in was delivered, nothing is left held or in flight
+    by_custody = _by_custody(await api.invoice(InvoiceRequest(quote_id=quote.quote_id)))
+    assert by_custody.get(Custody.DELIVERED) == 5 * ONE_USDC
+    assert not by_custody.get(Custody.HELD) and not by_custody.get(Custody.IN_FLIGHT)
+    assert chain.balance_of(USDC, deposit.deposit.address.value) == 0
+    await invoice_page(quote.quote_id)
+
+
+class Tamper(enum.Enum):
+    """Ways a payment can differ from what was asked for."""
+
+    DORP = enum.auto()  # pays in DORP, and says so
+    DORP_DISGUISED = enum.auto()  # pays in DORP, while claiming to be the USDC asked for
+    RECIPIENT = enum.auto()  # pays someone else
+    AMOUNT = enum.auto()  # pays less
+
+
+class TamperedPayer(Payer):
+    """A wallet whose payment doesn't pay what was asked. Except for DORP, the payment
+    still claims to be exactly what was asked for: only what it signs differs."""
+
+    def __init__(self, signer: EthSigner, tamper: Tamper) -> None:
+        self._signer = signer
+        self._tamper = tamper
+
+    @override
+    async def pay(self, required: PaymentRequired) -> PaymentPayload:
+        (asked,) = required.accepts
+        match self._tamper:
+            case Tamper.DORP | Tamper.DORP_DISGUISED:
+                dorp = {**asked.extra, "name": DORP.name, "version": DORP.version}
+                signed = replace(asked, asset=DORP.address, extra=dorp)
+            case Tamper.RECIPIENT:
+                signed = replace(asked, payTo=new_address())
+            case Tamper.AMOUNT:
+                signed = replace(asked, amount=Amount(asked.amount - 1))
+        now = int(Timestamp.now().dt.timestamp())
+        payment = sign_exact_evm(
+            self._signer,
+            required.resource,
+            signed,
+            valid_after=now - 60,
+            valid_before=now + asked.maxTimeoutSeconds,
+            nonce=Hex32.from_bytes(os.urandom(32)),
+        ).payload
+        return payment if self._tamper is Tamper.DORP else replace(payment, accepted=asked)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tamper", "refusal"),
+    [
+        (Tamper.DORP, "does not match the payment requirements"),
+        (Tamper.DORP_DISGUISED, "isn't signed by"),
+        (Tamper.RECIPIENT, "the payment is to"),
+        (Tamper.AMOUNT, "the payment is for"),
+    ],
+    ids=["dorp", "dorp-disguised", "recipient", "amount"],
+)
+async def test_payment_that_doesnt_pay_what_was_asked_is_refused(
+    api: Api, chain: LocalChain, tamper: Tamper, refusal: str
+) -> None:
+    five_usdc = TokenAmount(token=USDC_TOKEN, amount=Amount(5 * ONE_USDC))
+    quote = await _quote_x402_when_routable(
+        api, QuoteRequest(inputs=(five_usdc,), outputs=(_to(new_address(), five_usdc),))
+    )
+    invoice = InvoiceRequest(quote_id=quote.quote_id)
+    wallet = EthSigner(os.urandom(32))
+    chain.mint(USDC, wallet.address, 10 * ONE_USDC)
+    chain.mint(DORP, wallet.address, 10 * ONE_USDC)
+
+    with pytest.raises(PaymentNotSettledError, match=refusal):
+        await api.accept_paid(invoice, TamperedPayer(wallet, tamper))
+
+    # refused inside: nothing taken, nothing handed to a facilitator, the quote still stands
+    assert chain.balance_of(USDC, wallet.address) == 10 * ONE_USDC
+    assert chain.balance_of(DORP, wallet.address) == 10 * ONE_USDC
+    view = await api.invoice(invoice)
+    assert not [e for a in view.actions for step in a.steps for e in step.side_effects]
+    assert (await api.status(invoice)).status == "quoted"
+
+
+# long enough for the facilitator to verify it; short, so a payment that can't settle is
+# known to be dead soon after
+SHORT_LIVED_PAYMENT_SECONDS = 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("block_time")
+async def test_facilitator_without_gas(
+    served: Served, chain: LocalChain, facilitator_gas: FacilitatorGas, invoice_page: SaveInvoice
+) -> None:
+    # below the Api, so the same whichever interface: in process only
+    api = served.instance.api
+    signer = EthSigner(os.urandom(32))
+    chain.mint(USDC, signer.address, 10 * ONE_USDC)
+    payer = EvmPayer(signer, valid_for=SHORT_LIVED_PAYMENT_SECONDS)
+    recipient = new_address()
+    five_usdc = TokenAmount(token=USDC_TOKEN, amount=Amount(5 * ONE_USDC))
+    quote = await _quote_x402_when_routable(
+        api, QuoteRequest(inputs=(five_usdc,), outputs=(_to(recipient, five_usdc),))
+    )
+    invoice = InvoiceRequest(quote_id=quote.quote_id)
+
+    # verify needs no gas, settle does: the facilitator takes the payment, and can't settle it
+    facilitator_gas.starve()
+    with pytest.raises(PaymentNotSettledError):
+        await api.accept_paid(invoice, payer)
+    assert chain.balance_of(USDC, payer.address) == 10 * ONE_USDC
+    assert (await api.status(invoice)).status == "quoted"
+
+    # a failure only ranks a facilitator lower: once it can settle again, it's used again
+    facilitator_gas.feed()
+    await api.accept_paid(invoice, payer)
+    status = await _until_finished(api, quote.quote_id)
+    await invoice_page(quote.quote_id)
+    assert status.status == "delivered", f"invoice ended {status.status}: {status.reason}"
+    assert chain.balance_of(USDC, recipient) == 5 * ONE_USDC
+
+
+@pytest.mark.asyncio
+async def test_unknown_invoice(api: Api) -> None:
+    """A mistyped quote id is the same error whichever way it's asked."""
+    with pytest.raises(InvoiceNotFoundError):
+        await api.status(InvoiceRequest(quote_id="inv_bogus"))
+
+
+@pytest.mark.asyncio
+async def test_tools_down_hands_over_the_money(
+    api: Api, chain: LocalChain, invoice_page: SaveInvoice
+) -> None:
+    """A user pays part of a deposit, changes their mind, and gets the money back as the
+    account's key, which they then use themselves."""
+    amount = TokenAmount(token=ETH, amount=Amount(ONE_ETH // 10))
+    quote = await api.quote(QuoteRequest(inputs=(amount,), outputs=(_to(new_address(), amount),)))
+    request = InvoiceRequest(quote_id=quote.quote_id)
+    (deposit_to,) = (await api.accept(request)).deposits
+    sent = amount.amount // 2
+    chain.transfer_eth(deposit_to.address.value, sent)
+
+    await api.tools_down(request)
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "tools_down", f"invoice ended {status.status}"
+    assert status.reason == "the owner put the tools down"
+    (deposit,) = status.inputs
+    assert deposit.status == InputStatus.NOT_RECEIVED
+    assert [o.status for o in status.outputs] == [OutputStatus.PENDING]
+
+    if isinstance(api, RestApi):
+        # REST replies cross the operator's network readable: the keys never go that way
+        with pytest.raises(ToolNotAvailableError):
+            await api.handover(request)
+        return
+
+    handover = await api.handover(request)
+    (account,) = handover.accounts
+    assert account.address == deposit_to.address
+    assert account.balances == (TokenAmount(token=ETH, amount=Amount(sent)),)
+
+    # here's the money: the key moves it, with Mai out of the picture
+    owner = EthSigner(account.private_key.to_bytes())
+    assert owner.address == deposit_to.address.value
+    user = new_address()
+    async with HttpClient() as client:
+        evm = EvmChain(ANVIL_CHAIN, client, ANVIL_URL)
+        tx = await evm.prepare(owner, EncodedCall(to=user, data=HexStr("0x"), value=sent // 2))
+        await evm.submit(tx)
+        while await evm.receipt(tx.tx_hash) is None:
+            await asyncio.sleep(0.1)
+    assert chain.eth_balance(user) == sent // 2
+
+    # the handover brought the record up to what the chain showed: all of it released
+    view = await api.invoice(request)
+    (deposit,) = view.inputs
+    assert deposit.received.amount == sent
+    by_custody = _by_custody(view)
+    assert by_custody.get(Custody.RELEASED) == sent
+    assert not by_custody.get(Custody.HELD)
+    await invoice_page(quote.quote_id)
+
+
+@pytest.mark.asyncio
+async def test_handed_over_keys_become_inputs(
+    api: Api, chain: LocalChain, invoice_page: SaveInvoice
+) -> None:
+    """The money handed over with the tools down goes straight back in: the account's key
+    is the input to the next job, with nothing moved in between."""
+    if isinstance(api, RestApi):
+        held = HeldInput(token=ETH, private_key=Hex32.from_bytes(os.urandom(32)))
+        request = KeysQuoteRequest(inputs=(held,), outputs=())
+        with pytest.raises(ToolNotAvailableError):
+            await api.quote_keys(request)  # keys never cross an interface the operator reads
+        return
+
+    # a job that went no further than a partial deposit, with its tools put down
+    amount = TokenAmount(token=ETH, amount=Amount(ONE_ETH // 10))
+    first = await api.quote(QuoteRequest(inputs=(amount,), outputs=(_to(new_address(), amount),)))
+    (deposit_to,) = (await api.accept(InvoiceRequest(quote_id=first.quote_id))).deposits
+    sent = amount.amount // 2
+    chain.transfer_eth(deposit_to.address.value, sent)
+    await api.tools_down(InvoiceRequest(quote_id=first.quote_id))
+    assert (await _until_finished(api, first.quote_id)).status == "tools_down"
+    (account,) = (await api.handover(InvoiceRequest(quote_id=first.quote_id))).accounts
+
+    # the key is the next job's input: what that account holds, sent on
+    recipient = new_address()
+    held = HeldInput(token=ETH, private_key=account.private_key)
+    wanted = _to(recipient, TokenAmount(token=ETH, amount=Amount(sent)))
+    quote = await api.quote_keys(KeysQuoteRequest(inputs=(held,), outputs=(wanted,)))
+    assert quote.inputs == (TokenAmount(token=ETH, amount=Amount(sent)),)
+    accepted = await api.accept(InvoiceRequest(quote_id=quote.quote_id))
+    (input_account,) = accepted.deposits
+    assert input_account.address == deposit_to.address  # the same account, not a new one
+
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "delivered", f"invoice ended {status.status}: {status.reason}"
+    (output,) = quote.outputs
+    assert chain.eth_balance(recipient) == output.amount.amount
+    await invoice_page(quote.quote_id)
+
+
+@dataclass(frozen=True, slots=True)
+class _Accepted:
+    quote: QuoteResponse
+    deposit_to: Balance
+
+
+async def _accept_eth(api: Api, recipient: str) -> _Accepted:
+    """A quote for 0.01 ETH to `recipient`, accepted: nothing deposited yet."""
+    amount = TokenAmount(token=ETH, amount=Amount(ONE_ETH // 100))
+    quote = await api.quote(QuoteRequest(inputs=(amount,), outputs=(_to(recipient, amount),)))
+    (deposit_to,) = (await api.accept(InvoiceRequest(quote_id=quote.quote_id))).deposits
+    return _Accepted(quote=quote, deposit_to=deposit_to)
+
+
+@pytest.mark.asyncio
+async def test_undeliverable_output_puts_tools_down(api: Api, chain: LocalChain) -> None:
+    """The recipient stops accepting payments after the quote: once the funds are in, Mai
+    finds the rest can't be done and hands the money back untouched."""
+    recipient = new_address()
+    accepted = await _accept_eth(api, recipient)
+    quote, deposit_to = accepted.quote, accepted.deposit_to
+    chain.refuse_payments(recipient)
+    (paid,) = quote.inputs
+    chain.transfer_eth(deposit_to.address.value, paid.amount)
+
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "tools_down", f"invoice ended {status.status}"
+    assert status.reason is not None and status.reason.startswith("the rest can't be done")
+    by_custody = _by_custody(await api.invoice(InvoiceRequest(quote_id=quote.quote_id)))
+    assert by_custody == {Custody.HELD: paid.amount}  # nothing was spent trying
+
+
+@pytest.mark.asyncio
+async def test_gas_spike_beyond_the_reserve_puts_tools_down(
+    api: Api, chain: LocalChain, gas_spike: Callable[[], None]
+) -> None:
+    """Paid exactly the quote, then gas gets far dearer: finishing would eat into the
+    outputs, so Mai stops instead."""
+    accepted = await _accept_eth(api, new_address())
+    quote, deposit_to = accepted.quote, accepted.deposit_to
+    gas_spike()
+    (paid,) = quote.inputs
+    chain.transfer_eth(deposit_to.address.value, paid.amount)
+
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "tools_down", f"invoice ended {status.status}"
+    assert status.reason is not None and status.reason.startswith("finishing needs")
+    by_custody = _by_custody(await api.invoice(InvoiceRequest(quote_id=quote.quote_id)))
+    assert by_custody == {Custody.HELD: paid.amount}
+
+
+@pytest.mark.asyncio
+async def test_overpayment_pays_for_a_gas_spike(
+    api: Api, chain: LocalChain, gas_spike: Callable[[], None]
+) -> None:
+    """The same spike, with the user having sent more than the quote: the surplus is leave
+    to spend on finishing, so Mai delivers."""
+    recipient = new_address()
+    accepted = await _accept_eth(api, recipient)
+    quote, deposit_to = accepted.quote, accepted.deposit_to
+    gas_spike()
+    (paid,) = quote.inputs
+    chain.transfer_eth(deposit_to.address.value, paid.amount + ONE_ETH // 100)
+
+    status = await _until_finished(api, quote.quote_id)
+    assert status.status == "delivered", f"invoice ended {status.status}: {status.reason}"
+    (output,) = quote.outputs
+    assert chain.eth_balance(recipient) == output.amount.amount

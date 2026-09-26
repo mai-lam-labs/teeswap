@@ -1,5 +1,6 @@
 import abc
 import base64
+import logging
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -17,33 +18,72 @@ from .crypto.attestation import (
     Signer,
 )
 from .crypto.hpke import HpkeKeypair
-from .response import ToolResponse
+from .response import ErrorResponse, ToolResponse
 from .schema import schema_for_type
 from .wire import HasFromDict, WireError, encode, parse_json
+from .x402 import (
+    MCP_PAYMENT_META_KEY,
+    MCP_PAYMENT_RESPONSE_META_KEY,
+    PaidResponse,
+    PaymentPayload,
+    PaymentRequiredError,
+    ResourceInfo,
+)
+
+logger = logging.getLogger(__name__)
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_VERSIONS = ("2025-11-25", "2026-07-28")
 PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion"
+# a domain error's ErrorResponse in an isError result's _meta, so clients can raise its type
+ERROR_META_KEY = f"{PKG_NAME}/error"
 
 SESSION_TTL_SECONDS = 3600
 
 
 @dataclass(frozen=True, slots=True)
-class PaymentRequirement:
-    scheme: str
-    network: str
-    amount: str
-    currency: str
-    pay_to: str
-    description: str
+class JsonRpcRequest(HasFromDict):
+    method: str
+    id: str | int
+    params: dict[str, Any] = field(default_factory=dict)
+    jsonrpc: str = "2.0"
 
 
 @dataclass(frozen=True, slots=True)
-class JsonRpcRequest(HasFromDict):
+class JsonRpcNotification(HasFromDict):
     method: str
     params: dict[str, Any] = field(default_factory=dict)
-    id: str | int | None = None
     jsonrpc: str = "2.0"
+
+
+type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification
+
+
+def parse_message(data: dict[str, Any]) -> JsonRpcMessage:
+    """JSON-RPC 2.0: with an "id" it is a request (always answered), without one a
+    notification (never answered, not even with an error)."""
+    if "id" in data:
+        return JsonRpcRequest.from_dict(data)
+    return JsonRpcNotification.from_dict(data)
+
+
+# Client notifications we accept and deliberately take no action on, and why that is
+# within the MCP spec. If we start sending server-initiated requests or add long-running
+# tools, initialized/cancelled/progress need real handling.
+IGNORED_NOTIFICATIONS: dict[str, str] = {
+    "notifications/initialized": "only gates server-initiated requests; we send none",
+    "notifications/cancelled": (
+        "spec allows ignoring when cancellation isn't possible: stdio handles one request"
+        " at a time and HTTP calls are short, so the request has completed"
+    ),
+    "notifications/progress": "only concerns server-initiated requests; we send none",
+    "notifications/roots/list_changed": "we don't use client roots",
+}
+
+
+def handle_mcp_notification(notification: JsonRpcNotification) -> None:
+    if notification.method not in IGNORED_NOTIFICATIONS:
+        logger.debug("ignoring unknown notification %s", notification.method)
 
 
 # --- MCP method params (field names are the wire names) ---
@@ -65,6 +105,7 @@ class McpParams(HasFromDict):
         if version is not None and not isinstance(version, str):
             raise TypeError(f"{PROTOCOL_VERSION_META} must be a string")
         self._verifiable_tools()
+        self._payment()
 
     @property
     def protocol_version(self) -> str | None:
@@ -74,6 +115,18 @@ class McpParams(HasFromDict):
     def client_nonce(self) -> str | None:
         vt = self._verifiable_tools()
         return vt.nonce if vt is not None else None
+
+    @property
+    def payment(self) -> PaymentPayload | None:
+        return self._payment()
+
+    def _payment(self) -> PaymentPayload | None:
+        raw = self._meta.get(MCP_PAYMENT_META_KEY)
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise TypeError(f"{MCP_PAYMENT_META_KEY} must be an object")
+        return PaymentPayload.from_dict(raw)
 
     def _verifiable_tools(self) -> VerifiableToolsMeta | None:
         raw = self._meta.get(VERIFIABLE_TOOLS_NS)
@@ -105,10 +158,10 @@ class ToolsCallParams(McpParams):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BlindCallParams(McpParams):
     name: str
-    inputCommitment: str  # noqa: N815  # SEP-2133 wire field name
-    encryptionScheme: str  # noqa: N815  # SEP-2133 wire field name
-    encryptedArguments: str  # noqa: N815  # SEP-2133 wire field name
-    replyPublicKey: str | None = None  # noqa: N815  # SEP-2133 wire field name
+    inputCommitment: str  # noqa: N815  # Verifiable MCP wire field name
+    encryptionScheme: str  # noqa: N815  # Verifiable MCP wire field name
+    encryptedArguments: str  # noqa: N815  # Verifiable MCP wire field name
+    replyPublicKey: str | None = None  # noqa: N815  # Verifiable MCP wire field name
 
 
 _PARAMS_BY_METHOD: dict[str, type[McpParams]] = {
@@ -162,6 +215,8 @@ class ToolDefinition:
 
 
 class Tool(abc.ABC):
+    """A tool: its definition, where it may be called from, and what it does."""
+
     @property
     @abc.abstractmethod
     def definition(self) -> ToolDefinition: ...
@@ -174,14 +229,20 @@ class Tool(abc.ABC):
     def mcp_visible(self) -> bool:
         return True
 
-    async def price(self, args: Any) -> PaymentRequirement | None:  # noqa: ARG002
-        return None
+    @property
+    def blind_only(self) -> bool:
+        """Its result is secret: only a blind call with an encrypted reply may have it,
+        never a plain tools/call or REST, where the operator can read the reply."""
+        return False
 
     @abc.abstractmethod
-    async def execute(self, args: Any) -> ToolResponse: ...
+    async def execute(self, args: Any, payment: PaymentPayload | None = None) -> ToolResponse:
+        """Run the tool. `payment` is the client's x402 payment, if it sent one: a paid
+        tool raises PaymentRequiredError until it's paid, then returns a PaidResponse.
+        Any other tool ignores it, so it is never settled or charged."""
 
 
-class ToolNotAvailableError(Exception):
+class ToolNotAvailableError(TeeSwapError):
     pass
 
 
@@ -220,13 +281,22 @@ class Dispatcher:
         ]
 
     async def call(
-        self, name: str, arguments: dict[str, Any], has_session: bool = True
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        payment: PaymentPayload | None,
+        has_session: bool = True,
+        encrypted_reply: bool = False,
     ) -> ToolResponse:
         tool = self._tools.get(name)
         if tool is None:
             raise ToolNotFoundError(f"unknown tool: {name}")
         if not tool.mcp_visible:
             raise ToolNotAvailableError(f"{name} is not available via MCP")
+        if tool.blind_only and not encrypted_reply:
+            raise ToolNotAvailableError(
+                f"{name} returns secrets: call it with verifiable-tools/call and a replyPublicKey"
+            )
         if tool.requires_session and not has_session:
             raise ToolNotAvailableError(f"{name} requires a session (use stdio or stateful HTTP)")
 
@@ -234,7 +304,7 @@ class Dispatcher:
             args = tool.definition.input_type.from_dict(arguments)
         except (DaciteError, ValueError, TypeError) as e:
             raise InvalidToolArgumentsError(f"invalid arguments for {name}: {e}") from e
-        return await tool.execute(args)
+        return await tool.execute(args, payment)
 
     @property
     def signer(self) -> Signer | None:
@@ -252,7 +322,7 @@ class Dispatcher:
         return self._tools.get(name)
 
 
-class ToolNotFoundError(Exception):
+class ToolNotFoundError(TeeSwapError):
     pass
 
 
@@ -319,7 +389,7 @@ def _error(
     req_id: str | int | None,
     code: int,
     message: str,
-    data: dict[str, Any] | None = None,
+    data: ErrorResponse | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     err: dict[str, Any] = {"code": code, "message": message}
     if data is not None:
@@ -331,6 +401,21 @@ def _error(
 
 
 async def handle_mcp_request(
+    dispatcher: Dispatcher,
+    sessions: SessionManager,
+    method: str,
+    rpc: JsonRpcRequest,
+    session_id: str | None,
+) -> McpResult:
+    """Always answers: anything unexpected becomes -32603 without details, logged here."""
+    try:
+        return await _dispatch_request(dispatcher, sessions, method, rpc, session_id)
+    except Exception:
+        logger.exception("internal error handling %s", method)
+        return McpResult(body=_error(rpc.id, -32603, "internal error"))
+
+
+async def _dispatch_request(
     dispatcher: Dispatcher,
     sessions: SessionManager,
     method: str,
@@ -442,22 +527,87 @@ async def _handle_tools_call(
     has_session: bool = True,
 ) -> McpResult:
     try:
-        tool_result = await dispatcher.call(params.name, params.arguments, has_session=has_session)
+        response = await dispatcher.call(
+            params.name, params.arguments, params.payment, has_session=has_session
+        )
     except (ToolNotFoundError, ToolNotAvailableError) as e:
-        return McpResult(body=_error(req_id, -32601, str(e)))
+        return McpResult(body=_error(req_id, -32601, str(e), ErrorResponse.of(e)))
     except InvalidToolArgumentsError as e:
-        return McpResult(body=_error(req_id, -32602, str(e)))
+        return McpResult(body=_error(req_id, -32602, str(e), ErrorResponse.of(e)))
+    except PaymentRequiredError as e:
+        rendered = _payment_required_content(dispatcher, params.name, e)
+        return _attested_result(dispatcher, req_id, params, rendered)
+    except TeeSwapError as e:
+        # a domain failure is a tool result the model can see and act on, not a protocol error
+        return _attested_result(dispatcher, req_id, params, _error_content(e))
 
-    content = tool_result.to_mcp_content()
-    result_body: dict[str, Any] = {"content": content}
+    return _attested_result(dispatcher, req_id, params, _render_response(response))
 
+
+def _error_content(error: TeeSwapError) -> RenderedOutcome:
+    """A domain error as a tool result: its message for the model, its code in _meta."""
+    return RenderedOutcome(
+        content=[{"type": "text", "text": str(error)}],
+        fields={"isError": True},
+        meta={ERROR_META_KEY: ErrorResponse.of(error)},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedOutcome:
+    """A tool outcome in MCP terms: the result's content, its other fields
+    (isError, structuredContent), and _meta entries of its own."""
+
+    content: list[dict[str, Any]]
+    fields: dict[str, Any] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+def _payment_required_content(
+    dispatcher: Dispatcher, name: str, error: PaymentRequiredError
+) -> RenderedOutcome:
+    """x402 MCP transport: the PaymentRequired goes in structuredContent and, as JSON,
+    in the first text content item."""
+    required = error.required(
+        ResourceInfo(
+            url=f"mcp://tool/{name}",
+            description=dispatcher.tools[name].definition.description,
+            mimeType="application/json",
+        )
+    )
+    return RenderedOutcome(
+        content=[{"type": "text", "text": encode(required).decode()}],
+        fields={"isError": True, "structuredContent": required},
+    )
+
+
+def _render_response(response: ToolResponse) -> RenderedOutcome:
+    if isinstance(response, PaidResponse):
+        # x402 MCP transport: the settlement goes in _meta
+        return RenderedOutcome(
+            content=response.to_mcp_content(),
+            meta={MCP_PAYMENT_RESPONSE_META_KEY: response.settlement},
+        )
+    return RenderedOutcome(content=response.to_mcp_content())
+
+
+def _attested_result(
+    dispatcher: Dispatcher,
+    req_id: str | int | None,
+    params: ToolsCallParams,
+    rendered: RenderedOutcome,
+) -> McpResult:
+    result_body: dict[str, Any] = {"content": rendered.content, **rendered.fields}
+    meta = dict(rendered.meta)
     if dispatcher.signer is not None:
         verifiable = dispatcher.signer.attest_result(
             arguments=params.arguments,
-            content=content,
+            content=rendered.content,
             client_nonce=params.client_nonce,
         )
-        result_body["_meta"] = verifiable.to_meta()
+        meta |= verifiable.to_meta()
+    if meta:
+        result_body["_meta"] = meta
 
     return McpResult(body=_ok(req_id, result_body))
 
@@ -485,27 +635,42 @@ async def _handle_blind_call(
     except (DaciteError, ValueError, TypeError, cryptography.exceptions.InvalidTag) as e:
         return McpResult(body=_error(req_id, -32602, f"decryption failed: {e}"))
     except AttestationError as e:
-        return McpResult(body=_error(req_id, -32602, str(e)))
+        return McpResult(body=_error(req_id, -32602, str(e), ErrorResponse.of(e)))
 
     try:
-        tool_result = await dispatcher.call(params.name, decrypted.arguments)
+        response = await dispatcher.call(
+            params.name,
+            decrypted.arguments,
+            params.payment,
+            encrypted_reply=params.replyPublicKey is not None,
+        )
+        rendered = _render_response(response)
     except ToolNotFoundError as e:
-        return McpResult(body=_error(req_id, -32601, str(e)))
+        return McpResult(body=_error(req_id, -32601, str(e), ErrorResponse.of(e)))
     except InvalidToolArgumentsError as e:
-        return McpResult(body=_error(req_id, -32602, str(e)))
-
-    content = tool_result.to_mcp_content()
+        return McpResult(body=_error(req_id, -32602, str(e), ErrorResponse.of(e)))
+    except PaymentRequiredError as e:
+        rendered = _payment_required_content(dispatcher, params.name, e)
+    except TeeSwapError as e:
+        rendered = _error_content(e)
 
     content, meta = blind.attest_and_encrypt(
         decrypted=decrypted,
-        content=content,
+        content=rendered.content,
         tool_name=params.name,
         client_input_commitment=params.inputCommitment,
         client_nonce=params.client_nonce,
         reply_public_key_b64=params.replyPublicKey,
     )
 
-    return McpResult(body=_ok(req_id, {"content": content, "_meta": meta}))
+    # Verifiable MCP blind replies encrypt `content` only; other result fields
+    # (isError, x402's structuredContent and _meta settlement) are sent as they are
+    result_body: dict[str, Any] = {
+        "content": content,
+        **rendered.fields,
+        "_meta": rendered.meta | meta,
+    }
+    return McpResult(body=_ok(req_id, result_body))
 
 
 # --- JSONL transport ---
@@ -537,20 +702,28 @@ async def jsonl_loop(
             write_error(None, -32700, f"parse error: {e}")
             continue
 
+        if not isinstance(raw, dict):
+            write_error(None, -32600, "invalid request: expected a JSON object")
+            continue
         try:
-            rpc = JsonRpcRequest.from_dict(raw)
+            message = parse_message(raw)
         except (DaciteError, TypeError, ValueError) as e:
-            write_error(
-                raw.get("id") if isinstance(raw, dict) else None, -32600, f"invalid request: {e}"
-            )
+            write_error(raw.get("id"), -32600, f"invalid request: {e}")
             continue
 
-        result = await handle_mcp_request(
-            dispatcher=dispatcher,
-            sessions=sessions,
-            method=rpc.method,
-            rpc=rpc,
-            session_id=session.session_id,
-        )
-
-        write(result.body)
+        match message:
+            case JsonRpcNotification():
+                handle_mcp_notification(message)
+            case JsonRpcRequest():
+                result = await handle_mcp_request(
+                    dispatcher=dispatcher,
+                    sessions=sessions,
+                    method=message.method,
+                    rpc=message,
+                    session_id=session.session_id,
+                )
+                try:
+                    write(result.body)
+                except WireError:
+                    logger.exception("could not encode the reply to %s", message.method)
+                    write_error(message.id, -32603, "internal error")

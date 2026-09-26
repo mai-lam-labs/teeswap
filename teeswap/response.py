@@ -1,9 +1,11 @@
 import abc
 import base64
+from dataclasses import dataclass
 from typing import Any, override
 
 from litestar import MediaType
 
+from .common import TeeSwapError
 from .wire import WireStruct, encode
 
 
@@ -99,3 +101,22 @@ class DataclassResponse(WireStruct, ToolResponse):
     @override
     def to_rest(self) -> tuple[bytes, str]:
         return encode(self), MediaType.JSON
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorResponse(WireStruct):
+    """An error on the wire: the REST error body, the MCP error in `_meta` and in a
+    JSON-RPC error's `data`. `code` is the TeeSwapError class name; None when the
+    failure isn't a domain error (a bad route, an internal error)."""
+
+    code: str | None
+    message: str
+
+    @classmethod
+    def of(cls, error: TeeSwapError) -> ErrorResponse:
+        return cls(code=error.code, message=str(error))
+
+    def to_exception(self) -> TeeSwapError:
+        if self.code is None:
+            return TeeSwapError(self.message)
+        return TeeSwapError.from_code(self.code, self.message)

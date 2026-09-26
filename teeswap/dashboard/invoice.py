@@ -14,7 +14,8 @@ from litestar import MediaType, Response, Router, get
 from litestar.params import Parameter
 from litestar.status_codes import HTTP_200_OK, HTTP_404_NOT_FOUND
 
-from ..invoice import InvoiceId, InvoiceNotFoundError, InvoiceRegistry, InvoiceView
+from ..execution.effects import OutcomeStatus, SideEffectView
+from ..execution.invoice import InvoiceId, InvoiceNotFoundError, InvoiceRegistry, InvoiceView
 from ..types import Timestamp
 from .html import (
     a,
@@ -127,6 +128,10 @@ _STATUS_BADGE: dict[str, str] = {
     "delivered": "badge-success",
     "failed": "badge-danger",
     "expired": "badge-muted",
+    "tools_down": "badge-danger",
+    "released": "badge-warning",
+    "not_received": "badge-muted",
+    "waiting": "badge-warning",
 }
 
 
@@ -143,6 +148,19 @@ def _fmt_token(symbol: str, contract: str | None, chain_caip2: str) -> str:
     if contract:
         return f"{symbol} ({contract}) on {chain_caip2}"
     return f"{symbol} (native) on {chain_caip2}"
+
+
+def _effect_outcome(effect: SideEffectView) -> str:
+    outcome = effect.outcome
+    match outcome.status:
+        case OutcomeStatus.LANDED | OutcomeStatus.REVERTED:
+            return f"{outcome.status} {outcome.transaction or '(transaction not reported)'}"
+        case OutcomeStatus.VOID:
+            return f"void: {outcome.reason}"
+        case OutcomeStatus.PENDING if effect.error is not None:
+            return f"pending (send failed: {effect.error})"
+        case OutcomeStatus.PENDING:
+            return "pending"
 
 
 def _fmt_time(ts: Timestamp | None) -> str:
@@ -184,6 +202,10 @@ def render_invoice_html(invoice: InvoiceView) -> str:
             span("Status", cls="kv-label")
             with div(cls="kv-value"):
                 span(invoice.status.value.replace("_", " ").upper(), cls=f"badge {badge_cls}")
+
+            if invoice.reason:
+                span("Why", cls="kv-label")
+                span(invoice.reason, cls="kv-value")
 
             span("Expires", cls="kv-label")
             span(_fmt_time(invoice.expires_at), cls="kv-value")
@@ -230,18 +252,49 @@ def render_invoice_html(invoice: InvoiceView) -> str:
                             )
                             for tx in out.transactions:
                                 span(f" {tx.hash}", cls="mono")
-                            if out.error:
-                                span(f" {out.error}", style="color:var(--danger)")
+
+        # --- Accounts: the addresses the job controls; with the tools down, the handover ---
+        if invoice.accounts:
+            h2("Accounts")
+            if invoice.status.value == "tools_down":
+                p(
+                    "The tools are down: these accounts, and what they hold, are handed to "
+                    "the invoice's owner with their keys.",
+                    cls="sub",
+                )
+            with div(cls="card"), table():
+                with thead(), tr():
+                    th("Account")
+                    th("Chain")
+                    th("For")
+                with tbody():
+                    for account in invoice.accounts:
+                        with tr():
+                            td(account.address.value, cls="mono")
+                            td(account.address.chain.name)
+                            td(account.purpose)
+
+        # --- Custody: where every unit of the funds is now ---
+        if invoice.holdings:
+            h2("Custody")
+            with div(cls="card"), table():
+                with thead(), tr():
+                    th("Custody")
+                    th("Where")
+                    th("Amount")
+                with tbody():
+                    for position in invoice.holdings:
+                        tok = position.amount.token
+                        with tr():
+                            td(position.place.custody.value.replace("_", " "))
+                            td(position.place.address.value, cls="mono")
+                            td(_fmt_amount(position.amount.amount, tok.symbol, tok.decimals))
 
         # --- Work log ---
         if invoice.actions:
             h2("Work Log")
             for action in invoice.actions:
-                proto_name = action.protocol or "direct"
-                chain_label = action.source_chain.caip2
-                if action.destination_chain:
-                    chain_label += f" → {action.destination_chain.caip2}"
-                h3(f"{action.description} ({proto_name}) — {chain_label}")
+                h3(f"{action.description} — {action.source_chain.caip2}")
 
                 with div(cls="timeline"):
                     for step in action.steps:
@@ -271,18 +324,26 @@ def render_invoice_html(invoice: InvoiceView) -> str:
                                     style="color:var(--danger);font-size:0.75rem;margin:4px 0 0",
                                 )
 
-                            if step.transactions:
+                            if step.side_effects:
                                 with table():
                                     with thead(), tr():
-                                        th("Chain")
-                                        th("Transaction")
-                                        th("Time")
+                                        th("Side effect")
+                                        th("Key")
+                                        th("Sent to")
+                                        th("Sent")
+                                        th("Outcome")
                                     with tbody():
-                                        for tx in step.transactions:
+                                        for effect in step.side_effects:
                                             with tr():
-                                                td(f"{tx.chain.name} ({tx.chain.caip2})")
-                                                td(tx.hash, cls="mono")
-                                                td(_fmt_time(tx.timestamp))
+                                                td(effect.kind.value)
+                                                td(effect.key, cls="mono")
+                                                td(effect.target, cls="mono")
+                                                td(
+                                                    _fmt_time(effect.sent_at)
+                                                    if effect.sent_at
+                                                    else "not sent"
+                                                )
+                                                td(_effect_outcome(effect), cls="mono")
 
         # --- Quote estimates ---
         h2("Quote Estimates")
@@ -292,13 +353,6 @@ def render_invoice_html(invoice: InvoiceView) -> str:
                 span("Gas estimate", cls="kv-label")
                 span(
                     _fmt_amount(gas.amount, gas.token.symbol, gas.token.decimals),
-                    cls="kv-value",
-                )
-
-                fee = invoice.fee
-                span("Fee", cls="kv-label")
-                span(
-                    _fmt_amount(fee.amount, fee.token.symbol, fee.token.decimals),
                     cls="kv-value",
                 )
 

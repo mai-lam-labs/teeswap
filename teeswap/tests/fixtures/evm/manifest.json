@@ -1,0 +1,33 @@
+{
+  "source_chain": "eip155:8453",
+  "source_rpc": "https://mainnet.base.org",
+  "block": 51690813,
+  "contracts": {
+    "eip6492_validator": {
+      "address": "0xdAcD51A54883eb67D95FAEb2BBfdC4a9a6BD2a3B",
+      "bytes": 2376,
+      "sha256": "0753abfee8312dc039dc2eff6ad275a0d40b1ae9d9e5e032212693be2b05416d"
+    },
+    "permit2": {
+      "address": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+      "bytes": 9152,
+      "sha256": "14aac65013451ac5878cca13f96c26e761c659ceece37c822604451e1608f5fc"
+    },
+    "x402_exact_permit2_proxy": {
+      "address": "0x402085c248EeA27D92E8b30b2C58ed07f9E20001",
+      "bytes": 2913,
+      "sha256": "bcf0d9a12e9ac8060e1a76ef2bbc0895273c3f9946057376c60cf2fe565cc0f0"
+    },
+    "usdc_fiat_token_v2_2": {
+      "address": "0x2Ce6311ddAE708829bc0784C967b7d77D19FD779",
+      "bytes": 23464,
+      "sha256": "dcb3b7ca28662970d0a7cdad420e529fb837d7bf8a246b1a680c20e153db79e8"
+    },
+    "usdc_signature_checker": {
+      "address": "0x2d943e25E1859ed786aFe4afb2B42e14EFAc691E",
+      "bytes": 1741,
+      "sha256": "c2f89c8f2f4b2d9f3f1a9c27222107ea797b765fc3cc083b1543967cf4e0998c",
+      "note": "library linked into usdc_fiat_token_v2_2"
+    }
+  }
+}

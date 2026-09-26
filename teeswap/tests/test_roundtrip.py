@@ -6,11 +6,15 @@ using the production Signer, Dispatcher, and Verifier — no mocks.
 
 import asyncio
 import base64
+import io
 import json
 import os
 from dataclasses import dataclass
 from typing import Any, override
 
+from teeswap.blockchain.chains import Chain, ChainFamily
+from teeswap.blockchain.rpc import RpcConfig
+from teeswap.config import TeeSwapConfig
 from teeswap.crypto.attestation import (
     HPKE_INFO_ARGS,
     HPKE_INFO_REPLY,
@@ -23,16 +27,21 @@ from teeswap.crypto.attestation import (
 )
 from teeswap.crypto.hpke import HpkeKeypair, hpke_seal
 from teeswap.crypto.verify import VerificationFailed, Verified, Verifier
+from teeswap.instance import TeeSwap
 from teeswap.mcp import (
+    MCP_PROTOCOL_VERSION,
     Dispatcher,
     JsonRpcRequest,
     SessionManager,
     Tool,
     ToolDefinition,
     handle_mcp_request,
+    jsonl_loop,
 )
 from teeswap.response import JsonResponse
-from teeswap.wire import HasFromDict
+from teeswap.types import Address, Amount, Balance, QuoteRequest, Token, TokenAmount
+from teeswap.wire import HasFromDict, decode_object, encode
+from teeswap.x402 import PaymentPayload
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +63,7 @@ class EchoTool(Tool):
         )
 
     @override
-    async def execute(self, args: EchoInput) -> JsonResponse:
+    async def execute(self, args: EchoInput, payment: PaymentPayload | None = None) -> JsonResponse:
         return JsonResponse({"echoed": True})
 
 
@@ -306,3 +315,75 @@ def test_blind_call_rejects_commitment_mismatch() -> None:
     )
     assert "error" in result.body
     assert result.body["error"]["code"] == -32602
+
+
+def test_stdio_session_survives_tool_errors() -> None:
+    """The standard client handshake over stdio with the real tools, then failing calls.
+
+    Regressions: tools/list once failed to encode (float bounds in inputSchema), and any
+    exception from a tool ended the stdio loop. Notifications must get no reply; domain
+    errors are isError results; unexpected errors are -32603 and the session continues.
+    """
+    chain = Chain(
+        caip2="eip155:31337",
+        family=ChainFamily.EVM,
+        name="Anvil",
+        short_name="anvil",
+        native_token="ETH",
+        native_decimals=18,
+        testnet=True,
+    )
+    eth = Token(symbol="ETH", chain=chain, contract=None, decimals=18)
+    # nothing listens on port 9: the quote's gas-price call fails with a connection error
+    dead_rpc = RpcConfig(chain=chain.caip2, urls=("http://127.0.0.1:9",))
+    instance = TeeSwap(TeeSwapConfig(facilitators=(), rpcs=(dead_rpc,)))
+    quote = QuoteRequest(
+        inputs=(TokenAmount(token=eth, amount=Amount(10**18)),),
+        outputs=(
+            Balance(
+                amount=TokenAmount(token=eth, amount=Amount(10**17)),
+                address=Address(chain, "0x27C8042A0A791ad47731951049e6C0bd79989556"),
+            ),
+        ),
+    )
+    lines: list[dict[str, Any]] = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "teeswap_status", "arguments": {"quote_id": "inv_missing"}},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "teeswap_quote", "arguments": decode_object(encode(quote))},
+        },
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/list"},
+    ]
+    reader = io.StringIO("".join(encode(line).decode() + "\n" for line in lines))
+    writer = io.StringIO()
+    session = instance.sessions.create(MCP_PROTOCOL_VERSION)
+
+    asyncio.run(jsonl_loop(instance.dispatcher, instance.sessions, session, reader, writer))
+
+    replies = {r["id"]: r for r in map(decode_object, writer.getvalue().splitlines())}
+    assert sorted(replies) == [1, 2, 3, 4, 5]
+    assert "teeswap_quote" in {t["name"] for t in replies[2]["result"]["tools"]}
+    assert replies[3]["result"]["isError"] is True
+    # the invoice id is a credential: an error about it never repeats it
+    assert "inv_missing" not in replies[3]["result"]["content"][0]["text"]
+    assert replies[4]["error"] == {"code": -32603, "message": "internal error"}
+    assert replies[5]["result"]["tools"]

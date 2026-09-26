@@ -6,8 +6,8 @@ from litestar import MediaType, Request, Response, Router, get, post
 from litestar.datastructures.state import State
 
 from ..blockchain.rpc import RpcMonitor
+from ..execution.invoice import InvoiceRegistry
 from ..facilitator import FacilitatorMonitor
-from ..invoice import InvoiceRegistry
 from .auth import SESSION_COOKIE, OperatorSessions
 from .views import (
     render_facilitators,
